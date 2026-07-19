@@ -144,15 +144,22 @@
 
 ## v5 — In Development
 
-> Full redesign. 12-key MX mechanical switch matrix, ST7789 240×320 IPS display, AS5600 magnetic encoder on custom bearing mount, and custom copper-tape ridge substrate PCB.
+> Full redesign. 12-key MX mechanical switch matrix (4×3 landscape), ST7789 240×320 IPS display, **multi-host BLE with 3 device slots (Logitech Easy-Switch style)**, wireless AS5600 encoder puck, and custom copper-tape ridge substrate PCB.
+
+### Multi-Host BLE — use it like a Pebble Keys
+- 3 host slots, each remembers one bonded device (NVS persisted across power cycles)
+- Hold **FN (K9) 1s** → tap **K1/K2/K3** to jump between paired devices
+- Hold the slot key 1.5s instead to (re-)pair that slot with a new device
+- Switching re-advertises **accept-list filtered** to the slot's bonded host, so only the selected device reconnects; a wrong bonded host that connects anyway is rejected in software
+- Status bar shows the three slots like Easy-Switch LEDs (green = connected, amber = waiting, magenta = pairing)
+- Firmware: `firmware/v5/macropad_v5.ino` (NimBLE 2.x API, single file)
 
 ### Hardware Spec
-- ESP32 WROOM-32 dev board
-- ST7789 240×320 IPS display, glass flush-mounted (30.6×40.8mm active area)
-- 12× MX compatible mechanical switches, plate mount, 3×4 matrix, 19.05mm pitch
-- 12× 1N4148 diodes for n-key rollover
-- AS5600 + 50mm bearing-mounted scroll dial
-- EC12 push button (button only — AS5600 handles rotation)
+- NodeMCU ESP32-S V1.1 (WROOM-32) dev board
+- ST7789 240×320 IPS display, landscape mount, glass flush-mounted (30.6×40.8mm active area)
+- 12× MX compatible mechanical switches, plate mount, 4×3 landscape matrix, 19.05mm pitch
+- 12× 1N4148 diodes for n-key rollover (cathode → row line — see `hardware/pin_reference_v5.md`)
+- Wireless encoder puck: AS5600 + 50mm bearing-mounted dial on ESP12-E, ESP-NOW (separate device, firmware TBD)
 - CKCS charge+boost module + 18650 cell
 - Custom copper-tape ridge substrate PCB
 
@@ -169,24 +176,21 @@
 
 | GPIO | Board Label | Function | Notes |
 |------|------------|----------|-------|
-| 13 | P13 | Key Col 0 | Drive LOW to scan |
-| 14 | P14 | Key Col 1 | Drive LOW to scan |
-| 25 | P25 | Key Col 2 | Drive LOW to scan |
-| 26 | P26 | Key Row 0 | INPUT_PULLUP |
-| 32 | P32 | Key Row 1 | INPUT_PULLUP |
-| 33 | P33 | Key Row 2 | INPUT_PULLUP |
-| 34 | P34 | Key Row 3 | External 10kΩ pullup |
-| 39 | SVN | EC12 SW | External 10kΩ pullup |
-| 21 | P21 | I2C SDA | AS5600 |
-| 22 | P22 | I2C SCL | AS5600 |
-| 23 | P23 | SPI MOSI | ST7789 SDA |
-| 18 | P18 | SPI SCLK | ST7789 SCL |
-| 27 | P27 | TFT CS | 10kΩ pullup to 3.3V |
-| 17 | P17 | TFT DC | |
-| 16 | P16 | TFT RST | |
-| 19 | P19 | TFT BL | PWM via LEDC |
+| 18 | P18 | TFT SCK | SPI clock |
+| 23 | P23 | TFT MOSI | ST7789 SDA |
+| 5  | P5  | TFT CS  | |
+| 21 | P21 | TFT DC  | |
+| 22 | P22 | TFT RST | |
+| 19 | P19 | TFT BL  | PWM via LEDC |
+| 25 | P25 | Matrix Row 1 | Driven LOW to scan |
+| 26 | P26 | Matrix Row 2 | Driven LOW to scan |
+| 27 | P27 | Matrix Row 3 | Driven LOW to scan |
+| 32 | P32 | Matrix Row 4 | Driven LOW to scan |
+| 33 | P33 | Matrix Col 1 | INPUT_PULLUP |
+| 13 | P13 | Matrix Col 2 | INPUT_PULLUP |
+| 14 | P14 | Matrix Col 3 | INPUT_PULLUP |
 
-> Zero strapping pins used — clean boot every time, no pull resistors needed for boot.
+> Zero strapping pins used — clean boot every time, no pull resistors needed for boot. No I2C or encoder switch on the main board — the AS5600 puck is wireless. Full details + diode orientation: `hardware/pin_reference_v5.md`.
 
 ---
 

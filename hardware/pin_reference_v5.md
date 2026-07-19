@@ -1,63 +1,85 @@
-# MacroPad v5 — Pin Reference
+# MacroPad v5 — Pin Reference (multihost wiring)
 
-## ESP32 WROOM-32 GPIO Allocation
+Board: **NodeMCU ESP32-S V1.1** (WROOM-32, no PSRAM). P-label = GPIO number (P18 = GPIO18).
+13 pins used: TFT SPI (6) + 4×3 matrix (7). The AS5600 encoder is now a
+**separate wireless puck** (ESP12-E + ESP-NOW) — no I2C or encoder switch on
+the main board anymore.
+
+## ESP32 GPIO Allocation
 
 | GPIO | Board Label | Function | Direction | Notes |
-|------|------------|----------|-----------|-------|
-| 13 | P13 | Key Col 0 | OUTPUT | Drive LOW to scan |
-| 14 | P14 | Key Col 1 | OUTPUT | Drive LOW to scan |
-| 25 | P25 | Key Col 2 | OUTPUT | Drive LOW to scan |
-| 26 | P26 | Key Row 0 | INPUT | INPUT_PULLUP |
-| 32 | P32 | Key Row 1 | INPUT | INPUT_PULLUP |
-| 33 | P33 | Key Row 2 | INPUT | INPUT_PULLUP |
-| 34 | P34 | Key Row 3 | INPUT | Input-only, external 10kΩ pullup |
-| 39 | SVN | EC12 SW   | INPUT | Input-only, external 10kΩ pullup |
-| 21 | P21 | I2C SDA   | BIDIR | AS5600, 4.7kΩ pullup on breakout |
-| 22 | P22 | I2C SCL   | BIDIR | AS5600, 4.7kΩ pullup on breakout |
-| 23 | P23 | SPI MOSI  | OUTPUT | ST7789 SDA |
-| 18 | P18 | SPI SCLK  | OUTPUT | ST7789 SCL |
-| 27 | P27 | TFT CS    | OUTPUT | 10kΩ pullup to 3.3V |
-| 17 | P17 | TFT DC    | OUTPUT | |
-| 16 | P16 | TFT RST   | OUTPUT | |
-| 19 | P19 | TFT BL    | OUTPUT | PWM via LEDC |
+|------|------------|-----------|-----------|-------|
+| 18 | P18 | TFT SCK  | OUTPUT | SPI clock |
+| 23 | P23 | TFT MOSI | OUTPUT | SPI data (ST7789 SDA) |
+| 5  | P5  | TFT CS   | OUTPUT | HIGH at boot — fine |
+| 21 | P21 | TFT DC   | OUTPUT | |
+| 22 | P22 | TFT RST  | OUTPUT | |
+| 19 | P19 | TFT BL   | OUTPUT | PWM via LEDC (sketch-driven) |
+| 25 | P25 | Matrix Row 1 | OUTPUT | driven LOW one at a time |
+| 26 | P26 | Matrix Row 2 | OUTPUT | driven LOW one at a time |
+| 27 | P27 | Matrix Row 3 | OUTPUT | driven LOW one at a time |
+| 32 | P32 | Matrix Row 4 | OUTPUT | driven LOW one at a time |
+| 33 | P33 | Matrix Col 1 | INPUT | INPUT_PULLUP |
+| 13 | P13 | Matrix Col 2 | INPUT | INPUT_PULLUP, JTAG-shared (fine) |
+| 14 | P14 | Matrix Col 3 | INPUT | INPUT_PULLUP, JTAG-shared (fine) |
 | VIN | 5V | Power in  | POWER | From CKCS 5V out |
-| 3V3 | 3V3 | 3.3V out | POWER | To all VCC pins |
+| 3V3 | 3V3 | 3.3V out | POWER | To TFT VCC |
 
-## Key Matrix (3×4 = 12 keys)
+All matrix inputs use internal pullups — no external resistors needed
+(GPIO 34/36/39 input-only pins are no longer used).
+
+## Key Matrix (4 rows × 3 cols electrical = 12 keys)
+
+Rows are scanned (driven LOW one at a time, hi-Z otherwise); columns are read
+with `INPUT_PULLUP`.
 
 ```
-       Col0(13)  Col1(14)  Col2(25)
-Row0(26)  SW1      SW2      SW3
-Row1(32)  SW4      SW5      SW6
-Row2(33)  SW7      SW8      SW9
-Row3(34)  SW10     SW11     SW12
+          Col1(33)  Col2(13)  Col3(14)
+Row1(25)    K1        K5        K9(FN)
+Row2(26)    K2        K6        K10
+Row3(27)    K3        K7        K11
+Row4(32)    K4        K8        K12
 ```
 
-Each switch has a 1N4148 diode:
-- Anode → switch pin 2 (row side)
-- Cathode → column line
+Logical key index in firmware: `idx = col*4 + row`, giving the landscape
+4-wide × 3-tall grid the display shows:
 
-## Pullup Resistors
+```
+K1  K2  K3  K4
+K5  K6  K7  K8
+K9  K10 K11 K12      K9 = FN (bottom-left)
+```
 
-| Ref | Value | Pin | To |
-|-----|-------|-----|----|
-| R1 | 10kΩ | GPIO26 Row0 | 3.3V |
-| R2 | 10kΩ | GPIO32 Row1 | 3.3V |
-| R3 | 10kΩ | GPIO33 Row2 | 3.3V |
-| R4 | 10kΩ | GPIO34 Row3 | 3.3V |
-| R5 | 10kΩ | GPIO39 EC12 SW | 3.3V |
-| R6 | 10kΩ | GPIO27 TFT CS | 3.3V |
+So electrical **rows = physical columns** (left→right) and electrical
+**cols = physical rows** (top→bottom) on the landscape board.
 
-I2C pullups (4.7kΩ) are onboard the AS5600 breakout — no external ones needed.
+### Diode orientation — CHANGED from the old col-driven scan
+
+Each switch gets a 1N4148. Current must flow **column → switch → row**
+(pullup source → driven-LOW sink):
+
+- **Cathode (band) → row line** (P25/P26/P27/P32)
+- Anode → switch pin on the column side
+
+> ⚠️ Older revisions of this doc said cathode→column — that was for the old
+> column-driven scan. If diodes are soldered the old way, either flip them or
+> swap the row/column pin groups in `macropad_v5.ino`.
 
 ## Strapping Pins — Avoided
 
-| GPIO | Issue | Solution |
-|------|-------|----------|
-| 0 | Boot mode | Not used |
-| 2 | Boot mode | Not used |
-| 12 | Flash voltage | Not used (was TFT_BL in v4, moved to GPIO19 in v5) |
-| 15 | Boot log | Not used |
+| GPIO | Issue | Status |
+|------|-------|--------|
+| 0, 2, 12, 15 | Boot mode / flash voltage | **Not used at all** |
+
+If your board has PSRAM, GPIO 16/17 are reserved — this pinout avoids them
+too (standard NodeMCU-32S WROOM-32 has no PSRAM).
+
+## TFT_eSPI configuration
+
+Copy `firmware/v5/User_Setup.h` over
+`<Arduino sketchbook>/libraries/TFT_eSPI/User_Setup.h`. It contains the pins
+above, `ST7789_DRIVER`, 40MHz SPI and the font loads (`LOAD_GLCD` is
+mandatory — text renders blank without it).
 
 ## Power Chain
 
@@ -65,5 +87,5 @@ I2C pullups (4.7kΩ) are onboard the AS5600 breakout — no external ones needed
 USB-C socket → CKCS module USB-C pads (wired)
 CKCS B+ / B- → 18650 cell
 CKCS 5V out  → ESP32 VIN
-ESP32 3V3    → all VCC pins
+ESP32 3V3    → TFT VCC
 ```

@@ -1,37 +1,55 @@
 /*********************************************************************
- * ESP32 BLE HID Macro Pad  —  v5.0  (NimBLE)
+ * ESP32 BLE HID Macro Pad — v5 MULTIHOST (NimBLE)
  *
- * Hardware:
- *   Encoder : CLK=2, DT=4, SW=15
- *   TFT     : CS=5, DC=17, RST=16, BL=12  (128×160 ST7735)
- *   Buttons : GPIO 14,13,26,25,22,21,35,19
+ * Hardware : NodeMCU ESP32-S V1.1 (WROOM-32, no PSRAM)
+ *            ST7789 240×320 IPS, landscape mount (320×240)
+ *            12× MX switches, 4×3 electrical matrix, 1N4148 diodes
+ *            (AS5600 encoder puck is a separate ESP-NOW device — NOT
+ *             handled by this firmware yet)
  *
- * Library: NimBLE-Arduino (install via Library Manager)
- *   Replaces ESP32-BLE-Keyboard — no ghost connections, clean bonding
+ * Wiring (P-label = GPIO):
+ *   TFT  : SCK=P18  MOSI=P23  CS=P5  DC=P21  RST=P22  BL=P19 (LEDC PWM)
+ *   Matrix rows (OUTPUT, driven LOW one at a time): P25 P26 P27 P32
+ *   Matrix cols (INPUT_PULLUP)                    : P33 P13 P14
+ *   Diodes: cathode faces the ROW line (current col → switch → row)
  *
- * Features:
- *   ▸ 8 presets: OnShape, KiCad, Music, Gaming, LTspice, Custom×3
- *   ▸ BUILD MODE — remap any button live (hold encoder 1.5s)
- *   ▸ Encoder modes: VOL / SCROLL / ZOOM / ALT-TAB
- *   ▸ Settings menu: brightness, sleep, sensitivity, OS layout (hold 0.7s)
- *   ▸ OS Layout: Windows / Linux — remaps shortcuts live
- *   ▸ No-Sleep option (0 = always on)
- *   ▸ RTOS light-sleep with reliable multi-cycle wake
- *   ▸ Wake-key buffer + reconnect HUD
- *   ▸ BLE: fixed advertising for Android + Linux/BlueZ
- *   ▸ Long-hold encoder (3s) clears BLE bonds for re-pairing
+ * Key grid (logical, landscape, 4 wide × 3 tall):
+ *   K1  K2  K3  K4        idx 0..3   = row line r, col line c
+ *   K5  K6  K7  K8        idx 4..7     maps as  idx = c*4 + r
+ *   K9  K10 K11 K12       idx 8..11    (K9 = FN, bottom-left)
+ *
+ * ── PEBBLE-KEYS-STYLE MULTI-HOST BLE ─────────────────────────────
+ *   3 host slots, each remembers one bonded device (NVS persisted).
+ *   Switching re-advertises filtered to that slot's bonded host, so
+ *   only the selected device reconnects — like Logitech Easy-Switch.
+ *
+ * ── CONTROLS ─────────────────────────────────────────────────────
+ *   K9 (FN) tap          : fire its macro (like any key)
+ *   K9 (FN) hold 1s      : SYSTEM menu, then while it is open:
+ *       K1/K2/K3 tap     :   switch to device slot 1/2/3
+ *       K1/K2/K3 hold 1.5s:  (re-)pair that slot with a new device
+ *       K4               :   preset picker
+ *       K8               :   settings  (brightness / sleep / OS /
+ *                            devices+bond management)
+ *       K12              :   BUILD mode (remap any key live)
+ *       release FN       :   cancel
+ *
+ * Gotchas honoured (from CONTEXT.md §3 / v4 learnings):
+ *   ▸ NimBLE init BEFORE ledcAttach — radio init resets LEDC
+ *   ▸ BlueZ needs adv flags 0x06 rebuilt on EVERY adv restart
+ *   ▸ ledcAttach again after light-sleep — LEDC silently dropped
+ *   ▸ strapping pins 0/2/12/15 completely unused
  *********************************************************************/
 
 #include <NimBLEDevice.h>
-#include <NimBLEServer.h>
 #include <NimBLEHIDDevice.h>
 #include <TFT_eSPI.h>
 #include <SPI.h>
-#include "esp_sleep.h"
-#include "driver/gpio.h"
+#include <Preferences.h>
+#include <driver/gpio.h>
 
 // ════════════════════════════════════════════════
-//  PALETTE
+//  PALETTE (RGB565)
 // ════════════════════════════════════════════════
 #define C_BG       0x0841
 #define C_SURF     0x10A3
@@ -48,44 +66,42 @@
 #define C_PINK     0xFBB7
 #define C_LTBLUE   0x3D9F
 #define C_ORANGE   0xFC60
-#define C_GRID     0x0861
 #define C_BUILD    0x9F1F
 
-const uint16_t PRESET_COL[8] = {
+const uint16_t PRESET_COLORS[8] = {
   C_CYAN, C_GREEN, C_AMBER, C_MAGENTA,
   C_ORANGE, C_LTBLUE, C_PINK, C_YELLOW,
 };
 
 // ════════════════════════════════════════════════
-//  PINS
+//  PINS  (NodeMCU ESP32-S V1.1 — see header)
 // ════════════════════════════════════════════════
-#define TFT_BL  12
-#define ENC_CLK  2
-#define ENC_DT   4
-#define ENC_SW  15
-const uint8_t BTN_PINS[8] = {14,13,26,25,22,21,35,19};
+#define TFT_BL 19
+const uint8_t ROW_PINS[4] = {25, 26, 27, 32};  // driven LOW one at a time
+const uint8_t COL_PINS[3] = {33, 13, 14};      // INPUT_PULLUP readers
+
+#define NUM_KEYS   12
+#define KEY_FN      8          // bottom-left key (K9)
 
 // ════════════════════════════════════════════════
 //  TUNING
 // ════════════════════════════════════════════════
 int           backlightBrightness = 180;
 unsigned long sleepTimeoutMs      = 300000UL;   // 0 = no sleep
-int           encoderSensitivity  = 3;
-bool          linuxLayout         = false;       // false=Windows, true=Linux
+bool          linuxLayout         = false;      // false=Windows, true=Linux
 
-const uint16_t  BTN_DEBOUNCE_MS  = 15;
-const uint16_t  BTN_MIN_PRESS_MS = 40;
-const uint8_t   ENC_DEBOUNCE_MS  = 10;
-const unsigned long FLASH_MS     = 600;
-const unsigned long ALT_HOLD_MS  = 1000;
-const int ENC_DIR                = -1;
+const uint16_t KEY_DEBOUNCE_MS   = 12;
+const uint16_t KEY_MIN_PRESS_MS  = 30;
+const unsigned long FN_MENU_MS   = 1000;   // FN hold → SYSTEM menu
+const unsigned long PAIR_HOLD_MS = 1500;   // slot key hold → pairing mode
+const unsigned long CLRALL_HOLD_MS = 2000; // devices screen K11 hold → wipe bonds
+const unsigned long FLASH_MS     = 500;
 #define WAKEKEY_NONE  -1
 #define RECONNECT_TIMEOUT_MS  8000UL
 
 // ════════════════════════════════════════════════
 //  HID KEYCODES
 // ════════════════════════════════════════════════
-// Modifier bits
 #define MOD_LCTRL   0x01
 #define MOD_LSHIFT  0x02
 #define MOD_LALT    0x04
@@ -93,7 +109,9 @@ const int ENC_DIR                = -1;
 
 // Key usage codes (HID page 0x07)
 #define KEY_A         0x04
+#define KEY_B         0x05
 #define KEY_C         0x06
+#define KEY_D         0x07
 #define KEY_E         0x08
 #define KEY_F         0x09
 #define KEY_G         0x0A
@@ -108,6 +126,7 @@ const int ENC_DIR                = -1;
 #define KEY_R         0x15
 #define KEY_S         0x16
 #define KEY_T         0x17
+#define KEY_U         0x18
 #define KEY_V         0x19
 #define KEY_W         0x1A
 #define KEY_X         0x1B
@@ -116,12 +135,14 @@ const int ENC_DIR                = -1;
 #define KEY_1         0x1E
 #define KEY_2         0x1F
 #define KEY_3         0x20
+#define KEY_5         0x22
 #define KEY_7         0x24
-#define KEY_BACKTICK  0x35
+#define KEY_0         0x27
+#define KEY_ENTER     0x28
+#define KEY_TAB       0x2B
 #define KEY_MINUS     0x2D
 #define KEY_EQUAL     0x2E
-#define KEY_5         0x22
-#define KEY_TAB       0x2B
+#define KEY_BACKTICK  0x35
 #define KEY_F4        0x3D
 #define KEY_F11       0x44
 #define KEY_PRTSC     0x46
@@ -164,6 +185,27 @@ static const uint8_t hidReportMap[] = {
   0xC0,
 };
 
+#define DEVICE_NAME "ESP32 MacroPad"
+
+// ════════════════════════════════════════════════
+//  MULTI-HOST SLOTS  (the Easy-Switch feature)
+// ════════════════════════════════════════════════
+#define NUM_SLOTS 3
+
+struct HostSlot {           // POD — stored raw as one NVS blob
+  uint8_t addr[6];          // peer identity address (NimBLE native order)
+  uint8_t type;             // address type
+  uint8_t bonded;           // 0/1
+};
+HostSlot hostSlots[NUM_SLOTS] = {};
+int  activeSlot = 0;
+volatile bool pairingMode = false;
+
+// BLE→loop event mailbox — NimBLE callbacks must never draw on the TFT,
+// the loop task owns the display
+enum BleEvent : uint8_t { EVT_NONE=0, EVT_PAIRED, EVT_WRONG_HOST };
+volatile uint8_t pendingBleEvent = EVT_NONE;
+
 // ════════════════════════════════════════════════
 //  NIMBLE BLE GLOBALS
 // ════════════════════════════════════════════════
@@ -171,33 +213,144 @@ NimBLEServer*         pServer   = nullptr;
 NimBLEHIDDevice*      pHID      = nullptr;
 NimBLECharacteristic* pKbReport = nullptr;  // Report ID 1
 NimBLECharacteristic* pCcReport = nullptr;  // Report ID 2
-bool bleConnected = false;
+volatile bool bleConnected = false;
+volatile uint16_t bleConnHandle = 0;
 
-// NimBLE server callbacks — reliable connect/disconnect, no ghost state
+void startAdvertisingForSlot();   // fwd
+void saveSlots();                 // fwd
+
+int slotForAddress(const uint8_t addr[6]) {
+  for (int i = 0; i < NUM_SLOTS; i++)
+    if (hostSlots[i].bonded && memcmp(hostSlots[i].addr, addr, 6) == 0) return i;
+  return -1;
+}
+
 class ServerCB : public NimBLEServerCallbacks {
   void onConnect(NimBLEServer* s, NimBLEConnInfo& info) override {
-    bleConnected = true;
+    bleConnected  = true;
+    bleConnHandle = info.getConnHandle();
     // Request faster connection interval — critical for Android/Linux responsiveness
     s->updateConnParams(info.getConnHandle(), 6, 12, 0, 400);
     NimBLEDevice::stopAdvertising();
   }
+  void onAuthenticationComplete(NimBLEConnInfo& info) override {
+    if (!info.isEncrypted()) { pServer->disconnect(info.getConnHandle()); return; }
+    NimBLEAddress id = info.getIdAddress();
+    const uint8_t* idBytes = id.getBase()->val;
+    int knownSlot = slotForAddress(idBytes);
+
+    if (pairingMode) {
+      if (knownSlot >= 0 && knownSlot != activeSlot) {
+        // A host already bonded to a DIFFERENT slot grabbed the open
+        // advertising — kick it, keep waiting for a genuinely new device
+        pendingBleEvent = EVT_WRONG_HOST;
+        pServer->disconnect(info.getConnHandle());
+        return;
+      }
+      memcpy(hostSlots[activeSlot].addr, idBytes, 6);
+      hostSlots[activeSlot].type   = id.getBase()->type;
+      hostSlots[activeSlot].bonded = 1;
+      pairingMode = false;
+      saveSlots();
+      pendingBleEvent = EVT_PAIRED;
+    } else {
+      // Whitelist filtering should make this impossible, but enforce in
+      // software too: only the active slot's bonded host may stay
+      if (knownSlot != activeSlot) {
+        pendingBleEvent = EVT_WRONG_HOST;
+        pServer->disconnect(info.getConnHandle());
+      }
+    }
+  }
   void onDisconnect(NimBLEServer* s, NimBLEConnInfo& info, int reason) override {
     bleConnected = false;
     delay(200);
-    // Rebuild adv data on every restart — BlueZ requires flags to be present
-    // each time, not just on first boot
-    NimBLEAdvertising* pAdv = NimBLEDevice::getAdvertising();
-    NimBLEAdvertisementData advData;
-    advData.setFlags(0x06);
-    advData.setAppearance(0x03C1);
-    if(pHID) advData.addServiceUUID(pHID->getHidService()->getUUID());
-    pAdv->setAdvertisementData(advData);
-    NimBLEAdvertisementData scanData;
-    scanData.setName("ESP32 MacroPad");
-    pAdv->setScanResponseData(scanData);
-    NimBLEDevice::startAdvertising();
+    // Rebuild adv data on every restart — BlueZ requires the flags byte to
+    // be present each time, not just on first boot
+    startAdvertisingForSlot();
   }
 };
+
+// Rebuilds advertisement payload from scratch (BlueZ flags requirement)
+void configureAdvertising() {
+  NimBLEAdvertising* pAdv = NimBLEDevice::getAdvertising();
+  NimBLEAdvertisementData advData;
+  // Flags: 0x06 = LE General Discoverable (0x02) | BR/EDR Not Supported (0x04)
+  // BlueZ ignores devices that don't have this exact flags byte
+  advData.setFlags(0x06);
+  advData.setAppearance(0x03C1);           // HID keyboard
+  advData.addServiceUUID(pHID->getHidService()->getUUID());
+  pAdv->setAdvertisementData(advData);
+  // Scan response carries the full device name
+  NimBLEAdvertisementData scanData;
+  scanData.setName(DEVICE_NAME);
+  pAdv->setScanResponseData(scanData);
+  pAdv->enableScanResponse(true);
+  // 20–30ms interval — short enough for Linux's default scan window
+  pAdv->setMinInterval(32);
+  pAdv->setMaxInterval(48);
+}
+
+// Advertise for the ACTIVE slot:
+//   bonded slot → accept-list filtered, only that host can reconnect
+//   empty slot / pairing mode → open advertising (discoverable)
+void startAdvertisingForSlot() {
+  NimBLEAdvertising* pAdv = NimBLEDevice::getAdvertising();
+  if (pAdv->isAdvertising()) pAdv->stop();
+
+  while (NimBLEDevice::getWhiteListCount() > 0)
+    NimBLEDevice::whiteListRemove(NimBLEDevice::getWhiteListAddress(0));
+
+  bool filtered = hostSlots[activeSlot].bonded && !pairingMode;
+  if (filtered) {
+    NimBLEDevice::whiteListAdd(
+      NimBLEAddress(hostSlots[activeSlot].addr, hostSlots[activeSlot].type));
+    pAdv->setScanFilter(false, true);   // scan-req: anyone, connect: whitelist
+  } else {
+    pAdv->setScanFilter(false, false);  // open — pairing / first use
+  }
+  configureAdvertising();
+  pAdv->start();
+}
+
+// Easy-Switch: jump to slot n. forcePair drops the slot's old bond and
+// opens pairing (Pebble Keys long-press behaviour).
+void switchToSlot(int n, bool forcePair) {
+  if (n < 0 || n >= NUM_SLOTS) return;
+  if (forcePair && hostSlots[n].bonded) {
+    NimBLEDevice::deleteBond(NimBLEAddress(hostSlots[n].addr, hostSlots[n].type));
+    hostSlots[n].bonded = 0;
+  }
+  activeSlot  = n;
+  pairingMode = forcePair || !hostSlots[n].bonded;
+  saveSlots();
+  if (bleConnected) {
+    pServer->disconnect(bleConnHandle);  // onDisconnect → startAdvertisingForSlot
+  } else {
+    startAdvertisingForSlot();
+  }
+}
+
+void clearSlotBond(int n) {
+  if (n < 0 || n >= NUM_SLOTS || !hostSlots[n].bonded) return;
+  NimBLEDevice::deleteBond(NimBLEAddress(hostSlots[n].addr, hostSlots[n].type));
+  hostSlots[n].bonded = 0;
+  saveSlots();
+  if (n == activeSlot) {
+    pairingMode = true;
+    if (bleConnected) pServer->disconnect(bleConnHandle);
+    else startAdvertisingForSlot();
+  }
+}
+
+void clearAllBonds() {
+  NimBLEDevice::deleteAllBonds();
+  for (int i = 0; i < NUM_SLOTS; i++) hostSlots[i].bonded = 0;
+  pairingMode = true;
+  saveSlots();
+  if (bleConnected) pServer->disconnect(bleConnHandle);
+  else startAdvertisingForSlot();
+}
 
 // ════════════════════════════════════════════════
 //  KEY SEND HELPERS
@@ -205,19 +358,6 @@ class ServerCB : public NimBLEServerCallbacks {
 void sendKey(uint8_t mod, uint8_t key) {
   if (!bleConnected || !pKbReport) return;
   uint8_t report[8] = {mod, 0, key, 0, 0, 0, 0, 0};
-  pKbReport->setValue(report, 8);
-  pKbReport->notify();
-  delay(20);
-  // Release
-  uint8_t rel[8] = {};
-  pKbReport->setValue(rel, 8);
-  pKbReport->notify();
-  delay(10);
-}
-
-void sendKeys(uint8_t mod, uint8_t k1, uint8_t k2=0, uint8_t k3=0) {
-  if (!bleConnected || !pKbReport) return;
-  uint8_t report[8] = {mod, 0, k1, k2, k3, 0, 0, 0};
   pKbReport->setValue(report, 8);
   pKbReport->notify();
   delay(20);
@@ -239,31 +379,7 @@ void sendConsumer(uint16_t usage) {
   delay(10);
 }
 
-// Hold modifier key (for ALT-TAB across encoder ticks)
-uint8_t heldMod = 0;
-void holdMod(uint8_t mod) {
-  if (!bleConnected || !pKbReport) return;
-  heldMod = mod;
-  uint8_t report[8] = {mod, 0, 0, 0, 0, 0, 0, 0};
-  pKbReport->setValue(report, 8);
-  pKbReport->notify();
-}
-
-void sendKeyWithHeld(uint8_t extraMod, uint8_t key) {
-  if (!bleConnected || !pKbReport) return;
-  uint8_t report[8] = {(uint8_t)(heldMod | extraMod), 0, key, 0, 0, 0, 0, 0};
-  pKbReport->setValue(report, 8);
-  pKbReport->notify();
-  delay(40);
-  // Release key but keep modifier held
-  uint8_t held[8] = {heldMod, 0, 0, 0, 0, 0, 0, 0};
-  pKbReport->setValue(held, 8);
-  pKbReport->notify();
-  delay(20);
-}
-
 void releaseAll() {
-  heldMod = 0;
   if (!pKbReport) return;
   uint8_t rel[8] = {};
   pKbReport->setValue(rel, 8);
@@ -275,6 +391,7 @@ void releaseAll() {
 // ════════════════════════════════════════════════
 //  ACTION IDS
 // ════════════════════════════════════════════════
+#define A_NONE         0
 #define A_PLAY       101
 #define A_NEXT       102
 #define A_PREV       103
@@ -337,6 +454,7 @@ void releaseAll() {
 #define A_FORWARD    174
 #define A_REFRESH    175
 #define A_ADDR_BAR   176
+#define A_ALTTAB     177
 #define A_LTS_MOVE   190
 #define A_LTS_GND    191
 #define A_LTS_VCC    192
@@ -346,577 +464,541 @@ void releaseAll() {
 #define A_LTS_WIRE   196
 #define A_LTS_RUN    197
 
-// ── Linux-specific action IDs (200+) ───────────────
-// These mirror Windows actions but use Linux/GNOME shortcuts
-#define A_LX_LOCK        200   // Super+L
-#define A_LX_SNIP        201   // Shift+PrtSc (GNOME region screenshot)
-#define A_LX_SS_FULL     202   // PrtSc
-#define A_LX_TASK        203   // Super+Tab (GNOME Activities)
-#define A_LX_MINALL      204   // Super+D (show desktop)
-#define A_LX_DESK_R      205   // Ctrl+Alt+Right
-#define A_LX_DESK_L      206   // Ctrl+Alt+Left
-#define A_LX_CALC        207   // Super (open launcher)
-#define A_LX_EXPLORER    208   // Super+E (Nautilus)
-#define A_LX_SETTINGS    209   // Super+I (GNOME Settings)
-#define A_LX_CLOSE       210   // Alt+F4
-#define A_LX_REDO        211   // Ctrl+Shift+Z
-#define A_LX_TERMINAL    212   // Ctrl+Alt+T (open terminal)
-#define A_LX_ZOOM_IN     213   // Ctrl+= (terminal/browser zoom in)
-#define A_LX_ZOOM_OUT    214   // Ctrl+- (terminal/browser zoom out)
-#define A_LX_ZOOM_RST    215   // Ctrl+0 (reset zoom)
-#define A_LX_NOTIF       216   // Super+V (GNOME notification tray)
-#define A_LX_SPLIT_H     217   // Ctrl+Shift+E (Tilix/GNOME Terminal split horizontal)
-#define A_LX_SPLIT_V     218   // Ctrl+Shift+O (Tilix/GNOME Terminal split vertical)
-#define A_LX_NEW_TERM    219   // Ctrl+Shift+T (new terminal tab)
-#define A_LX_MAXIMIZE    220   // Super+Up (maximize window)
-#define A_LX_HALF_L      221   // Super+Left (snap left half)
-#define A_LX_HALF_R      222   // Super+Right (snap right half)
-#define A_LX_MOVE_WS1    223   // Shift+Super+1 (move window to workspace 1)
-#define A_LX_MOVE_WS2    224   // Shift+Super+2 (move window to workspace 2)
-
-// Extra keycodes needed for Linux actions
-#define KEY_D         0x07
-#define KEY_0         0x27
-#define KEY_B         0x05
-#define KEY_U         0x18
-#define KEY_PRTSC_KEY 0x46
+// ── Linux-specific action IDs (200+) — GNOME/Tilix shortcuts ──
+#define A_LX_TERMINAL    212   // Ctrl+Alt+T
+#define A_LX_ZOOM_IN     213   // Ctrl+=
+#define A_LX_ZOOM_OUT    214   // Ctrl+-
+#define A_LX_ZOOM_RST    215   // Ctrl+0
+#define A_LX_NOTIF       216   // Super+V
+#define A_LX_SPLIT_H     217   // Ctrl+Shift+E (Tilix)
+#define A_LX_SPLIT_V     218   // Ctrl+Shift+O (Tilix)
+#define A_LX_NEW_TERM    219   // Ctrl+Shift+T
+#define A_LX_MAXIMIZE    220   // Super+Up
+#define A_LX_HALF_L      221   // Super+Left
+#define A_LX_HALF_R      222   // Super+Right
+#define A_LX_MOVE_WS1    223   // Shift+Super+1
+#define A_LX_MOVE_WS2    224   // Shift+Super+2
 
 struct Action { const char* label; int id; };
 const Action ACTION_LIB[] = {
-  {"Play/Pause",A_PLAY},{"Next",A_NEXT},{"Prev",A_PREV},{"Mute",A_MUTE},
+  {"---",A_NONE},
+  {"Play/Pse",A_PLAY},{"Next",A_NEXT},{"Prev",A_PREV},{"Mute",A_MUTE},
   {"Spotify",A_SPOTIFY},{"Vol Up",A_VOLUP},{"Vol Down",A_VOLDN},
-  {"Lock PC",A_LOCK},{"Screenshot",A_SNIP},{"Full SS",A_SS_FULL},
-  {"Task View",A_TASK},{"Min All",A_MINALL},{"Desk Right",A_DESK_R},
-  {"Desk Left",A_DESK_L},{"Calculator",A_CALC},{"Explorer",A_EXPLORER},
-  {"Win Sett.",A_SETTINGS_W},
+  {"Lock PC",A_LOCK},{"Snip",A_SNIP},{"Full SS",A_SS_FULL},
+  {"TaskView",A_TASK},{"Min All",A_MINALL},{"Desk R",A_DESK_R},
+  {"Desk L",A_DESK_L},{"Calc",A_CALC},{"Explorer",A_EXPLORER},
+  {"Win Sett",A_SETTINGS_W},{"Alt-Tab",A_ALTTAB},
   {"Undo",A_UNDO},{"Redo",A_REDO},{"Save",A_SAVE},{"Copy",A_COPY},
-  {"Paste",A_PASTE},{"Cut",A_CUT},{"Select All",A_SELALL},
-  {"Close Win",A_CLOSE},{"Find",A_FIND},{"Replace",A_REPLACE},
-  {"New File",A_NEWFILE},{"Open File",A_OPENFILE},
-  {"OS: Fit",A_OS_FIT},{"OS: Front",A_OS_FRONT},{"OS: Top",A_OS_TOP},
-  {"OS: Right",A_OS_RIGHT},{"OS: Iso",A_OS_ISO},{"OS: ZFit",A_OS_ZOOM_FIT},
-  {"OS: Extrude",A_OS_EXTRUDE},{"OS: Sketch",A_OS_SKETCH},
-  {"OS: Mate",A_OS_MATE},{"OS: Assem.",A_OS_ASSEMBLY},
-  {"KC: Route",A_KC_ROUTE},{"KC: AddNet",A_KC_ADD_NET},
+  {"Paste",A_PASTE},{"Cut",A_CUT},{"Sel All",A_SELALL},
+  {"CloseWin",A_CLOSE},{"Find",A_FIND},{"Replace",A_REPLACE},
+  {"New File",A_NEWFILE},{"OpenFile",A_OPENFILE},
+  {"OS: Fit",A_OS_FIT},{"OS:Front",A_OS_FRONT},{"OS: Top",A_OS_TOP},
+  {"OS:Right",A_OS_RIGHT},{"OS: Iso",A_OS_ISO},{"OS: ZFit",A_OS_ZOOM_FIT},
+  {"OS:Extrd",A_OS_EXTRUDE},{"OS:Sktch",A_OS_SKETCH},
+  {"OS: Mate",A_OS_MATE},{"OS:Assem",A_OS_ASSEMBLY},
+  {"KC:Route",A_KC_ROUTE},{"KC:AddNt",A_KC_ADD_NET},
   {"KC: ZFit",A_KC_ZOOM_FIT},{"KC: DRC",A_KC_DRC},{"KC: 3D",A_KC_3D},
-  {"KC: Copper",A_KC_COPPER},{"KC: Gerber",A_KC_GERBER},
+  {"KC:Coppr",A_KC_COPPER},{"KC:Gerbr",A_KC_GERBER},
   {"KC: Rats",A_KC_RATSNEST},
   {"PTT",A_PUSH_TO_TALK},{"Reload",A_RELOAD},{"Map",A_MAP},
-  {"Scoreboard",A_SCORE},{"Fullscreen",A_FULLSCREEN},
-  {"OBS Rec",A_OBS_REC},{"OBS Stream",A_OBS_STREAM},{"Discord",A_DISCORD},
-  {"New Tab",A_NEW_TAB},{"Close Tab",A_CLOSE_TAB},{"Reopen Tab",A_RETAB},
+  {"Score",A_SCORE},{"FullScrn",A_FULLSCREEN},
+  {"OBS Rec",A_OBS_REC},{"OBS Strm",A_OBS_STREAM},{"Discord",A_DISCORD},
+  {"New Tab",A_NEW_TAB},{"CloseTab",A_CLOSE_TAB},{"ReopnTab",A_RETAB},
   {"Back",A_BACK},{"Forward",A_FORWARD},{"Refresh",A_REFRESH},
   {"Addr Bar",A_ADDR_BAR},
   {"LTS Move",A_LTS_MOVE},{"LTS GND",A_LTS_GND},{"LTS VCC",A_LTS_VCC},
   {"LTS Res",A_LTS_RES},{"LTS Cap",A_LTS_CAP},{"LTS Comp",A_LTS_COMP},
   {"LTS Wire",A_LTS_WIRE},{"LTS Run",A_LTS_RUN},
   // Linux / GNOME shortcuts
-  {"LX:Term",A_LX_TERMINAL},{"LX:ZoomIn",A_LX_ZOOM_IN},{"LX:ZoomOt",A_LX_ZOOM_OUT},
-  {"LX:ZmRst",A_LX_ZOOM_RST},{"LX:Notif",A_LX_NOTIF},{"LX:SplitH",A_LX_SPLIT_H},
-  {"LX:SplitV",A_LX_SPLIT_V},{"LX:NewTrm",A_LX_NEW_TERM},{"LX:MaxWin",A_LX_MAXIMIZE},
+  {"LX:Term",A_LX_TERMINAL},{"LX:ZmIn",A_LX_ZOOM_IN},{"LX:ZmOut",A_LX_ZOOM_OUT},
+  {"LX:ZmRst",A_LX_ZOOM_RST},{"LX:Notif",A_LX_NOTIF},{"LX:SpltH",A_LX_SPLIT_H},
+  {"LX:SpltV",A_LX_SPLIT_V},{"LX:NwTrm",A_LX_NEW_TERM},{"LX:MaxWn",A_LX_MAXIMIZE},
   {"LX:HalfL",A_LX_HALF_L},{"LX:HalfR",A_LX_HALF_R},
-  {"LX:Mv WS1",A_LX_MOVE_WS1},{"LX:Mv WS2",A_LX_MOVE_WS2},
+  {"LX:MvWS1",A_LX_MOVE_WS1},{"LX:MvWS2",A_LX_MOVE_WS2},
 };
 const int ACTION_LIB_SIZE = sizeof(ACTION_LIB)/sizeof(Action);
 
 // ════════════════════════════════════════════════
-//  PRESETS
+//  PRESETS — 12 keys each (4 wide × 3 tall)
 // ════════════════════════════════════════════════
 #define NUM_PRESETS  8
-#define MAX_BTNS     8
+#define PRESETS_VER  1        // bump to invalidate stored NVS presets
 
-struct ButtonAction { char label[9]; int id; };
-struct Preset { char name[10]; int btnCount; ButtonAction btns[MAX_BTNS]; };
+struct KeyAction { char label[9]; int id; };
+struct Preset    { char name[10]; KeyAction keys[NUM_KEYS]; };
 
 Preset presets[NUM_PRESETS] = {
-  // ONSHAPE — all 8 CAD shortcuts (same on all OS, web-based)
-  {"ONSHAPE",8,{
+  {"ONSHAPE",{
     {"Fit",A_OS_FIT},{"Front",A_OS_FRONT},{"Top",A_OS_TOP},{"Right",A_OS_RIGHT},
-    {"Iso",A_OS_ISO},{"Extrude",A_OS_EXTRUDE},{"Sketch",A_OS_SKETCH},{"Mate",A_OS_MATE}
+    {"Iso",A_OS_ISO},{"ZFit",A_OS_ZOOM_FIT},{"Extrude",A_OS_EXTRUDE},{"Sketch",A_OS_SKETCH},
+    {"Mate",A_OS_MATE},{"Assem",A_OS_ASSEMBLY},{"Undo",A_UNDO},{"Save",A_SAVE}
   }},
-  // KICAD — all 8 PCB shortcuts (same on all OS)
-  {"KICAD",8,{
+  {"KICAD",{
     {"Route",A_KC_ROUTE},{"ZFit",A_KC_ZOOM_FIT},{"DRC",A_KC_DRC},{"3D",A_KC_3D},
-    {"Copper",A_KC_COPPER},{"Gerber",A_KC_GERBER},{"Rats",A_KC_RATSNEST},{"AddNet",A_KC_ADD_NET}
+    {"Copper",A_KC_COPPER},{"Gerber",A_KC_GERBER},{"Rats",A_KC_RATSNEST},{"AddNet",A_KC_ADD_NET},
+    {"Undo",A_UNDO},{"Save",A_SAVE},{"Copy",A_COPY},{"Paste",A_PASTE}
   }},
-  // MUSIC — 8 buttons, media + browser controls
-  {"MUSIC",8,{
+  {"MUSIC",{
     {"Play",A_PLAY},{"Next",A_NEXT},{"Prev",A_PREV},{"Mute",A_MUTE},
-    {"Vol Up",A_VOLUP},{"Vol Dn",A_VOLDN},{"New Tab",A_NEW_TAB},{"Close",A_CLOSE_TAB}
+    {"Vol Up",A_VOLUP},{"Vol Dn",A_VOLDN},{"Spotify",A_SPOTIFY},{"New Tab",A_NEW_TAB},
+    {"CloseTab",A_CLOSE_TAB},{"Back",A_BACK},{"Forward",A_FORWARD},{"Refresh",A_REFRESH}
   }},
-  // LTSPICE — all 8 schematic shortcuts
-  {"LTSPICE",8,{
+  {"LTSPICE",{
     {"Move",A_LTS_MOVE},{"GND",A_LTS_GND},{"VCC",A_LTS_VCC},{"Res",A_LTS_RES},
-    {"Cap",A_LTS_CAP},{"AddComp",A_LTS_COMP},{"Wire",A_LTS_WIRE},{"Run",A_LTS_RUN}
+    {"Cap",A_LTS_CAP},{"AddComp",A_LTS_COMP},{"Wire",A_LTS_WIRE},{"Run",A_LTS_RUN},
+    {"Undo",A_UNDO},{"Save",A_SAVE},{"Copy",A_COPY},{"Paste",A_PASTE}
   }},
-  // GAMING — 8 buttons
-  {"GAMING",8,{
+  {"GAMING",{
     {"PTT",A_PUSH_TO_TALK},{"Reload",A_RELOAD},{"Map",A_MAP},{"Score",A_SCORE},
-    {"FullScr",A_FULLSCREEN},{"OBSRec",A_OBS_REC},{"OBSStr",A_OBS_STREAM},{"Discord",A_DISCORD}
+    {"FullScr",A_FULLSCREEN},{"OBS Rec",A_OBS_REC},{"OBS Str",A_OBS_STREAM},{"Discord",A_DISCORD},
+    {"Mute",A_MUTE},{"Snip",A_SNIP},{"Full SS",A_SS_FULL},{"Task",A_TASK}
   }},
-  // CUSTOM1 — Linux system shortcuts (Win mode: equivalent Windows shortcuts)
-  {"SYS",8,{
-    {"Term",A_LX_TERMINAL},   // Ctrl+Alt+T  (Win: Win+R → cmd)      → A_CALC in Win mode
-    {"Lock",A_LOCK},          // Super+L     (same both OS)
-    {"Snip",A_SNIP},          // Shift+PrtSc (Win: Win+Shift+S)
-    {"Files",A_EXPLORER},     // Super+E     (same both OS → Nautilus/Explorer)
-    {"MaxWin",A_LX_MAXIMIZE}, // Super+Up    (Win: Win+Up)
-    {"HalfL",A_LX_HALF_L},   // Super+Left  (Win: Win+Left)
-    {"HalfR",A_LX_HALF_R},   // Super+Right (Win: Win+Right)
-    {"Show Dk",A_MINALL}      // Super+D     (Win: Win+M)
+  {"SYS",{
+    {"Term",A_LX_TERMINAL},{"Lock",A_LOCK},{"Snip",A_SNIP},{"Files",A_EXPLORER},
+    {"MaxWin",A_LX_MAXIMIZE},{"HalfL",A_LX_HALF_L},{"HalfR",A_LX_HALF_R},{"Show Dk",A_MINALL},
+    {"Task",A_TASK},{"Desk L",A_DESK_L},{"Desk R",A_DESK_R},{"Calc",A_CALC}
   }},
-  // CUSTOM2 — Linux workspace + terminal dev shortcuts
-  {"DEV",8,{
-    {"Term",A_LX_TERMINAL},   // Ctrl+Alt+T  — open new terminal
-    {"NewTab",A_LX_NEW_TERM}, // Ctrl+Shift+T — new terminal tab
-    {"SplitH",A_LX_SPLIT_H}, // Ctrl+Shift+E — horizontal split (Tilix)
-    {"SplitV",A_LX_SPLIT_V}, // Ctrl+Shift+O — vertical split (Tilix)
-    {"Desk R",A_DESK_R},      // Ctrl+Alt+Right — next workspace
-    {"Desk L",A_DESK_L},      // Ctrl+Alt+Left  — prev workspace
-    {"Zoom In",A_LX_ZOOM_IN}, // Ctrl+= — zoom in terminal/browser
-    {"ZoomOut",A_LX_ZOOM_OUT} // Ctrl+- — zoom out
+  {"DEV",{
+    {"Term",A_LX_TERMINAL},{"NewTab",A_LX_NEW_TERM},{"SplitH",A_LX_SPLIT_H},{"SplitV",A_LX_SPLIT_V},
+    {"Desk R",A_DESK_R},{"Desk L",A_DESK_L},{"Zoom In",A_LX_ZOOM_IN},{"ZoomOut",A_LX_ZOOM_OUT},
+    {"ZmRst",A_LX_ZOOM_RST},{"Undo",A_UNDO},{"Save",A_SAVE},{"Find",A_FIND}
   }},
-  // CUSTOM3 — Universal text editing (works on all OS)
-  {"EDIT",8,{
+  {"EDIT",{
     {"Undo",A_UNDO},{"Redo",A_REDO},{"Save",A_SAVE},{"Copy",A_COPY},
-    {"Paste",A_PASTE},{"Find",A_FIND},{"Rplace",A_REPLACE},{"SelAll",A_SELALL}
+    {"Paste",A_PASTE},{"Cut",A_CUT},{"Find",A_FIND},{"Rplace",A_REPLACE},
+    {"SelAll",A_SELALL},{"NewFile",A_NEWFILE},{"OpenFile",A_OPENFILE},{"Alt-Tab",A_ALTTAB}
   }},
 };
 
 // ════════════════════════════════════════════════
 //  SCREEN / STATE
 // ════════════════════════════════════════════════
-enum Screen { SCR_MAIN, SCR_BUILD, SCR_BUILD_COUNT, SCR_BUILD_SLOT, SCR_BUILD_ACTION, SCR_SETTINGS };
+enum Screen {
+  SCR_MAIN, SCR_SYSMENU, SCR_PRESET, SCR_SETTINGS,
+  SCR_EDIT_BRIGHT, SCR_EDIT_SLEEP, SCR_DEVICES,
+  SCR_BUILD_PRESET, SCR_BUILD_KEYS, SCR_BUILD_ACTION
+};
 Screen currentScreen = SCR_MAIN;
 
-enum EncMode { MODE_VOLUME=0, MODE_SCROLL, MODE_ZOOM, MODE_ALTTAB, _MODE_COUNT };
-const char*    modeNames[_MODE_COUNT]  = {"VOL","SCROLL","ZOOM","ALT-TAB"};
-const uint16_t modeColors[_MODE_COUNT] = {C_CYAN, C_AMBER, C_MAGENTA, C_YELLOW};
-
-int  activePreset  = 0;
-int  encMode       = MODE_VOLUME;
-bool locked        = false;
-
-int  lastFlashBtn  = -1;
+int  activePreset = 0;
+int  lastFlashKey = -1;
 unsigned long flashUntil = 0;
 
-unsigned long altReleaseAt = 0;
-bool          altHeld      = false;
+int  buildPreset  = 0;
+int  buildSlot    = 0;
+int  buildActPage = 0;
 
-int  settingsSel = 0;
-bool settingsAdj = false;
-int  tmpBright   = 180;
-int  tmpSleepMin = 5;   // 0 = no sleep
-int  tmpSens     = 3;
-bool tmpLinux    = false;
-const char* settingsItems[] = {"Brightness","Sleep(min)","Enc.Sens","OS Layout","Exit+Save"};
-const int   SETTINGS_COUNT  = 5;
+bool lastBleConn    = false;
+bool lastPairingUi  = false;
 
-int  buildPreset   = 0;
-int  buildCount    = 4;
-int  buildSlot     = 0;
-int  buildActSel   = 0;
-int  buildActScroll= 0;
+char toastMsg[28] = "";
+uint16_t toastColor = C_CYAN;
+unsigned long toastUntil = 0;
 
-long encPos      = 0;
-long lastEncPos  = 0;
-unsigned long lastEncTime = 0;
-long menuAccum   = 0;
-
-bool lastBleConn = false;
-
-static int  wakeKeyBtnIdx  = WAKEKEY_NONE;
+static int  wakeKeyIdx     = WAKEKEY_NONE;
 static bool wakeKeyPending = false;
 static unsigned long wakeTimeMs = 0;
 
 unsigned long lastActivityMs = 0;
 static inline void recordActivity() { lastActivityMs = millis(); }
 
+Preferences prefs;
+
 // ════════════════════════════════════════════════
-//  TFT
+//  TFT — direct drawing + small sprites only
+//  (full 320×240 sprite = 150KB, impossible with BLE active)
 // ════════════════════════════════════════════════
-TFT_eSPI    tft = TFT_eSPI();
-TFT_eSprite spr = TFT_eSprite(&tft);
+TFT_eSPI    tft    = TFT_eSPI();
+TFT_eSprite sprBar = TFT_eSprite(&tft);   // 320×26 status bar
+TFT_eSprite sprCell= TFT_eSprite(&tft);   // 78×68 reusable key cell
+
+// Landscape cell grid: 4 cols × 3 rows below the 26px status bar
+static inline int cellX(int i){ return 1 + (i % 4) * 80; }
+static inline int cellY(int i){ return 28 + (i / 4) * 70; }
+#define CELL_W 78
+#define CELL_H 68
 
 // ════════════════════════════════════════════════
 //  FORWARD DECLARATIONS
 // ════════════════════════════════════════════════
-void drawMain(); void drawBuild(); void drawBuildCount();
-void drawBuildSlot(); void drawBuildAction(); void drawSettings();
-void redraw(); void fireAction(int id);
-void onButtonPressed(int idx); void handleEncoderAction();
+void redraw();
+void drawMain(); void drawSysMenu(); void drawPresetPicker();
+void drawSettings(); void drawEditor(); void drawDevices();
+void drawBuildPreset(); void drawBuildKeys(); void drawBuildAction();
 void drawReconnectHUD(const char* keyName);
+void fireAction(int id);
 
 // ════════════════════════════════════════════════
-//  RECONNECT HUD
+//  PERSISTENCE (NVS)
 // ════════════════════════════════════════════════
-void drawReconnectHUD(const char* keyName) {
-  spr.fillSprite(C_BG);
-  spr.fillRect(0,0,128,18,C_SURF);
-  spr.drawFastHLine(0,18,128,C_AMBER);
-  spr.setTextColor(C_AMBER,C_SURF); spr.setTextSize(1);
-  spr.setCursor(10,5); spr.print("RECONNECTING...");
-  int dots=(millis()/400)%4;
-  spr.setTextColor(C_DIM,C_SURF); spr.setCursor(106,5);
-  for(int d=0;d<dots;d++) spr.print(".");
-  uint16_t pulse=((millis()/300)%2)?C_AMBER:C_SURF2;
-  spr.fillCircle(64,62,22,C_SURF2);
-  spr.drawCircle(64,62,22,pulse);
-  spr.drawCircle(64,62,16,pulse);
-  spr.setTextColor(C_AMBER,C_SURF2); spr.setTextSize(2);
-  spr.setCursor(58,53); spr.print("B");
-  spr.setTextSize(1);
-  spr.fillRoundRect(10,95,108,28,6,C_SURF2);
-  spr.drawRoundRect(10,95,108,28,6,C_AMBER);
-  spr.setTextColor(C_DIM,C_SURF2); spr.setCursor(16,100); spr.print("Queued:");
-  spr.setTextColor(C_WHITE,C_SURF2);
-  int kx=64-(strlen(keyName)*3);
-  spr.setCursor(max(16,kx),112); spr.print(keyName);
-  spr.setTextColor(C_DIM,C_BG);
-  spr.setCursor(8,135); spr.print("Will fire when connected");
-  spr.pushSprite(0,0);
+void loadState() {
+  prefs.begin("mpv5", false);
+  backlightBrightness = prefs.getInt("bright", 180);
+  int sleepMin        = prefs.getInt("sleepMin", 5);
+  sleepTimeoutMs      = (sleepMin == 0) ? 0UL : (unsigned long)sleepMin * 60000UL;
+  linuxLayout         = prefs.getBool("linux", false);
+  activePreset        = constrain(prefs.getInt("preset", 0), 0, NUM_PRESETS-1);
+  activeSlot          = constrain(prefs.getInt("slot", 0), 0, NUM_SLOTS-1);
+  if (prefs.getBytesLength("slots") == sizeof(hostSlots))
+    prefs.getBytes("slots", hostSlots, sizeof(hostSlots));
+  if (prefs.getInt("pver", 0) == PRESETS_VER &&
+      prefs.getBytesLength("presets") == sizeof(presets))
+    prefs.getBytes("presets", presets, sizeof(presets));
+}
+
+void saveSettings() {
+  prefs.putInt("bright", backlightBrightness);
+  prefs.putInt("sleepMin", (sleepTimeoutMs == 0) ? 0 : (int)(sleepTimeoutMs / 60000UL));
+  prefs.putBool("linux", linuxLayout);
+  prefs.putInt("preset", activePreset);
+}
+
+void saveSlots() {
+  prefs.putBytes("slots", hostSlots, sizeof(hostSlots));
+  prefs.putInt("slot", activeSlot);
+}
+
+void savePresets() {
+  prefs.putBytes("presets", presets, sizeof(presets));
+  prefs.putInt("pver", PRESETS_VER);
 }
 
 // ════════════════════════════════════════════════
-//  ENCODER READ
+//  MATRIX SCAN
+//  Rows driven LOW one at a time (inactive rows hi-Z, tolerant of
+//  breadboard wiring without diodes); cols read with pullups.
+//  Logical key idx = colLine*4 + rowLine  → 4-wide × 3-tall UI grid.
 // ════════════════════════════════════════════════
-static const int8_t ENC_TABLE[]={0,-1,1,0,1,0,0,-1,-1,0,0,1,0,1,-1,0};
-void updateEncoder() {
-  static uint8_t prev=0;
-  uint8_t ab=0;
-  if(digitalRead(ENC_CLK)) ab|=0x02;
-  if(digitalRead(ENC_DT))  ab|=0x01;
-  prev=(prev<<2)|ab;
-  int8_t d=ENC_TABLE[prev&0x0F];
-  if(d!=0){
-    unsigned long now=millis();
-    if(now-lastEncTime<ENC_DEBOUNCE_MS) return;
-    lastEncTime=now;
-    encPos+=d*ENC_DIR;
+void matrixInit() {
+  for (int r = 0; r < 4; r++) pinMode(ROW_PINS[r], INPUT);
+  for (int c = 0; c < 3; c++) pinMode(COL_PINS[c], INPUT_PULLUP);
+}
+
+uint16_t scanMatrixRaw() {
+  uint16_t bits = 0;
+  for (int r = 0; r < 4; r++) {
+    pinMode(ROW_PINS[r], OUTPUT);
+    digitalWrite(ROW_PINS[r], LOW);
+    delayMicroseconds(25);
+    for (int c = 0; c < 3; c++)
+      if (digitalRead(COL_PINS[c]) == LOW) bits |= 1u << (c * 4 + r);
+    pinMode(ROW_PINS[r], INPUT);
   }
+  return bits;
 }
 
+// Debounced per-key state
+bool keyStable[NUM_KEYS]  = {};
+bool keyRaw[NUM_KEYS]     = {};
+unsigned long keyChangeMs[NUM_KEYS] = {};
+unsigned long keyDownMs[NUM_KEYS]   = {};
+bool keyHoldFired[NUM_KEYS] = {};
+
 // ════════════════════════════════════════════════
-//  STATUS BAR
+//  STATUS BAR — slot chips = Easy-Switch "LEDs"
 // ════════════════════════════════════════════════
-void drawStatusBar(uint16_t accent=C_CYAN) {
-  spr.fillRect(0,0,128,18,C_SURF);
-  spr.drawFastHLine(0,18,128,C_BORDER);
-  spr.fillCircle(6,9,4,bleConnected?C_GREEN:C_RED);
-  spr.setTextSize(1);
-  spr.setTextColor(bleConnected?C_GREEN:C_RED,C_SURF);
-  spr.setCursor(13,5); spr.print(bleConnected?"BLE":"---");
-  spr.setTextColor(accent,C_SURF);
-  int nx=44-(strlen(presets[activePreset].name)*3);
-  spr.setCursor(max(36,nx),5); spr.print(presets[activePreset].name);
-  // OS layout indicator (right side, before lock icon)
-  spr.setTextColor(linuxLayout?C_AMBER:C_DIM,C_SURF);
-  spr.setCursor(84,5); spr.print(linuxLayout?"LX":"W");
-  if(locked){
-    spr.fillRoundRect(108,3,12,9,2,C_YELLOW);
-    spr.fillRect(110,1,6,5,C_BG);
-    spr.fillRoundRect(111,1,4,5,2,C_YELLOW);
+void drawStatusBar(const char* title, uint16_t accent) {
+  sprBar.fillSprite(C_SURF);
+  sprBar.setTextColor(accent, C_SURF);
+  sprBar.setTextSize(2);
+  sprBar.setCursor(6, 6);
+  sprBar.print(title);
+
+  // OS layout tag
+  sprBar.setTextSize(1);
+  sprBar.setTextColor(C_DIM, C_SURF);
+  sprBar.setCursor(216, 10);
+  sprBar.print(linuxLayout ? "LNX" : "WIN");
+
+  // Slot chips 1 2 3
+  for (int i = 0; i < NUM_SLOTS; i++) {
+    int x = 244 + i * 26;
+    uint16_t fill, border, txt;
+    if (i == activeSlot) {
+      if      (bleConnected) fill = C_GREEN;
+      else if (pairingMode)  fill = C_MAGENTA;
+      else                   fill = C_AMBER;
+      border = fill; txt = 0x0000;
+    } else {
+      fill = C_SURF2;
+      border = hostSlots[i].bonded ? C_DIM : C_BORDER;
+      txt = hostSlots[i].bonded ? C_DIM : C_BORDER;
+    }
+    sprBar.fillRoundRect(x, 4, 22, 18, 4, fill);
+    sprBar.drawRoundRect(x, 4, 22, 18, 4, border);
+    sprBar.setTextColor(txt, fill);
+    sprBar.setCursor(x + 9, 9);
+    sprBar.print(i + 1);
   }
+  sprBar.pushSprite(0, 0);
 }
 
 // ════════════════════════════════════════════════
-//  DRAW MAIN
+//  KEY CELL — drawn via reusable sprite, flicker free
+// ════════════════════════════════════════════════
+void drawCell(int i, const char* line1, const char* line2,
+              uint16_t accent, bool filled) {
+  uint16_t bg = filled ? accent : C_SURF;
+  sprCell.fillSprite(C_BG);
+  sprCell.fillRoundRect(0, 0, CELL_W, CELL_H, 8, bg);
+  sprCell.drawRoundRect(0, 0, CELL_W, CELL_H, 8, filled ? accent : C_BORDER);
+
+  sprCell.setTextSize(1);
+  sprCell.setTextColor(filled ? 0x0000 : C_DIM, bg);
+  sprCell.setCursor(5, 4);
+  sprCell.print(i + 1);
+  if (i == KEY_FN) { sprCell.setCursor(60, 4); sprCell.print("FN"); }
+
+  if (line1 && line1[0]) {
+    int w = strlen(line1) * 6;
+    sprCell.setTextColor(filled ? 0x0000 : C_WHITE, bg);
+    sprCell.setCursor(max(3, (CELL_W - w) / 2), line2 && line2[0] ? 24 : 30);
+    sprCell.print(line1);
+  }
+  if (line2 && line2[0]) {
+    int w = strlen(line2) * 6;
+    sprCell.setTextColor(filled ? 0x0000 : accent, bg);
+    sprCell.setCursor(max(3, (CELL_W - w) / 2), 42);
+    sprCell.print(line2);
+  }
+  sprCell.pushSprite(cellX(i), cellY(i));
+}
+
+void drawCellEmpty(int i) { drawCell(i, "", "", C_BORDER, false); }
+
+// ════════════════════════════════════════════════
+//  TOAST — transient centered message
+// ════════════════════════════════════════════════
+void showToast(const char* msg, uint16_t color, unsigned long ms) {
+  strncpy(toastMsg, msg, sizeof(toastMsg) - 1);
+  toastMsg[sizeof(toastMsg) - 1] = '\0';
+  toastColor = color;
+  toastUntil = millis() + ms;
+  int w = strlen(toastMsg) * 12 + 28;
+  int x = (320 - w) / 2;
+  tft.fillRoundRect(x, 96, w, 48, 10, C_SURF2);
+  tft.drawRoundRect(x, 96, w, 48, 10, color);
+  tft.setTextSize(2);
+  tft.setTextColor(color, C_SURF2);
+  tft.setCursor(x + 14, 113);
+  tft.print(toastMsg);
+}
+
+// ════════════════════════════════════════════════
+//  SCREENS
 // ════════════════════════════════════════════════
 void drawMain() {
-  spr.fillSprite(C_BG);
-  uint16_t ac=PRESET_COL[activePreset];
-  for(int x=4;x<128;x+=8) for(int y=22;y<160;y+=8) spr.drawPixel(x,y,C_GRID);
-  drawStatusBar(ac);
-
-  if(!locked) {
-    spr.fillRoundRect(16,24,96,20,8,C_SURF);
-    spr.drawRoundRect(16,24,96,20,8,modeColors[encMode]);
-    spr.fillCircle(26,34,4,modeColors[encMode]);
-    spr.setTextColor(modeColors[encMode],C_SURF);
-    spr.setTextSize(1);
-    spr.setCursor(34,29); spr.print(modeNames[encMode]);
-    spr.fillTriangle(10,32,10,40,5,36,modeColors[encMode]);
-    spr.fillTriangle(118,32,118,40,123,36,modeColors[encMode]);
-
-    int cx=64,cy=84;
-    uint16_t ic=modeColors[encMode];
-    switch(encMode){
-      case MODE_VOLUME:
-        spr.fillRect(cx-20,cy-12,10,24,ic);
-        spr.fillTriangle(cx-10,cy-20,cx-10,cy+20,cx+18,cy,ic);
-        spr.drawFastHLine(cx+22,cy-10,5,ic);
-        spr.drawFastHLine(cx+22,cy,5,ic);
-        spr.drawFastHLine(cx+22,cy+10,5,ic);
-        break;
-      case MODE_SCROLL:
-        spr.drawRoundRect(cx-8,cy-26,16,52,7,ic);
-        spr.fillRoundRect(cx-5,cy-14,10,28,4,ic);
-        spr.fillTriangle(cx,cy-30,cx-5,cy-22,cx+5,cy-22,ic);
-        spr.fillTriangle(cx,cy+30,cx-5,cy+22,cx+5,cy+22,ic);
-        break;
-      case MODE_ZOOM:
-        spr.drawCircle(cx-4,cy-4,18,ic);
-        spr.drawLine(cx+11,cy+11,cx+22,cy+22,ic);
-        spr.drawFastHLine(cx-14,cy-4,20,ic);
-        spr.drawFastVLine(cx-4,cy-14,20,ic);
-        break;
-      case MODE_ALTTAB:
-        for(int i=0;i<3;i++) spr.drawRoundRect(cx-22+i*6,cy-14+i*5,30,22,3,ic);
-        spr.fillRoundRect(cx-10,cy-6,30,22,3,ic);
-        spr.setTextColor(C_BG,ic); spr.setCursor(cx-4,cy+1); spr.print("ALT");
-        break;
-    }
-
-    spr.setTextSize(1);
-    spr.setTextColor(C_DIM,C_BG);
-    spr.setCursor(6,118); spr.print("Turn="); spr.setTextColor(modeColors[encMode],C_BG); spr.print(modeNames[encMode]);
-    spr.setTextColor(C_DIM,C_BG);
-    spr.setCursor(6,129); spr.print("Enc=Lock  HoldEnc=Menu");
-
-    spr.drawFastHLine(0,141,128,C_BORDER);
-    int page=activePreset/4;
-    for(int p=0;p<4;p++){
-      int idx=page*4+p;
-      if(idx>=NUM_PRESETS) break;
-      int tx=2+p*31;
-      bool act=(idx==activePreset);
-      uint16_t pc=PRESET_COL[idx];
-      if(act){ spr.fillRoundRect(tx,143,29,15,3,pc); spr.setTextColor(C_BG,pc); }
-      else   { spr.drawRoundRect(tx,143,29,15,3,C_BORDER); spr.setTextColor(C_DIM,C_BG); }
-      spr.setCursor(tx+3,148);
-      char ab[5]; strncpy(ab,presets[idx].name,4); ab[4]='\0';
-      spr.print(ab);
-    }
-    for(int pg=0;pg<2;pg++){
-      bool cur=(pg==page);
-      if(cur) spr.fillCircle(120+pg*5,150,2,ac);
-      else    spr.drawCircle(120+pg*5,150,2,C_DIM);
-    }
-  } else {
-    spr.fillRect(0,20,128,14,C_SURF);
-    spr.setTextSize(1);
-    spr.setTextColor(C_YELLOW,C_SURF);
-    spr.setCursor(4,24); spr.print("LOCKED ");
-    spr.setTextColor(modeColors[encMode],C_SURF);
-    spr.print(modeNames[encMode]);
-    spr.drawFastHLine(0,34,128,C_BORDER);
-
-    int cnt=presets[activePreset].btnCount;
-    int rows=(cnt+1)/2;
-    int bw=58, bh=min(32,(125-(rows-1)*4)/rows);
-
-    for(int i=0;i<cnt;i++){
-      int col=i%2, row=i/2;
-      int x=4+col*(bw+6);
-      int y=37+row*(bh+4);
-      bool flash=(i==lastFlashBtn && millis()<flashUntil);
-      uint16_t bg=flash?ac:C_SURF2;
-      uint16_t fg=flash?C_BG:C_WHITE;
-      uint16_t br=flash?C_WHITE:C_BORDER;
-      spr.fillRoundRect(x,y,bw,bh,4,bg);
-      spr.drawRoundRect(x,y,bw,bh,4,br);
-      spr.setTextColor(flash?bg:C_DIM,bg);
-      spr.setCursor(x+3,y+2); spr.print(i+1);
-      spr.setTextColor(fg,bg);
-      const char* lbl=presets[activePreset].btns[i].label;
-      int lx=x+max(0,(bw-(int)strlen(lbl)*6)/2);
-      spr.setCursor(lx,y+(bh/2)-3); spr.print(lbl);
-    }
-
-    if(encMode==MODE_ALTTAB && altHeld){
-      spr.fillRect(0,152,128,8,C_BG);
-      spr.setTextColor(C_YELLOW,C_BG);
-      spr.setCursor(14,153); spr.print("< ALT SELECTING... >");
-    }
+  tft.fillScreen(C_BG);
+  uint16_t accent = PRESET_COLORS[activePreset];
+  drawStatusBar(presets[activePreset].name, accent);
+  for (int i = 0; i < NUM_KEYS; i++) {
+    KeyAction& ka = presets[activePreset].keys[i];
+    bool flash = (i == lastFlashKey);
+    if (ka.id == A_NONE) drawCellEmpty(i);
+    else drawCell(i, ka.label, nullptr, accent, flash);
   }
-  spr.pushSprite(0,0);
 }
 
-// ════════════════════════════════════════════════
-//  DRAW BUILD
-// ════════════════════════════════════════════════
-void drawBuild() {
-  spr.fillSprite(C_BG);
-  drawStatusBar(C_BUILD);
-  spr.fillRect(0,20,128,18,C_SURF);
-  spr.drawFastHLine(0,38,128,C_BUILD);
-  spr.setTextColor(C_BUILD,C_SURF); spr.setTextSize(1);
-  spr.setCursor(6,26); spr.print("BUILD MODE");
-  spr.setTextColor(C_DIM,C_SURF); spr.setCursor(76,26); spr.print("LEGO");
-  spr.setTextColor(C_WHITE,C_BG); spr.setCursor(6,46); spr.print("Editing:");
-  spr.setTextColor(PRESET_COL[buildPreset],C_BG); spr.setCursor(6,58); spr.print(presets[buildPreset].name);
-  spr.setTextColor(C_DIM,C_BG); spr.setCursor(6,74); spr.print("Active slots:");
-  spr.setTextColor(C_WHITE,C_BG); spr.setCursor(84,74); spr.print(presets[buildPreset].btnCount);
-  int pc=presets[buildPreset].btnCount;
-  for(int i=0;i<pc && i<6;i++){
-    int px=6+(i%3)*40, py=86+(i/3)*16;
-    spr.fillRoundRect(px,py,36,13,3,C_SURF2);
-    spr.setTextColor(C_WHITE,C_SURF2); spr.setCursor(px+3,py+3);
-    char tmp[6]; strncpy(tmp,presets[buildPreset].btns[i].label,5); tmp[5]='\0';
-    spr.print(tmp);
+void drawSysMenu() {
+  tft.fillScreen(C_BG);
+  drawStatusBar("SYSTEM", C_LTBLUE);
+  for (int i = 0; i < NUM_SLOTS; i++) {
+    char l1[10]; snprintf(l1, sizeof(l1), "SLOT %d", i + 1);
+    const char* l2 = (i == activeSlot) ? (bleConnected ? "ACTIVE" : (pairingMode ? "PAIRING" : "WAITING"))
+                                       : (hostSlots[i].bonded ? "linked" : "empty");
+    uint16_t col = (i == activeSlot) ? (bleConnected ? C_GREEN : (pairingMode ? C_MAGENTA : C_AMBER))
+                                     : (hostSlots[i].bonded ? C_CYAN : C_BORDER);
+    drawCell(i, l1, l2, col, i == activeSlot);
   }
-  spr.drawFastHLine(0,130,128,C_BORDER);
-  spr.setTextColor(C_DIM,C_BG); spr.setCursor(6,136); spr.print("Turn=pick preset");
-  spr.setTextColor(C_BUILD,C_BG); spr.setCursor(6,148); spr.print("Press=START EDITING");
-  spr.pushSprite(0,0);
+  drawCell(3,  "PRESETS", nullptr, C_YELLOW, false);
+  drawCellEmpty(4); drawCellEmpty(5); drawCellEmpty(6);
+  drawCell(7,  "SETTINGS", nullptr, C_CYAN, false);
+  drawCell(8,  "FN", "release=X", C_LTBLUE, false);
+  drawCellEmpty(9);
+  drawCellEmpty(10);
+  drawCell(11, "BUILD", nullptr, C_BUILD, false);
 }
 
-// ════════════════════════════════════════════════
-//  DRAW BUILD COUNT
-// ════════════════════════════════════════════════
-void drawBuildCount() {
-  spr.fillSprite(C_BG);
-  drawStatusBar(C_BUILD);
-  spr.fillRect(0,20,128,18,C_SURF);
-  spr.drawFastHLine(0,38,128,C_BUILD);
-  spr.setTextColor(C_BUILD,C_SURF); spr.setTextSize(1);
-  spr.setCursor(6,26); spr.print("STEP 1: HOW MANY BTNS?");
-  spr.setTextColor(C_DIM,C_BG); spr.setCursor(6,44); spr.print("Turn encoder to choose");
-  spr.setTextSize(4);
-  spr.setTextColor(C_BUILD,C_BG);
-  char buf[3]; sprintf(buf,"%d",buildCount);
-  spr.setCursor(64-(strlen(buf)*12),58); spr.print(buf);
-  spr.setTextSize(1);
-  spr.setTextColor(C_DIM,C_BG); spr.setCursor(28,100); spr.print("buttons active");
-  for(int i=0;i<MAX_BTNS;i++){
-    int dx=18+i*12,dy=116;
-    if(i<buildCount) spr.fillCircle(dx,dy,5,C_BUILD);
-    else             spr.drawCircle(dx,dy,5,C_BORDER);
-  }
-  spr.setTextColor(C_BUILD,C_BG); spr.setCursor(6,154); spr.print("Press=confirm");
-  spr.pushSprite(0,0);
+void drawPresetPicker() {
+  tft.fillScreen(C_BG);
+  drawStatusBar("PRESET", C_YELLOW);
+  for (int i = 0; i < NUM_PRESETS; i++)
+    drawCell(i, presets[i].name, nullptr, PRESET_COLORS[i], i == activePreset);
+  drawCellEmpty(8); drawCellEmpty(9); drawCellEmpty(10);
+  drawCell(11, "BACK", nullptr, C_DIM, false);
 }
 
-// ════════════════════════════════════════════════
-//  DRAW BUILD SLOT
-// ════════════════════════════════════════════════
-void drawBuildSlot() {
-  spr.fillSprite(C_BG);
-  drawStatusBar(C_BUILD);
-  spr.fillRect(0,20,128,18,C_SURF);
-  spr.drawFastHLine(0,38,128,C_BUILD);
-  spr.setTextColor(C_BUILD,C_SURF); spr.setTextSize(1);
-  spr.setCursor(6,26); spr.print("STEP 2: PICK SLOT");
-  int cnt=buildCount;
-  int rows=(cnt+1)/2;
-  int bw=56, bh=min(32,(120-(rows-1)*4)/rows);
-  for(int i=0;i<cnt;i++){
-    int col=i%2,row=i/2;
-    int x=4+col*(bw+6), y=42+row*(bh+4);
-    bool sel=(i==buildSlot);
-    spr.fillRoundRect(x,y,bw,bh,4,sel?C_BUILD:C_SURF);
-    spr.drawRoundRect(x,y,bw,bh,4,sel?C_WHITE:C_BORDER);
-    spr.setTextColor(sel?C_BG:C_DIM,sel?C_BUILD:C_SURF); spr.setCursor(x+3,y+2); spr.print(i+1);
-    spr.setTextColor(sel?C_WHITE:C_DIM,sel?C_BUILD:C_SURF);
-    const char* lbl=presets[buildPreset].btns[i].label;
-    spr.setCursor(x+max(0,(bw-(int)strlen(lbl)*6)/2),y+(bh/2)-3); spr.print(lbl);
-  }
-  spr.setTextColor(C_BUILD,C_BG); spr.setCursor(6,155); spr.print("Press=assign action");
-  spr.pushSprite(0,0);
-}
-
-// ════════════════════════════════════════════════
-//  DRAW BUILD ACTION
-// ════════════════════════════════════════════════
-void drawBuildAction() {
-  spr.fillSprite(C_BG);
-  drawStatusBar(C_BUILD);
-  spr.fillRect(0,20,128,18,C_SURF);
-  spr.drawFastHLine(0,38,128,C_BUILD);
-  spr.setTextColor(C_BUILD,C_SURF); spr.setTextSize(1);
-  char hdr[22]; sprintf(hdr,"SLOT %d: PICK ACTION",buildSlot+1);
-  spr.setCursor(6,26); spr.print(hdr);
-  const int VISIBLE=6;
-  for(int i=0;i<VISIBLE;i++){
-    int idx=buildActScroll+i;
-    if(idx>=ACTION_LIB_SIZE) break;
-    bool sel=(idx==buildActSel);
-    int ry=40+i*19;
-    if(sel){ spr.fillRoundRect(2,ry,116,17,3,C_BUILD); spr.setTextColor(C_WHITE,C_BUILD); }
-    else   { spr.setTextColor(C_DIM,C_BG); }
-    spr.setCursor(8,ry+5); spr.print(ACTION_LIB[idx].label);
-    if(sel){ spr.setCursor(110,ry+5); spr.print(">"); }
-  }
-  int sbH=6*19;
-  int sbPos=40+(buildActSel*(sbH-8))/max(1,ACTION_LIB_SIZE-1);
-  spr.fillRect(122,40,4,sbH,C_BORDER);
-  spr.fillRect(122,sbPos,4,8,C_BUILD);
-  spr.setTextColor(C_BUILD,C_BG); spr.setCursor(6,156); spr.print("Press=assign  Hold=back");
-  spr.pushSprite(0,0);
-}
-
-// ════════════════════════════════════════════════
-//  DRAW SETTINGS
-// ════════════════════════════════════════════════
 void drawSettings() {
-  spr.fillSprite(C_BG);
-  drawStatusBar(C_CYAN);
-  spr.fillRect(0,20,128,18,C_SURF);
-  spr.drawFastHLine(0,38,128,C_CYAN);
-  spr.setTextColor(C_CYAN,C_SURF); spr.setTextSize(1);
-  spr.setCursor(6,26); spr.print("SETTINGS");
-  spr.setTextColor(C_DIM,C_SURF); spr.setCursor(76,26); spr.print("enc=nav");
-
-  // 5 items, 22px each — tighter to fit
-  for(int i=0;i<SETTINGS_COUNT;i++){
-    bool sel=(i==settingsSel);
-    int ry=42+i*22;
-    if(sel){ spr.fillRoundRect(2,ry,124,20,4,C_SURF2); spr.drawRoundRect(2,ry,124,20,4,C_CYAN); }
-    spr.setTextColor(sel?C_WHITE:C_DIM, sel?C_SURF2:C_BG);
-    spr.setCursor(10,ry+6); spr.print(settingsItems[i]);
-    spr.setTextColor(sel?C_CYAN:C_BORDER, sel?C_SURF2:C_BG);
-
-    char vb[12];
-    if(i==0){
-      sprintf(vb,"%d",tmpBright);
-      spr.setCursor(96,ry+6); spr.print(vb);
-    } else if(i==1){
-      if(tmpSleepMin==0){
-        spr.setTextColor(sel?C_GREEN:C_DIM, sel?C_SURF2:C_BG);
-        spr.setCursor(88,ry+6); spr.print("OFF");
-      } else {
-        sprintf(vb,"%dmin",tmpSleepMin);
-        spr.setCursor(84,ry+6); spr.print(vb);
-      }
-    } else if(i==2){
-      sprintf(vb,"%d",tmpSens);
-      spr.setCursor(104,ry+6); spr.print(vb);
-    } else if(i==3){
-      // OS Layout toggle
-      spr.setTextColor(tmpLinux ? C_AMBER : C_LTBLUE, sel?C_SURF2:C_BG);
-      spr.setCursor(80,ry+6); spr.print(tmpLinux ? "LINUX" : "WIN");
-    } else if(i==4){
-      spr.setTextColor(C_GREEN, sel?C_SURF2:C_BG);
-      spr.setCursor(96,ry+6); spr.print("SAVE");
-    }
-    if(sel && settingsAdj && i<3){
-      spr.setTextColor(C_AMBER,C_SURF2); spr.setCursor(116,ry+6); spr.print("<");
-    }
-  }
-  spr.setTextColor(C_DIM,C_BG); spr.setCursor(2,153); spr.print("Press=select  Hold=back");
-  spr.pushSprite(0,0);
+  tft.fillScreen(C_BG);
+  drawStatusBar("SETTINGS", C_CYAN);
+  char v[10];
+  snprintf(v, sizeof(v), "%d", backlightBrightness);
+  drawCell(0, "BRIGHT", v, C_CYAN, false);
+  int sm = (sleepTimeoutMs == 0) ? 0 : (int)(sleepTimeoutMs / 60000UL);
+  if (sm == 0) snprintf(v, sizeof(v), "OFF");
+  else         snprintf(v, sizeof(v), "%d min", sm);
+  drawCell(1, "SLEEP", v, C_AMBER, false);
+  drawCell(2, "OS", linuxLayout ? "LINUX" : "WINDOWS", C_GREEN, false);
+  drawCell(3, "DEVICES", nullptr, C_MAGENTA, false);
+  for (int i = 4; i < 11; i++) drawCellEmpty(i);
+  drawCell(11, "SAVE", "+ exit", C_WHITE, false);
 }
 
-// ════════════════════════════════════════════════
-//  REDRAW
-// ════════════════════════════════════════════════
-void redraw(){
-  switch(currentScreen){
-    case SCR_MAIN:         drawMain();        break;
-    case SCR_BUILD:        drawBuild();       break;
-    case SCR_BUILD_COUNT:  drawBuildCount();  break;
-    case SCR_BUILD_SLOT:   drawBuildSlot();   break;
-    case SCR_BUILD_ACTION: drawBuildAction(); break;
-    case SCR_SETTINGS:     drawSettings();    break;
+void drawEditor() {
+  bool isBright = (currentScreen == SCR_EDIT_BRIGHT);
+  tft.fillScreen(C_BG);
+  drawStatusBar(isBright ? "BRIGHTNESS" : "SLEEP", isBright ? C_CYAN : C_AMBER);
+
+  char v[12];
+  if (isBright) snprintf(v, sizeof(v), "%d", backlightBrightness);
+  else {
+    int sm = (sleepTimeoutMs == 0) ? 0 : (int)(sleepTimeoutMs / 60000UL);
+    if (sm == 0) snprintf(v, sizeof(v), "OFF");
+    else         snprintf(v, sizeof(v), "%d min", sm);
+  }
+  tft.setTextSize(4);
+  tft.setTextColor(C_WHITE, C_BG);
+  int w = strlen(v) * 24;
+  tft.setCursor((320 - w) / 2, 70);
+  tft.print(v);
+
+  // bar
+  int maxV = isBright ? 255 : 60;
+  int curV = isBright ? backlightBrightness
+                      : ((sleepTimeoutMs == 0) ? 0 : (int)(sleepTimeoutMs / 60000UL));
+  tft.drawRoundRect(40, 130, 240, 14, 5, C_BORDER);
+  int bw = (curV * 236) / maxV;
+  if (bw > 0) tft.fillRoundRect(42, 132, bw, 10, 4, isBright ? C_CYAN : C_AMBER);
+
+  tft.setTextSize(1);
+  tft.setTextColor(C_DIM, C_BG);
+  tft.setCursor(48, 170);  tft.print("K5 = -");
+  tft.setCursor(232, 170); tft.print("K8 = +");
+  tft.setCursor(116, 200); tft.print("K12 / FN = done");
+}
+
+void drawDevices() {
+  tft.fillScreen(C_BG);
+  drawStatusBar("DEVICES", C_MAGENTA);
+  for (int i = 0; i < NUM_SLOTS; i++) {
+    int y = 30 + i * 56;
+    bool act = (i == activeSlot);
+    uint16_t col = act ? (bleConnected ? C_GREEN : (pairingMode ? C_MAGENTA : C_AMBER)) : C_BORDER;
+    tft.fillRoundRect(4, y, 312, 50, 8, C_SURF);
+    tft.drawRoundRect(4, y, 312, 50, 8, col);
+    tft.setTextSize(2);
+    tft.setTextColor(act ? col : C_WHITE, C_SURF);
+    tft.setCursor(14, y + 8);
+    tft.printf("SLOT %d", i + 1);
+    tft.setTextSize(1);
+    tft.setTextColor(C_DIM, C_SURF);
+    tft.setCursor(14, y + 32);
+    if (hostSlots[i].bonded) {
+      const uint8_t* a = hostSlots[i].addr;
+      tft.printf("%02X:%02X:%02X:%02X:%02X:%02X", a[5], a[4], a[3], a[2], a[1], a[0]);
+    } else tft.print("empty — hold key to pair");
+    if (act) {
+      tft.setTextColor(col, C_SURF);
+      tft.setCursor(230, y + 8);
+      tft.print(bleConnected ? "CONNECTED" : (pairingMode ? "PAIRING..." : "WAITING"));
+    }
+  }
+  tft.setTextSize(1);
+  tft.setTextColor(C_DIM, C_BG);
+  tft.setCursor(8, 226);
+  tft.print("K1-3 switch  hold=pair  K5-7 clear  K11 hold=wipe all  K12 back");
+}
+
+void drawBuildPreset() {
+  tft.fillScreen(C_BG);
+  drawStatusBar("BUILD: PICK", C_BUILD);
+  for (int i = 0; i < NUM_PRESETS; i++)
+    drawCell(i, presets[i].name, nullptr, PRESET_COLORS[i], false);
+  drawCellEmpty(8); drawCellEmpty(9); drawCellEmpty(10);
+  drawCell(11, "CANCEL", nullptr, C_DIM, false);
+}
+
+void drawBuildKeys() {
+  tft.fillScreen(C_BG);
+  char t[16];
+  snprintf(t, sizeof(t), "ED:%s", presets[buildPreset].name);
+  drawStatusBar(t, C_BUILD);
+  for (int i = 0; i < NUM_KEYS; i++) {
+    KeyAction& ka = presets[buildPreset].keys[i];
+    if (i == KEY_FN)
+      drawCell(i, ka.id == A_NONE ? "---" : ka.label, "tap=DONE", C_BUILD, false);
+    else
+      drawCell(i, ka.id == A_NONE ? "---" : ka.label, nullptr, C_BUILD, false);
+  }
+}
+
+void drawBuildAction() {
+  tft.fillScreen(C_BG);
+  int pages = (ACTION_LIB_SIZE + 7) / 8;
+  char t[18];
+  snprintf(t, sizeof(t), "K%d %d/%d", buildSlot + 1, buildActPage + 1, pages);
+  drawStatusBar(t, C_BUILD);
+  for (int i = 0; i < 8; i++) {
+    int idx = buildActPage * 8 + i;
+    if (idx < ACTION_LIB_SIZE)
+      drawCell(i, ACTION_LIB[idx].label, nullptr, C_BUILD, false);
+    else drawCellEmpty(i);
+  }
+  drawCell(8,  "BACK", nullptr, C_DIM, false);
+  drawCellEmpty(9);
+  drawCell(10, "< PAGE", nullptr, C_LTBLUE, false);
+  drawCell(11, "PAGE >", nullptr, C_LTBLUE, false);
+}
+
+void drawReconnectHUD(const char* keyName) {
+  tft.fillScreen(C_BG);
+  drawStatusBar("RECONNECT", C_AMBER);
+  uint16_t pulse = ((millis() / 300) % 2) ? C_AMBER : C_SURF2;
+  tft.fillCircle(160, 110, 30, C_SURF2);
+  tft.drawCircle(160, 110, 30, pulse);
+  tft.drawCircle(160, 110, 22, pulse);
+  tft.setTextSize(3);
+  tft.setTextColor(C_AMBER, C_SURF2);
+  tft.setCursor(152, 100);
+  tft.print("B");
+  tft.fillRoundRect(80, 160, 160, 34, 8, C_SURF2);
+  tft.drawRoundRect(80, 160, 160, 34, 8, C_AMBER);
+  tft.setTextSize(1);
+  tft.setTextColor(C_DIM, C_SURF2);
+  tft.setCursor(90, 166);
+  tft.print("Queued:");
+  tft.setTextSize(2);
+  tft.setTextColor(C_WHITE, C_SURF2);
+  int kx = 160 - (int)strlen(keyName) * 6;
+  tft.setCursor(max(90, kx), 176);
+  tft.print(keyName);
+  tft.setTextSize(1);
+  tft.setTextColor(C_DIM, C_BG);
+  tft.setCursor(96, 210);
+  tft.print("Will fire when connected");
+}
+
+void redraw() {
+  switch (currentScreen) {
+    case SCR_MAIN:         drawMain();         break;
+    case SCR_SYSMENU:      drawSysMenu();      break;
+    case SCR_PRESET:       drawPresetPicker(); break;
+    case SCR_SETTINGS:     drawSettings();     break;
+    case SCR_EDIT_BRIGHT:
+    case SCR_EDIT_SLEEP:   drawEditor();       break;
+    case SCR_DEVICES:      drawDevices();      break;
+    case SCR_BUILD_PRESET: drawBuildPreset();  break;
+    case SCR_BUILD_KEYS:   drawBuildKeys();    break;
+    case SCR_BUILD_ACTION: drawBuildAction();  break;
   }
 }
 
 // ════════════════════════════════════════════════
 //  FIRE ACTION  (OS-layout aware)
 // ════════════════════════════════════════════════
-void fireAction(int id){
-  if(!bleConnected) return;
-  switch(id){
+void fireAction(int id) {
+  if (id == A_NONE || !bleConnected) return;
+  switch (id) {
     // ── Media / Consumer (same on all OS) ──────
     case A_PLAY:      sendConsumer(CONSUMER_PLAY_PAUSE); break;
     case A_NEXT:      sendConsumer(CONSUMER_NEXT);       break;
@@ -925,11 +1007,11 @@ void fireAction(int id){
     case A_VOLUP:     sendConsumer(CONSUMER_VOL_UP);     break;
     case A_VOLDN:     sendConsumer(CONSUMER_VOL_DOWN);   break;
 
-    // ── Universal text editing (same on all OS) ─
+    // ── Universal text editing ─────────────────
     case A_UNDO:      sendKey(MOD_LCTRL, KEY_Z); break;
     case A_REDO:
-      if(linuxLayout) sendKey(MOD_LCTRL|MOD_LSHIFT, KEY_Z);  // Linux standard
-      else            sendKey(MOD_LCTRL, KEY_Y);              // Windows
+      if (linuxLayout) sendKey(MOD_LCTRL | MOD_LSHIFT, KEY_Z);
+      else             sendKey(MOD_LCTRL, KEY_Y);
       break;
     case A_SAVE:      sendKey(MOD_LCTRL, KEY_S); break;
     case A_COPY:      sendKey(MOD_LCTRL, KEY_C); break;
@@ -940,75 +1022,59 @@ void fireAction(int id){
     case A_REPLACE:   sendKey(MOD_LCTRL, KEY_H); break;
     case A_NEWFILE:   sendKey(MOD_LCTRL, KEY_N); break;
     case A_OPENFILE:  sendKey(MOD_LCTRL, KEY_O); break;
-    case A_CLOSE:
-      sendKey(MOD_LALT, KEY_F4); break;   // works on both
+    case A_CLOSE:     sendKey(MOD_LALT, KEY_F4); break;
+    case A_ALTTAB:    sendKey(MOD_LALT, KEY_TAB); break;
 
-    // ── OS-specific system actions ──────────────
-    case A_LOCK:
-      if(linuxLayout) sendKey(MOD_LGUI, KEY_L);           // Super+L (GNOME/KDE)
-      else            sendKey(MOD_LGUI, KEY_L);           // Win+L
-      break;
+    // ── OS-specific system actions ─────────────
+    case A_LOCK:      sendKey(MOD_LGUI, KEY_L); break;   // Super+L / Win+L
     case A_SNIP:
-      if(linuxLayout) sendKey(MOD_LSHIFT, KEY_PRTSC);     // Shift+PrtSc (GNOME region screenshot)
-      else            sendKey(MOD_LGUI|MOD_LSHIFT, KEY_S); // Win+Shift+S
+      if (linuxLayout) sendKey(MOD_LSHIFT, KEY_PRTSC);            // GNOME region
+      else             sendKey(MOD_LGUI | MOD_LSHIFT, KEY_S);     // Win+Shift+S
       break;
     case A_SS_FULL:
-      if(linuxLayout) sendKey(0, KEY_PRTSC);              // PrtSc
-      else            sendKey(MOD_LGUI, KEY_PRTSC);       // Win+PrtSc
+      if (linuxLayout) sendKey(0, KEY_PRTSC);
+      else             sendKey(MOD_LGUI, KEY_PRTSC);
       break;
-    case A_TASK:
-      if(linuxLayout) sendKey(MOD_LGUI, KEY_TAB);         // Super+Tab (GNOME Activities)
-      else            sendKey(MOD_LGUI, KEY_TAB);         // Win+Tab
-      break;
+    case A_TASK:      sendKey(MOD_LGUI, KEY_TAB); break;  // Activities / Win+Tab
     case A_MINALL:
-      if(linuxLayout) sendKey(MOD_LGUI, KEY_D);           // Super+D (show desktop)
-      else            sendKey(MOD_LGUI, KEY_M);           // Win+M
+      if (linuxLayout) sendKey(MOD_LGUI, KEY_D);
+      else             sendKey(MOD_LGUI, KEY_M);
       break;
     case A_DESK_R:
-      if(linuxLayout) sendKey(MOD_LCTRL|MOD_LALT, KEY_RIGHT_ARR);  // Ctrl+Alt+Right (GNOME)
-      else            sendKey(MOD_LCTRL|MOD_LGUI,  KEY_RIGHT_ARR); // Ctrl+Win+Right
+      if (linuxLayout) sendKey(MOD_LCTRL | MOD_LALT, KEY_RIGHT_ARR);
+      else             sendKey(MOD_LCTRL | MOD_LGUI, KEY_RIGHT_ARR);
       break;
     case A_DESK_L:
-      if(linuxLayout) sendKey(MOD_LCTRL|MOD_LALT, KEY_LEFT_ARR);
-      else            sendKey(MOD_LCTRL|MOD_LGUI,  KEY_LEFT_ARR);
+      if (linuxLayout) sendKey(MOD_LCTRL | MOD_LALT, KEY_LEFT_ARR);
+      else             sendKey(MOD_LCTRL | MOD_LGUI, KEY_LEFT_ARR);
       break;
-    case A_EXPLORER:
-      if(linuxLayout) sendKey(MOD_LGUI, KEY_E);           // Super+E (Nautilus on most DEs)
-      else            sendKey(MOD_LGUI, KEY_E);           // Win+E
-      break;
-    case A_SETTINGS_W:
-      if(linuxLayout) sendKey(MOD_LGUI, KEY_I);           // Super+I (GNOME Settings)
-      else            sendKey(MOD_LGUI, KEY_I);           // Win+I
-      break;
-    case A_SPOTIFY:
-      if(linuxLayout) sendKey(MOD_LGUI, KEY_3);           // user-assigned, same key
-      else            sendKey(MOD_LGUI, KEY_3);
-      break;
+    case A_EXPLORER:  sendKey(MOD_LGUI, KEY_E); break;
+    case A_SETTINGS_W: sendKey(MOD_LGUI, KEY_I); break;
+    case A_SPOTIFY:   sendKey(MOD_LGUI, KEY_3); break;
     case A_CALC:
-      if(linuxLayout){
-        // On Linux, just send Super — user can type calc in the launcher
-        sendKey(MOD_LGUI, 0);
+      if (linuxLayout) {
+        sendKey(MOD_LGUI, 0);        // open launcher, type manually
       } else {
         sendKey(MOD_LGUI, KEY_R); delay(300);
-        { uint8_t calcKeys[] = {KEY_C,KEY_A,KEY_L,KEY_C};
-          for(int i=0;i<4;i++){ sendKey(0,calcKeys[i]); delay(30); }
-          sendKey(0,0x28); }
+        { uint8_t calcKeys[] = {KEY_C, KEY_A, KEY_L, KEY_C};
+          for (int i = 0; i < 4; i++) { sendKey(0, calcKeys[i]); delay(30); }
+          sendKey(0, KEY_ENTER); }
       }
       break;
 
-    // ── OnShape (same shortcuts on all OS) ─────
+    // ── OnShape ────────────────────────────────
     case A_OS_FIT:       sendKey(0, KEY_F); break;
     case A_OS_FRONT:     sendKey(MOD_LSHIFT, KEY_1); break;
     case A_OS_TOP:       sendKey(MOD_LSHIFT, KEY_2); break;
     case A_OS_RIGHT:     sendKey(MOD_LSHIFT, KEY_3); break;
     case A_OS_ISO:       sendKey(MOD_LSHIFT, KEY_7); break;
-    case A_OS_ZOOM_FIT:  sendKey(MOD_LCTRL|MOD_LSHIFT, KEY_F); break;
+    case A_OS_ZOOM_FIT:  sendKey(MOD_LCTRL | MOD_LSHIFT, KEY_F); break;
     case A_OS_EXTRUDE:   sendKey(MOD_LSHIFT, KEY_E); break;
     case A_OS_SKETCH:    sendKey(0, KEY_S); break;
     case A_OS_MATE:      sendKey(MOD_LCTRL, KEY_M); break;
-    case A_OS_ASSEMBLY:  sendKey(MOD_LALT,  KEY_A); break;
+    case A_OS_ASSEMBLY:  sendKey(MOD_LALT, KEY_A); break;
 
-    // ── KiCad (same on all OS) ─────────────────
+    // ── KiCad ──────────────────────────────────
     case A_KC_ROUTE:     sendKey(0, KEY_X); break;
     case A_KC_ADD_NET:   sendKey(0, KEY_W); break;
     case A_KC_ZOOM_FIT:  sendKey(0, KEY_5); break;
@@ -1018,26 +1084,26 @@ void fireAction(int id){
     case A_KC_GERBER:    sendKey(MOD_LCTRL, KEY_P); break;
     case A_KC_RATSNEST:  sendKey(0, KEY_BACKTICK); break;
 
-    // ── Gaming (same on all OS) ────────────────
+    // ── Gaming ─────────────────────────────────
     case A_PUSH_TO_TALK: sendKey(0, KEY_V); break;
     case A_RELOAD:       sendKey(0, KEY_R); break;
     case A_MAP:          sendKey(0, KEY_M); break;
     case A_SCORE:        sendKey(0, KEY_TAB); break;
     case A_FULLSCREEN:   sendKey(0, KEY_F11); break;
-    case A_OBS_REC:      sendKey(MOD_LCTRL|MOD_LALT, KEY_R); break;
-    case A_OBS_STREAM:   sendKey(MOD_LCTRL|MOD_LALT, KEY_S); break;
-    case A_DISCORD:      sendKey(MOD_LCTRL|MOD_LALT, KEY_A); break;
+    case A_OBS_REC:      sendKey(MOD_LCTRL | MOD_LALT, KEY_R); break;
+    case A_OBS_STREAM:   sendKey(MOD_LCTRL | MOD_LALT, KEY_S); break;
+    case A_DISCORD:      sendKey(MOD_LCTRL | MOD_LALT, KEY_A); break;
 
-    // ── Browser (same on all OS) ───────────────
+    // ── Browser ────────────────────────────────
     case A_NEW_TAB:      sendKey(MOD_LCTRL, KEY_T); break;
     case A_CLOSE_TAB:    sendKey(MOD_LCTRL, KEY_W); break;
-    case A_RETAB:        sendKey(MOD_LCTRL|MOD_LSHIFT, KEY_T); break;
-    case A_BACK:         sendKey(MOD_LALT,  KEY_LEFT_ARR); break;
-    case A_FORWARD:      sendKey(MOD_LALT,  KEY_RIGHT_ARR); break;
+    case A_RETAB:        sendKey(MOD_LCTRL | MOD_LSHIFT, KEY_T); break;
+    case A_BACK:         sendKey(MOD_LALT, KEY_LEFT_ARR); break;
+    case A_FORWARD:      sendKey(MOD_LALT, KEY_RIGHT_ARR); break;
     case A_REFRESH:      sendKey(MOD_LCTRL, KEY_R); break;
     case A_ADDR_BAR:     sendKey(MOD_LCTRL, KEY_L); break;
 
-    // ── LTspice (same on all OS) ───────────────
+    // ── LTspice ────────────────────────────────
     case A_LTS_MOVE:     sendKey(0, KEY_M); break;
     case A_LTS_GND:      sendKey(0, KEY_G); break;
     case A_LTS_VCC:      sendKey(0, KEY_V); break;
@@ -1047,177 +1113,219 @@ void fireAction(int id){
     case A_LTS_WIRE:     sendKey(0, KEY_W); break;
     case A_LTS_RUN:      sendKey(MOD_LALT, KEY_R); break;
 
-    // ── Linux / GNOME exclusive actions ───────
-    // These fire regardless of linuxLayout flag —
-    // they're only assigned to presets when in Linux mode
-    case A_LX_TERMINAL:  sendKey(MOD_LCTRL|MOD_LALT, KEY_T); break;     // Ctrl+Alt+T
-    case A_LX_ZOOM_IN:   sendKey(MOD_LCTRL, KEY_EQUAL); break;           // Ctrl+=
-    case A_LX_ZOOM_OUT:  sendKey(MOD_LCTRL, KEY_MINUS); break;           // Ctrl+-
-    case A_LX_ZOOM_RST:  sendKey(MOD_LCTRL, KEY_0); break;               // Ctrl+0
-    case A_LX_NOTIF:     sendKey(MOD_LGUI, KEY_V); break;                 // Super+V
-    case A_LX_SPLIT_H:   sendKey(MOD_LCTRL|MOD_LSHIFT, KEY_E); break;   // Ctrl+Shift+E (Tilix)
-    case A_LX_SPLIT_V:   sendKey(MOD_LCTRL|MOD_LSHIFT, KEY_O); break;   // Ctrl+Shift+O (Tilix)
-    case A_LX_NEW_TERM:  sendKey(MOD_LCTRL|MOD_LSHIFT, KEY_T); break;   // Ctrl+Shift+T
-    case A_LX_MAXIMIZE:  sendKey(MOD_LGUI, KEY_UP_ARR); break;           // Super+Up
-    case A_LX_HALF_L:    sendKey(MOD_LGUI, KEY_LEFT_ARR); break;         // Super+Left
-    case A_LX_HALF_R:    sendKey(MOD_LGUI, KEY_RIGHT_ARR); break;        // Super+Right
-    case A_LX_MOVE_WS1:  sendKey(MOD_LGUI|MOD_LSHIFT, KEY_1); break;    // Super+Shift+1
-    case A_LX_MOVE_WS2:  sendKey(MOD_LGUI|MOD_LSHIFT, KEY_2); break;    // Super+Shift+2
+    // ── Linux / GNOME exclusive ────────────────
+    case A_LX_TERMINAL:  sendKey(MOD_LCTRL | MOD_LALT, KEY_T); break;
+    case A_LX_ZOOM_IN:   sendKey(MOD_LCTRL, KEY_EQUAL); break;
+    case A_LX_ZOOM_OUT:  sendKey(MOD_LCTRL, KEY_MINUS); break;
+    case A_LX_ZOOM_RST:  sendKey(MOD_LCTRL, KEY_0); break;
+    case A_LX_NOTIF:     sendKey(MOD_LGUI, KEY_V); break;
+    case A_LX_SPLIT_H:   sendKey(MOD_LCTRL | MOD_LSHIFT, KEY_E); break;
+    case A_LX_SPLIT_V:   sendKey(MOD_LCTRL | MOD_LSHIFT, KEY_O); break;
+    case A_LX_NEW_TERM:  sendKey(MOD_LCTRL | MOD_LSHIFT, KEY_T); break;
+    case A_LX_MAXIMIZE:  sendKey(MOD_LGUI, KEY_UP_ARR); break;
+    case A_LX_HALF_L:    sendKey(MOD_LGUI, KEY_LEFT_ARR); break;
+    case A_LX_HALF_R:    sendKey(MOD_LGUI, KEY_RIGHT_ARR); break;
+    case A_LX_MOVE_WS1:  sendKey(MOD_LGUI | MOD_LSHIFT, KEY_1); break;
+    case A_LX_MOVE_WS2:  sendKey(MOD_LGUI | MOD_LSHIFT, KEY_2); break;
   }
 }
 
 // ════════════════════════════════════════════════
-//  ENCODER ACTION
+//  INPUT — per-screen tap / hold handlers
 // ════════════════════════════════════════════════
-void handleEncoderAction(){
-  if(encPos==lastEncPos) return;
-  long delta=encPos-lastEncPos;
-  lastEncPos=encPos;
+unsigned long holdThresholdFor(int i) {   // 0 = no hold action for this key
+  switch (currentScreen) {
+    case SCR_MAIN:       return (i == KEY_FN) ? FN_MENU_MS : 0;
+    case SCR_SYSMENU:    return (i <= 2) ? PAIR_HOLD_MS : 0;
+    case SCR_DEVICES:    return (i <= 2) ? PAIR_HOLD_MS : ((i == 10) ? CLRALL_HOLD_MS : 0);
+    case SCR_BUILD_KEYS: return (i == KEY_FN) ? PAIR_HOLD_MS : 0;
+    default:             return 0;
+  }
+}
+
+void onKeyHold(int i) {
   recordActivity();
-
-  auto menuStep=[&](int thresh=2)->int{
-    menuAccum+=delta;
-    if(menuAccum>=thresh){ menuAccum=0; return 1; }
-    if(menuAccum<=-thresh){ menuAccum=0; return -1; }
-    return 0;
-  };
-
-  if(currentScreen==SCR_SETTINGS){
-    int s=menuStep(); if(!s) return;
-    if(settingsAdj){
-      if(settingsSel==0) tmpBright  =constrain(tmpBright  +s*10,0,255);
-      if(settingsSel==1) tmpSleepMin=constrain(tmpSleepMin+s,0,60);  // 0 = no sleep
-      if(settingsSel==2) tmpSens    =constrain(tmpSens    +s,1,8);
-      if(settingsSel==3) tmpLinux   =!tmpLinux;  // toggle on any turn
-    } else settingsSel=constrain(settingsSel+s,0,SETTINGS_COUNT-1);
-    drawSettings(); return;
-  }
-  if(currentScreen==SCR_BUILD){ int s=menuStep(); if(!s) return; buildPreset=constrain(buildPreset+s,0,NUM_PRESETS-1); drawBuild(); return; }
-  if(currentScreen==SCR_BUILD_COUNT){ int s=menuStep(); if(!s) return; buildCount=constrain(buildCount+s,1,MAX_BTNS); drawBuildCount(); return; }
-  if(currentScreen==SCR_BUILD_SLOT){ int s=menuStep(); if(!s) return; buildSlot=constrain(buildSlot+s,0,buildCount-1); drawBuildSlot(); return; }
-  if(currentScreen==SCR_BUILD_ACTION){
-    int s=menuStep(); if(!s) return;
-    buildActSel=constrain(buildActSel+s,0,ACTION_LIB_SIZE-1);
-    const int VIS=6;
-    if(buildActSel<buildActScroll) buildActScroll=buildActSel;
-    if(buildActSel>=buildActScroll+VIS) buildActScroll=buildActSel-VIS+1;
-    drawBuildAction(); return;
-  }
-  if(currentScreen==SCR_MAIN && !locked){
-    int s=menuStep(5); if(!s) return;
-    encMode=(encMode+s+_MODE_COUNT)%_MODE_COUNT;
-    drawMain(); return;
-  }
-  if(currentScreen==SCR_MAIN && locked){
-    if(!bleConnected) return;
-    static long acc=0;
-    acc+=delta;
-    if(abs(acc)<encoderSensitivity) return;
-    int steps=acc/encoderSensitivity;
-    acc%=encoderSensitivity;
-    int dir=(steps>0)?1:-1;
-    int n=abs(steps);
-    switch(encMode){
-      case MODE_VOLUME:
-        for(int i=0;i<n;i++) sendConsumer(dir>0?CONSUMER_VOL_UP:CONSUMER_VOL_DOWN);
-        break;
-      case MODE_SCROLL:
-        for(int i=0;i<n;i++) sendKey(0, dir>0?KEY_DOWN_ARR:KEY_UP_ARR);
-        break;
-      case MODE_ZOOM:
-        for(int i=0;i<n;i++) sendKey(MOD_LCTRL, dir>0?KEY_EQUAL:KEY_MINUS);
-        break;
-      case MODE_ALTTAB:
-        if(!altHeld){ holdMod(MOD_LALT); altHeld=true; delay(60); }
-        for(int i=0;i<n;i++){
-          if(dir>0) sendKeyWithHeld(0, KEY_TAB);
-          else      sendKeyWithHeld(MOD_LSHIFT, KEY_TAB);
-          delay(30);
-        }
-        altReleaseAt=millis()+ALT_HOLD_MS;
+  char msg[24];
+  switch (currentScreen) {
+    case SCR_MAIN:
+      if (i == KEY_FN) { currentScreen = SCR_SYSMENU; drawSysMenu(); }
+      break;
+    case SCR_SYSMENU:
+      if (i <= 2) {
+        switchToSlot(i, true);
+        currentScreen = SCR_MAIN;
         drawMain();
-        break;
-    }
+        snprintf(msg, sizeof(msg), "PAIRING SLOT %d", i + 1);
+        showToast(msg, C_MAGENTA, 1500);
+      }
+      break;
+    case SCR_DEVICES:
+      if (i <= 2) { switchToSlot(i, true); drawDevices(); }
+      else if (i == 10) {
+        clearAllBonds();
+        drawDevices();
+        showToast("ALL BONDS WIPED", C_RED, 1500);
+      }
+      break;
+    case SCR_BUILD_KEYS:
+      if (i == KEY_FN) {  // edit the FN key's own macro slot
+        buildSlot = KEY_FN; buildActPage = 0;
+        currentScreen = SCR_BUILD_ACTION; drawBuildAction();
+      }
+      break;
+    default: break;
   }
 }
 
-// ════════════════════════════════════════════════
-//  BUTTON HANDLER
-// ════════════════════════════════════════════════
-void onButtonPressed(int idx){
+void onKeyTap(int i) {
   recordActivity();
-  if(idx==9){
-    if(currentScreen==SCR_MAIN){ tmpBright=backlightBrightness; tmpSleepMin=(sleepTimeoutMs==0)?0:(int)(sleepTimeoutMs/60000UL); tmpSens=encoderSensitivity; tmpLinux=linuxLayout; settingsSel=0; settingsAdj=false; currentScreen=SCR_SETTINGS; drawSettings(); }
-    else if(currentScreen==SCR_SETTINGS){ currentScreen=SCR_MAIN; drawMain(); }
-    else if(currentScreen==SCR_BUILD){ currentScreen=SCR_MAIN; drawMain(); }
-    else if(currentScreen==SCR_BUILD_COUNT){ currentScreen=SCR_BUILD; drawBuild(); }
-    else if(currentScreen==SCR_BUILD_SLOT){ currentScreen=SCR_BUILD_COUNT; drawBuildCount(); }
-    else if(currentScreen==SCR_BUILD_ACTION){ currentScreen=SCR_BUILD_SLOT; drawBuildSlot(); }
-    return;
-  }
-  if(currentScreen==SCR_SETTINGS){
-    if(idx!=8) return;
-    if(settingsSel==SETTINGS_COUNT-1){
-      // Exit+Save
-      backlightBrightness=tmpBright;
-      ledcWrite(TFT_BL,backlightBrightness);
-      sleepTimeoutMs=(tmpSleepMin==0) ? 0UL : (unsigned long)tmpSleepMin*60000UL;
-      encoderSensitivity=tmpSens;
-      linuxLayout=tmpLinux;
-      settingsAdj=false;
-      currentScreen=SCR_MAIN;
-      drawMain();
-    } else if(settingsSel==3){
-      // OS Layout — toggle on press too
-      tmpLinux=!tmpLinux;
-      drawSettings();
-    } else {
-      settingsAdj=!settingsAdj;
-      if(!settingsAdj && settingsSel==0){ backlightBrightness=tmpBright; ledcWrite(TFT_BL,backlightBrightness); }
-      drawSettings();
+  char msg[24];
+  switch (currentScreen) {
+
+    case SCR_MAIN: {
+      KeyAction& ka = presets[activePreset].keys[i];
+      if (ka.id == A_NONE) return;
+      lastFlashKey = i; flashUntil = millis() + FLASH_MS;
+      drawCell(i, ka.label, nullptr, PRESET_COLORS[activePreset], true);
+      fireAction(ka.id);
+      break;
     }
+
+    case SCR_SYSMENU:
+      if (i <= 2) {
+        if (i == activeSlot && bleConnected) {
+          currentScreen = SCR_MAIN; drawMain();
+          snprintf(msg, sizeof(msg), "SLOT %d ACTIVE", i + 1);
+          showToast(msg, C_GREEN, 900);
+        } else {
+          switchToSlot(i, false);
+          currentScreen = SCR_MAIN; drawMain();
+          snprintf(msg, sizeof(msg), hostSlots[i].bonded ? "SLOT %d" : "PAIR SLOT %d",
+                   i + 1);
+          showToast(msg, hostSlots[i].bonded ? C_CYAN : C_MAGENTA, 1200);
+        }
+      }
+      else if (i == 3)  { currentScreen = SCR_PRESET;       drawPresetPicker(); }
+      else if (i == 7)  { currentScreen = SCR_SETTINGS;     drawSettings(); }
+      else if (i == 11) { buildPreset = activePreset;
+                          currentScreen = SCR_BUILD_PRESET; drawBuildPreset(); }
+      break;
+
+    case SCR_PRESET:
+      if (i < NUM_PRESETS) {
+        activePreset = i;
+        saveSettings();
+        currentScreen = SCR_MAIN; drawMain();
+      } else if (i == 11 || i == KEY_FN) {
+        currentScreen = SCR_MAIN; drawMain();
+      }
+      break;
+
+    case SCR_SETTINGS:
+      if      (i == 0) { currentScreen = SCR_EDIT_BRIGHT; drawEditor(); }
+      else if (i == 1) { currentScreen = SCR_EDIT_SLEEP;  drawEditor(); }
+      else if (i == 2) { linuxLayout = !linuxLayout; drawSettings(); }
+      else if (i == 3) { currentScreen = SCR_DEVICES; drawDevices(); }
+      else if (i == 11 || i == KEY_FN) {
+        saveSettings();
+        currentScreen = SCR_MAIN; drawMain();
+        showToast("SAVED", C_GREEN, 800);
+      }
+      break;
+
+    case SCR_EDIT_BRIGHT:
+      if (i == 4) { backlightBrightness = max(10,  backlightBrightness - 15);
+                    ledcWrite(TFT_BL, backlightBrightness); drawEditor(); }
+      else if (i == 7) { backlightBrightness = min(255, backlightBrightness + 15);
+                    ledcWrite(TFT_BL, backlightBrightness); drawEditor(); }
+      else if (i == 11 || i == KEY_FN) { currentScreen = SCR_SETTINGS; drawSettings(); }
+      break;
+
+    case SCR_EDIT_SLEEP: {
+      int sm = (sleepTimeoutMs == 0) ? 0 : (int)(sleepTimeoutMs / 60000UL);
+      if      (i == 4) { sm = max(0, sm - 1); }
+      else if (i == 7) { sm = min(60, sm + 1); }
+      else if (i == 11 || i == KEY_FN) { currentScreen = SCR_SETTINGS; drawSettings(); break; }
+      else break;
+      sleepTimeoutMs = (sm == 0) ? 0UL : (unsigned long)sm * 60000UL;
+      drawEditor();
+      break;
+    }
+
+    case SCR_DEVICES:
+      if (i <= 2) { switchToSlot(i, false); drawDevices(); }
+      else if (i >= 4 && i <= 6) {
+        clearSlotBond(i - 4);
+        drawDevices();
+        snprintf(msg, sizeof(msg), "SLOT %d CLEARED", i - 3);
+        showToast(msg, C_RED, 1200);
+      }
+      else if (i == 11 || i == KEY_FN) { currentScreen = SCR_SETTINGS; drawSettings(); }
+      break;
+
+    case SCR_BUILD_PRESET:
+      if (i < NUM_PRESETS) { buildPreset = i; currentScreen = SCR_BUILD_KEYS; drawBuildKeys(); }
+      else if (i == 11)    { currentScreen = SCR_MAIN; drawMain(); }
+      break;
+
+    case SCR_BUILD_KEYS:
+      if (i == KEY_FN) {   // done — persist and leave
+        savePresets();
+        activePreset = buildPreset;
+        saveSettings();
+        currentScreen = SCR_MAIN; drawMain();
+        showToast("PRESET SAVED", C_GREEN, 1200);
+      } else {
+        buildSlot = i; buildActPage = 0;
+        currentScreen = SCR_BUILD_ACTION; drawBuildAction();
+      }
+      break;
+
+    case SCR_BUILD_ACTION: {
+      int pages = (ACTION_LIB_SIZE + 7) / 8;
+      if (i < 8) {
+        int idx = buildActPage * 8 + i;
+        if (idx < ACTION_LIB_SIZE) {
+          strncpy(presets[buildPreset].keys[buildSlot].label, ACTION_LIB[idx].label, 8);
+          presets[buildPreset].keys[buildSlot].label[8] = '\0';
+          presets[buildPreset].keys[buildSlot].id = ACTION_LIB[idx].id;
+          currentScreen = SCR_BUILD_KEYS; drawBuildKeys();
+        }
+      }
+      else if (i == 8)  { currentScreen = SCR_BUILD_KEYS; drawBuildKeys(); }
+      else if (i == 10) { buildActPage = (buildActPage + pages - 1) % pages; drawBuildAction(); }
+      else if (i == 11) { buildActPage = (buildActPage + 1) % pages; drawBuildAction(); }
+      break;
+    }
+
+    default: break;
+  }
+}
+
+void onKeyUp(int i, unsigned long heldMs) {
+  // FN release always closes the SYSTEM menu, hold-fired or not
+  if (i == KEY_FN && currentScreen == SCR_SYSMENU) {
+    currentScreen = SCR_MAIN; drawMain();
     return;
   }
-  if(currentScreen==SCR_BUILD){ if(idx!=8) return; buildCount=presets[buildPreset].btnCount; currentScreen=SCR_BUILD_COUNT; drawBuildCount(); return; }
-  if(currentScreen==SCR_BUILD_COUNT){ if(idx!=8) return; presets[buildPreset].btnCount=buildCount; buildSlot=0; currentScreen=SCR_BUILD_SLOT; drawBuildSlot(); return; }
-  if(currentScreen==SCR_BUILD_SLOT){ if(idx!=8) return; buildActSel=0; buildActScroll=0; currentScreen=SCR_BUILD_ACTION; drawBuildAction(); return; }
-  if(currentScreen==SCR_BUILD_ACTION){
-    if(idx!=8) return;
-    strncpy(presets[buildPreset].btns[buildSlot].label, ACTION_LIB[buildActSel].label, 8);
-    presets[buildPreset].btns[buildSlot].label[8]='\0';
-    presets[buildPreset].btns[buildSlot].id=ACTION_LIB[buildActSel].id;
-    if(buildSlot<buildCount-1){ buildSlot++; buildActSel=0; buildActScroll=0; currentScreen=SCR_BUILD_SLOT; drawBuildSlot(); }
-    else { activePreset=buildPreset; currentScreen=SCR_MAIN; drawMain(); }
-    return;
-  }
-  if(idx==8){
-    locked=!locked;
-    if(!locked){ releaseAll(); altHeld=false; altReleaseAt=0; }
-    drawMain(); return;
-  }
-  if(!locked){ activePreset=idx; drawMain(); return; }
-  if(idx<presets[activePreset].btnCount && bleConnected){
-    lastFlashBtn=idx; flashUntil=millis()+FLASH_MS;
-    drawMain();
-    fireAction(presets[activePreset].btns[idx].id);
-  }
+  if (keyHoldFired[i]) return;                 // hold action already consumed it
+  if (heldMs < KEY_MIN_PRESS_MS) return;
+  onKeyTap(i);
 }
 
 // ════════════════════════════════════════════════
 //  SLEEP / WAKE
 // ════════════════════════════════════════════════
-void maybeEnterSleep(){
-  if(sleepTimeoutMs==0) return;                          // No-sleep mode
-  if(millis()-lastActivityMs < sleepTimeoutMs) return;
-  for(int i=0;i<8;i++) if(digitalRead(BTN_PINS[i])==LOW){ lastActivityMs=millis(); return; }
-  if(digitalRead(ENC_SW)==LOW){ lastActivityMs=millis(); return; }
+void maybeEnterSleep() {
+  if (sleepTimeoutMs == 0) return;
+  if (millis() - lastActivityMs < sleepTimeoutMs) return;
+  if (scanMatrixRaw() != 0) { recordActivity(); return; }
 
   // Blank display
-  ledcWrite(TFT_BL,0);
-  spr.fillSprite(0x0000); spr.pushSprite(0,0);
+  ledcWrite(TFT_BL, 0);
+  tft.fillScreen(0x0000);
   releaseAll();
 
-  // Stop advertising — NimBLE restarts it automatically on wake via onDisconnect
   NimBLEDevice::stopAdvertising();
   delay(200);
 
@@ -1225,8 +1333,13 @@ void maybeEnterSleep(){
   esp_sleep_disable_wakeup_source(ESP_SLEEP_WAKEUP_ALL);
   delay(50);
 
-  for(int i=0;i<8;i++) gpio_wakeup_enable((gpio_num_t)BTN_PINS[i], GPIO_INTR_LOW_LEVEL);
-  gpio_wakeup_enable((gpio_num_t)ENC_SW, GPIO_INTR_LOW_LEVEL);
+  // Any keypress pulls a col low: drive ALL rows low, wake on any col
+  for (int r = 0; r < 4; r++) {
+    pinMode(ROW_PINS[r], OUTPUT);
+    digitalWrite(ROW_PINS[r], LOW);
+  }
+  for (int c = 0; c < 3; c++)
+    gpio_wakeup_enable((gpio_num_t)COL_PINS[c], GPIO_INTR_LOW_LEVEL);
   esp_sleep_enable_gpio_wakeup();
 
   Serial.flush();
@@ -1236,50 +1349,58 @@ void maybeEnterSleep(){
   wakeTimeMs     = millis();
   lastActivityMs = wakeTimeMs;   // reset FIRST — prevents instant re-sleep
 
+  for (int r = 0; r < 4; r++) pinMode(ROW_PINS[r], INPUT);  // back to scan idle
+
   // Re-attach LEDC — dropped silently during light-sleep
   ledcAttach(TFT_BL, 5000, 8);
   ledcWrite(TFT_BL, backlightBrightness);
-  delay(50);  // settle GPIO lines
+  delay(50);
 
-  // NimBLE's onDisconnect already restarted advertising — nothing to do here
+  // Light sleep dropped any BLE connection; if the stack didn't get an
+  // onDisconnect (we weren't connected), restart advertising ourselves
+  if (!bleConnected && !NimBLEDevice::getAdvertising()->isAdvertising())
+    startAdvertisingForSlot();
 
-  wakeKeyBtnIdx=WAKEKEY_NONE; wakeKeyPending=false;
-  for(int i=0;i<8;i++){
-    if(digitalRead(BTN_PINS[i])==LOW){
-      if(locked && i<presets[activePreset].btnCount){ wakeKeyBtnIdx=i; wakeKeyPending=true; }
+  // Wake-key buffer: remember which key woke us, fire it on reconnect
+  wakeKeyIdx = WAKEKEY_NONE; wakeKeyPending = false;
+  uint16_t raw = scanMatrixRaw();
+  for (int i = 0; i < NUM_KEYS; i++) {
+    if (raw & (1u << i)) {
+      if (presets[activePreset].keys[i].id != A_NONE) {
+        wakeKeyIdx = i; wakeKeyPending = true;
+      }
       break;
     }
   }
 
-  if(wakeKeyPending) drawReconnectHUD(presets[activePreset].btns[wakeKeyBtnIdx].label);
+  if (wakeKeyPending && !bleConnected)
+    drawReconnectHUD(presets[activePreset].keys[wakeKeyIdx].label);
   else redraw();
 }
 
 // ════════════════════════════════════════════════
 //  SETUP
 // ════════════════════════════════════════════════
-void setup(){
+void setup() {
   Serial.begin(115200);
 
-  for(int i=0;i<8;i++) pinMode(BTN_PINS[i],INPUT_PULLUP);
-  pinMode(ENC_SW,INPUT_PULLUP);
-  pinMode(ENC_CLK,INPUT_PULLUP);
-  pinMode(ENC_DT,INPUT_PULLUP);
+  loadState();
+  matrixInit();
 
-  // TFT init first — no backlight yet, BLE init will clobber LEDC if we set it now
-  tft.init(); tft.setRotation(2);
-  spr.setColorDepth(16); spr.createSprite(128,160);
+  // TFT init first — no backlight yet, BLE init would clobber LEDC
+  tft.init();
+  tft.setRotation(1);            // landscape 320×240 — use 3 if upside down
+  sprBar.setColorDepth(16);  sprBar.createSprite(320, 26);
+  sprCell.setColorDepth(16); sprCell.createSprite(CELL_W, CELL_H);
 
   // ── NimBLE init ──────────────────────────────
-  // Must happen BEFORE ledcAttach — ESP_PWR_LVL_P9 radio init resets LEDC state
-  NimBLEDevice::init("ESP32 MacroPad");
+  // Must happen BEFORE ledcAttach — radio init resets LEDC state
+  NimBLEDevice::init(DEVICE_NAME);
   NimBLEDevice::setPower(ESP_PWR_LVL_P9);
 
-  // Security: Just Works bonding — no PIN, no confirmation
-  // BLE_SM_PAIR_AUTHREQ_BOND alone (no MITM bit) = accepted by Android & BlueZ
+  // Just Works bonding — no PIN. BOND alone (no MITM) = Android & BlueZ happy
   NimBLEDevice::setSecurityAuth(BLE_SM_PAIR_AUTHREQ_BOND);
   NimBLEDevice::setSecurityIOCap(BLE_HS_IO_NO_INPUT_OUTPUT);
-  // Accept both legacy pairing and SC — older Android needs legacy
   NimBLEDevice::setSecurityInitKey(BLE_SM_PAIR_KEY_DIST_ENC | BLE_SM_PAIR_KEY_DIST_ID);
   NimBLEDevice::setSecurityRespKey(BLE_SM_PAIR_KEY_DIST_ENC | BLE_SM_PAIR_KEY_DIST_ID);
 
@@ -1288,8 +1409,7 @@ void setup(){
 
   pHID = new NimBLEHIDDevice(pServer);
   pHID->setManufacturer("DIY");
-  // Use a generic HID PnP ID (not Microsoft's) — avoids Android driver conflicts
-  pHID->setPnp(0x02, 0x05AC, 0x0220, 0x0100);
+  pHID->setPnp(0x02, 0x05AC, 0x0220, 0x0100);   // generic PnP, no driver conflicts
   pHID->setHidInfo(0x00, 0x01);
   pHID->setReportMap((uint8_t*)hidReportMap, sizeof(hidReportMap));
 
@@ -1298,178 +1418,126 @@ void setup(){
 
   pHID->startServices();
 
-  // ── Start advertising ─────────────────────────
-  // BlueZ (Linux) REQUIRES:
-  //   1. Flags byte: LE General Discoverable + BR/EDR Not Supported
-  //   2. Complete local name in scan response
-  //   3. HID service UUID in primary adv packet
-  //   4. Short interval so Linux scan window catches it
-  NimBLEAdvertising* pAdv = NimBLEDevice::getAdvertising();
+  // First-boot: nothing bonded anywhere → slot 1 starts in pairing mode
+  if (!hostSlots[activeSlot].bonded) pairingMode = true;
+  startAdvertisingForSlot();
 
-  // Build the advertising data manually so flags are guaranteed present
-  NimBLEAdvertisementData advData;
-  // Flags: 0x06 = LE General Discoverable (0x02) | BR/EDR Not Supported (0x04)
-  // BlueZ ignores devices that don't have this exact flags byte
-  advData.setFlags(0x06);
-  advData.setAppearance(0x03C1);           // HID keyboard
-  advData.addServiceUUID(pHID->getHidService()->getUUID());
-  pAdv->setAdvertisementData(advData);
-
-  // Scan response carries the full device name
-  // BlueZ uses this to show "ESP32 MacroPad" instead of raw MAC address
-  NimBLEAdvertisementData scanData;
-  scanData.setName("ESP32 MacroPad");
-  pAdv->setScanResponseData(scanData);
-
-  pAdv->enableScanResponse(true);
-  // 20–30ms interval (units of 0.625ms → 32–48)
-  // Short enough for Linux's default scan window to reliably catch it
-  pAdv->setMinInterval(32);
-  pAdv->setMaxInterval(48);
-  pAdv->start();
-
-  // ── Backlight ON after BLE init ───────────────
-  // ledcAttach here so BLE radio init (above) can't reset the PWM channel
+  // ── Backlight ON only after BLE init ─────────
   ledcAttach(TFT_BL, 5000, 8);
   ledcWrite(TFT_BL, backlightBrightness);
 
-  // Boot splash — drawn now that backlight is reliably on
-  spr.fillSprite(C_BG);
-  spr.setTextColor(C_CYAN,C_BG); spr.setTextSize(2);
-  spr.setCursor(10,30); spr.print("MACRO");
-  spr.setCursor(10,52); spr.print("PAD v5");
-  spr.setTextSize(1);
-  spr.setTextColor(C_BUILD,C_BG); spr.setCursor(10,80); spr.print("BUILD MODE");
-  spr.setTextColor(C_DIM,C_BG);
-  spr.setCursor(10,95);  spr.print("NimBLE stack");
-  spr.setCursor(10,107); spr.print("8 Presets");
-  spr.setCursor(10,119); spr.print("Win + Linux layouts");
-  spr.setCursor(10,131); spr.print("Hold enc 3s=re-pair");
-  spr.pushSprite(0,0);
+  // Boot splash
+  tft.fillScreen(C_BG);
+  tft.setTextSize(3);
+  tft.setTextColor(C_CYAN, C_BG);
+  tft.setCursor(60, 70);  tft.print("MACROPAD v5");
+  tft.setTextSize(1);
+  tft.setTextColor(C_BUILD, C_BG);
+  tft.setCursor(60, 110); tft.print("MULTI-HOST  ·  3 device slots");
+  tft.setTextColor(C_DIM, C_BG);
+  tft.setCursor(60, 130); tft.print("NimBLE  ·  12-key matrix  ·  ST7789");
+  tft.setCursor(60, 145); tft.print("Hold FN (K9) 1s = system menu");
+  delay(900);
 
-  tmpBright   = backlightBrightness;
-  tmpSleepMin = (sleepTimeoutMs==0) ? 0 : (int)(sleepTimeoutMs/60000UL);
-  tmpSens     = encoderSensitivity;
-  tmpLinux    = linuxLayout;
   lastActivityMs = millis();
-
-  delay(500);
   drawMain();
 }
 
 // ════════════════════════════════════════════════
 //  LOOP
 // ════════════════════════════════════════════════
-void loop(){
-  updateEncoder();
-  handleEncoderAction();
+void loop() {
+  unsigned long now = millis();
 
-  unsigned long now=millis();
-
-  // Alt-Tab release timer
-  if(altHeld && altReleaseAt!=0 && now>=altReleaseAt){
-    releaseAll(); altHeld=false; altReleaseAt=0;
-    if(currentScreen==SCR_MAIN) drawMain();
+  // BLE events from callback context → UI feedback (loop owns the TFT)
+  if (pendingBleEvent != EVT_NONE) {
+    uint8_t evt = pendingBleEvent;
+    pendingBleEvent = EVT_NONE;
+    if (evt == EVT_PAIRED) {
+      char msg[24];
+      snprintf(msg, sizeof(msg), "PAIRED SLOT %d", activeSlot + 1);
+      redraw();
+      showToast(msg, C_GREEN, 1500);
+    } else if (evt == EVT_WRONG_HOST) {
+      redraw();
+      showToast("WRONG DEVICE", C_RED, 1200);
+    }
   }
 
-  // Connection state change → redraw status bar
-  if(bleConnected != lastBleConn){
+  // Connection state change → redraw (+ fire buffered wake-key)
+  if (bleConnected != lastBleConn) {
     lastBleConn = bleConnected;
-    if(bleConnected){
-      // Fire buffered wake-key if pending
-      if(wakeKeyPending && wakeKeyBtnIdx!=WAKEKEY_NONE){
-        wakeKeyPending=false;
+    if (bleConnected) {
+      if (wakeKeyPending && wakeKeyIdx != WAKEKEY_NONE) {
+        wakeKeyPending = false;
         delay(150);
-        lastFlashBtn=wakeKeyBtnIdx; flashUntil=now+FLASH_MS;
+        lastFlashKey = wakeKeyIdx; flashUntil = now + FLASH_MS;
         drawMain();
-        fireAction(presets[activePreset].btns[wakeKeyBtnIdx].id);
-        wakeKeyBtnIdx=WAKEKEY_NONE;
-      } else { redraw(); }
+        fireAction(presets[activePreset].keys[wakeKeyIdx].id);
+        wakeKeyIdx = WAKEKEY_NONE;
+      } else redraw();
     } else {
-      if(wakeKeyPending && wakeKeyBtnIdx!=WAKEKEY_NONE)
-        drawReconnectHUD(presets[activePreset].btns[wakeKeyBtnIdx].label);
+      if (wakeKeyPending && wakeKeyIdx != WAKEKEY_NONE)
+        drawReconnectHUD(presets[activePreset].keys[wakeKeyIdx].label);
       else redraw();
     }
   }
 
+  // Pairing-state change (from BLE callbacks) → status bar refresh
+  if (pairingMode != lastPairingUi) {
+    lastPairingUi = pairingMode;
+    if (currentScreen == SCR_MAIN || currentScreen == SCR_DEVICES) redraw();
+  }
+
   // Reconnect HUD animation + timeout
-  if(!bleConnected && wakeKeyPending && wakeKeyBtnIdx!=WAKEKEY_NONE){
-    static unsigned long lastHud=0;
-    if(now-lastHud>400){
-      lastHud=now;
-      if(now-wakeTimeMs < RECONNECT_TIMEOUT_MS)
-        drawReconnectHUD(presets[activePreset].btns[wakeKeyBtnIdx].label);
-      else { wakeKeyPending=false; wakeKeyBtnIdx=WAKEKEY_NONE; redraw(); }
+  if (!bleConnected && wakeKeyPending && wakeKeyIdx != WAKEKEY_NONE) {
+    static unsigned long lastHud = 0;
+    if (now - lastHud > 400) {
+      lastHud = now;
+      if (now - wakeTimeMs < RECONNECT_TIMEOUT_MS)
+        drawReconnectHUD(presets[activePreset].keys[wakeKeyIdx].label);
+      else { wakeKeyPending = false; wakeKeyIdx = WAKEKEY_NONE; redraw(); }
     }
   }
 
-  // Flash timer
-  if(lastFlashBtn>=0 && now>=flashUntil){
-    lastFlashBtn=-1;
-    if(currentScreen==SCR_MAIN) drawMain();
+  // Toast expiry
+  if (toastUntil != 0 && now >= toastUntil) { toastUntil = 0; redraw(); }
+
+  // Key flash expiry
+  if (lastFlashKey >= 0 && now >= flashUntil) {
+    int k = lastFlashKey; lastFlashKey = -1;
+    if (currentScreen == SCR_MAIN) {
+      KeyAction& ka = presets[activePreset].keys[k];
+      if (ka.id == A_NONE) drawCellEmpty(k);
+      else drawCell(k, ka.label, nullptr, PRESET_COLORS[activePreset], false);
+    }
   }
 
-  // Button scan
-  for(int i=0;i<8;i++){
-    static bool lr[8]={};
-    static unsigned long lc[8]={};
-    static bool st[8]={};
-    static unsigned long ps[8]={};
-    bool r=(digitalRead(BTN_PINS[i])==LOW);
-    if(r!=lr[i]){ lr[i]=r; lc[i]=now; }
-    if((now-lc[i])>=BTN_DEBOUNCE_MS && r!=st[i]){
-      st[i]=r;
-      if(r) ps[i]=now;
-      else if((now-ps[i])>=BTN_MIN_PRESS_MS){
+  // ── Matrix scan with per-key debounce + tap/hold events ──
+  uint16_t raw = scanMatrixRaw();
+  for (int i = 0; i < NUM_KEYS; i++) {
+    bool r = (raw >> i) & 1;
+    if (r != keyRaw[i]) { keyRaw[i] = r; keyChangeMs[i] = now; }
+    if ((now - keyChangeMs[i]) >= KEY_DEBOUNCE_MS && r != keyStable[i]) {
+      keyStable[i] = r;
+      if (r) {
+        keyDownMs[i] = now;
+        keyHoldFired[i] = false;
         recordActivity();
-        if(currentScreen==SCR_BUILD && i<NUM_PRESETS){ buildPreset=i; drawBuild(); }
-        else onButtonPressed(i);
+      } else {
+        onKeyUp(i, now - keyDownMs[i]);
+      }
+    }
+    // In-flight hold detection (FN menu, slot pairing, bond wipe)
+    if (keyStable[i] && !keyHoldFired[i]) {
+      unsigned long th = holdThresholdFor(i);
+      if (th != 0 && (now - keyDownMs[i]) >= th) {
+        keyHoldFired[i] = true;
+        onKeyHold(i);
       }
     }
   }
 
-  // Encoder SW
-  static unsigned long encDown=0;
-  static bool encWas=false;
-  static bool buildTriggered=false;
-  static bool bondClearTriggered=false;
-  bool encNow=(digitalRead(ENC_SW)==LOW);
-  if(encNow && !encWas){ encDown=now; encWas=true; buildTriggered=false; bondClearTriggered=false; recordActivity(); }
-  // 3s hold → clear all BLE bonds (allows fresh pairing with new device)
-  if(encNow && encWas && !bondClearTriggered && (now-encDown>3000)){
-    bondClearTriggered=true;
-    bleConnected=false;
-    NimBLEDevice::deleteAllBonds();
-    NimBLEDevice::stopAdvertising();
-    delay(100);
-    NimBLEDevice::startAdvertising();
-    // Show feedback on display
-    spr.fillSprite(C_BG);
-    spr.fillRect(0,0,128,18,C_SURF);
-    spr.drawFastHLine(0,18,128,C_RED);
-    spr.setTextColor(C_RED,C_SURF); spr.setTextSize(1);
-    spr.setCursor(6,5); spr.print("BONDS CLEARED");
-    spr.setTextColor(C_DIM,C_BG); spr.setCursor(6,32); spr.print("All pairings removed.");
-    spr.setTextColor(C_WHITE,C_BG); spr.setCursor(6,48); spr.print("Now re-pair your");
-    spr.setCursor(6,60); spr.print("device normally.");
-    spr.setTextColor(C_CYAN,C_BG); spr.setCursor(6,80); spr.print("Advertising...");
-    spr.pushSprite(0,0);
-    delay(2500);
-    redraw();
-  }
-  if(encNow && encWas && !buildTriggered && !bondClearTriggered && currentScreen==SCR_MAIN && (now-encDown>1500)){
-    buildPreset=activePreset; buildCount=presets[buildPreset].btnCount;
-    currentScreen=SCR_BUILD; drawBuild(); buildTriggered=true;
-  }
-  else if(!encNow && encWas){
-    unsigned long held=now-encDown;
-    if(!buildTriggered && !bondClearTriggered){
-      if(held>=700)     onButtonPressed(9);
-      else if(held>=40) onButtonPressed(8);
-    }
-    encWas=false;
-  }
-
   maybeEnterSleep();
-  delay(4);
+  delay(3);
 }
