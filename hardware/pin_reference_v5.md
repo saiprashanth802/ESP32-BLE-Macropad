@@ -81,6 +81,19 @@ Copy `firmware/v5/User_Setup.h` over
 above, `ST7789_DRIVER`, 40MHz SPI and the font loads (`LOAD_GLCD` is
 mandatory — text renders blank without it).
 
+## Flashing this specific board (bench NodeMCU-32S, MAC 84:1F:E8:2B:33:48)
+
+Its Boya flash chip (mfr 0x68) **cannot run at the default 80MHz flash clock**
+— the 2nd-stage bootloader crash-loops printing only `entry 0x4008059c`.
+In Arduino IDE set:
+
+- **Tools → Flash Frequency → 40MHz**  (mandatory)
+- **Tools → Upload Speed → 115200**  (921600 aborts with
+  "Packet content transfer stopped" on this board/cable)
+
+Also disconnect the display while flashing, and power it from **3V3, never
+5V** — an overdriven backlight sags the rail enough to kill flash writes.
+
 ## Power Chain
 
 ```
