@@ -15,55 +15,40 @@ the main board anymore.
 | 21 | P21 | TFT DC   | OUTPUT | |
 | 22 | P22 | TFT RST  | OUTPUT | |
 | 19 | P19 | TFT BL   | OUTPUT | PWM via LEDC (sketch-driven) |
-| 25 | P25 | Matrix Row 1 | OUTPUT | driven LOW one at a time |
-| 26 | P26 | Matrix Row 2 | OUTPUT | driven LOW one at a time |
-| 27 | P27 | Matrix Row 3 | OUTPUT | driven LOW one at a time |
-| 32 | P32 | Matrix Row 4 | OUTPUT | driven LOW one at a time |
-| 33 | P33 | Matrix Col 1 | INPUT | INPUT_PULLUP |
-| 13 | P13 | Matrix Col 2 | INPUT | INPUT_PULLUP, JTAG-shared (fine) |
-| 14 | P14 | Matrix Col 3 | INPUT | INPUT_PULLUP, JTAG-shared (fine) |
+| 25 | P25 | Matrix Row 1 (top) | OUTPUT | driven LOW one at a time |
+| 32 | P32 | Matrix Row 2 (mid) | OUTPUT | driven LOW one at a time |
+| 33 | P33 | Matrix Row 3 (bot) | OUTPUT | driven LOW one at a time |
+| 26 | P26 | Matrix Col 1 | INPUT | INPUT_PULLUP |
+| 14 | P14 | Matrix Col 2 | INPUT | INPUT_PULLUP, JTAG-shared (fine) |
+| 27 | P27 | Matrix Col 3 | INPUT | INPUT_PULLUP |
+| 13 | P13 | Matrix Col 4 | INPUT | INPUT_PULLUP, JTAG-shared (fine) |
 | VIN | 5V | Power in  | POWER | From CKCS 5V out |
 | 3V3 | 3V3 | 3.3V out | POWER | To TFT VCC |
 
 All matrix inputs use internal pullups — no external resistors needed
 (GPIO 34/36/39 input-only pins are no longer used).
 
-## Key Matrix (4 rows × 3 cols electrical = 12 keys)
+## Key Matrix (3 rows × 4 cols = 12 keys) — AS BUILT
 
-Rows are scanned (driven LOW one at a time, hi-Z otherwise); columns are read
-with `INPUT_PULLUP`.
-
-```
-          Col1(33)  Col2(13)  Col3(14)
-Row1(25)    K1        K5        K9(FN)
-Row2(26)    K2        K6        K10
-Row3(27)    K3        K7        K11
-Row4(32)    K4        K8        K12
-```
-
-Logical key index in firmware: `idx = col*4 + row`, giving the landscape
-4-wide × 3-tall grid the display shows:
+**Verified on hardware 2026-07-20 with a pairwise conduction probe** — this
+supersedes every earlier pin grouping. The 3 physical rows are the driven
+lines; the 4 physical columns are read with `INPUT_PULLUP`.
 
 ```
-K1  K2  K3  K4
-K5  K6  K7  K8
-K9  K10 K11 K12      K9 = FN (bottom-left)
+           Col1(26)  Col2(14)  Col3(27)  Col4(13)
+Row1(25)     K1        K2        K3        K4
+Row2(32)     K5        K6        K7        K8
+Row3(33)     K9(FN)    K10       K11       K12
 ```
 
-So electrical **rows = physical columns** (left→right) and electrical
-**cols = physical rows** (top→bottom) on the landscape board.
+Logical key index in firmware: `idx = row*4 + col` — identical to the
+landscape grid the display shows. K9 (bottom-left) = FN.
 
-### Diode orientation — CHANGED from the old col-driven scan
+### Diode orientation (verified)
 
-Each switch gets a 1N4148. Current must flow **column → switch → row**
-(pullup source → driven-LOW sink):
-
-- **Cathode (band) → row line** (P25/P26/P27/P32)
-- Anode → switch pin on the column side
-
-> ⚠️ Older revisions of this doc said cathode→column — that was for the old
-> column-driven scan. If diodes are soldered the old way, either flip them or
-> swap the row/column pin groups in `macropad_v5.ino`.
+Each switch has a 1N4148 with the **cathode (band) toward the ROW line**
+(P25/P32/P33); current flows column → switch → row. The firmware's
+row-driven scan matches this as-built orientation.
 
 ## Strapping Pins — Avoided
 

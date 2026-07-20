@@ -154,6 +154,14 @@
 - Status bar shows the three slots like Easy-Switch LEDs (green = connected, amber = waiting, magenta = pairing)
 - Firmware: `firmware/v5/macropad_v5.ino` (NimBLE 2.x API, single file)
 
+### Config Mode — wireless setup + OTA firmware update
+- **Settings → CONFIG (WiFi/OTA)** suspends BLE and raises a WiFi hotspot (`MacroPad-Setup` / `macropad123`, `http://192.168.4.1`)
+- Built-in web UI + JSON API to remap keys, edit presets, and change settings — no re-flash needed
+- Every key can be a built-in action, an **arbitrary modifier+keycode chord**, a media code, a **type-a-string**, or a **multi-step macro** — the schema a companion app targets
+- **OTA firmware update**: upload a new `.bin` from the browser; it flashes the inactive OTA partition and reboots (safe rollback if it fails)
+- WiFi and BLE never run at once (WROOM-32 coexistence); entering/leaving Config Mode reboots cleanly
+- Full contract: [`docs/CONFIG_API.md`](docs/CONFIG_API.md)
+
 ### Hardware Spec
 - NodeMCU ESP32-S V1.1 (WROOM-32) dev board
 - ST7789 240×320 IPS display, landscape mount, glass flush-mounted (30.6×40.8mm active area)

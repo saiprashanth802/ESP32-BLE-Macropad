@@ -7,15 +7,15 @@
  *            (AS5600 encoder puck is a separate ESP-NOW device — NOT
  *             handled by this firmware yet)
  *
- * Wiring (P-label = GPIO):
+ * Wiring (P-label = GPIO) — AS BUILT, verified by pairwise probe:
  *   TFT  : SCK=P18  MOSI=P23  CS=P5  DC=P21  RST=P22  BL=P19 (LEDC PWM)
- *   Matrix rows (OUTPUT, driven LOW one at a time): P25 P26 P27 P32
- *   Matrix cols (INPUT_PULLUP)                    : P33 P13 P14
+ *   Matrix rows, driven LOW one at a time (top→bottom): P25 P32 P33
+ *   Matrix cols, INPUT_PULLUP readers (left→right)    : P26 P14 P27 P13
  *   Diodes: cathode faces the ROW line (current col → switch → row)
  *
  * Key grid (logical, landscape, 4 wide × 3 tall):
- *   K1  K2  K3  K4        idx 0..3   = row line r, col line c
- *   K5  K6  K7  K8        idx 4..7     maps as  idx = c*4 + r
+ *   K1  K2  K3  K4        idx 0..3   = drive row d, read col j
+ *   K5  K6  K7  K8        idx 4..7     maps as  idx = d*4 + j
  *   K9  K10 K11 K12       idx 8..11    (K9 = FN, bottom-left)
  *
  * ── PEBBLE-KEYS-STYLE MULTI-HOST BLE ─────────────────────────────
@@ -41,12 +41,32 @@
  *   ▸ strapping pins 0/2/12/15 completely unused
  *********************************************************************/
 
+// Network stack FIRST — TFT_eSPI (SMOOTH_FONT) includes <FS.h> and trips its
+// include guard, which would hide the global `FS` alias WebServer.h needs.
+#include <WiFi.h>
+#include <FS.h>
+#include <WebServer.h>
+#include <Update.h>
+#include <ArduinoJson.h>
 #include <NimBLEDevice.h>
 #include <NimBLEHIDDevice.h>
 #include <TFT_eSPI.h>
 #include <SPI.h>
 #include <Preferences.h>
 #include <driver/gpio.h>
+
+// ════════════════════════════════════════════════
+//  CONFIG / OTA — versioned contract for the companion app
+//  Config Mode (Settings → CONFIG) suspends BLE, raises a SoftAP web
+//  server exposing a JSON config API + firmware upload. WiFi and BLE
+//  never run at once (WROOM-32 coexistence is unstable), so entering
+//  and leaving Config Mode both go through a clean reboot.
+// ════════════════════════════════════════════════
+#define FW_VERSION   "v5-multihost"
+#define CONFIG_API   2            // bump when the JSON schema changes
+#define AP_SSID      "MacroPad-Setup"
+#define AP_PASS      "macropad123" // WPA2 needs >=8 chars; changeable via API
+#define AP_IP_STR    "192.168.4.1"
 
 // ════════════════════════════════════════════════
 //  PALETTE (RGB565)
@@ -77,11 +97,50 @@ const uint16_t PRESET_COLORS[8] = {
 //  PINS  (NodeMCU ESP32-S V1.1 — see header)
 // ════════════════════════════════════════════════
 #define TFT_BL 19
-const uint8_t ROW_PINS[4] = {25, 26, 27, 32};  // driven LOW one at a time
-const uint8_t COL_PINS[3] = {33, 13, 14};      // INPUT_PULLUP readers
+// AS-BUILT wiring (verified with pairwise diagnostic 2026-07-20):
+// 3 physical rows are the DRIVEN lines (diode cathodes face them),
+// 4 physical columns are the READ lines. Key idx = row*4 + col.
+const uint8_t DRIVE_PINS[3] = {25, 32, 33};     // rows top→bottom, driven LOW
+const uint8_t READ_PINS[4]  = {26, 14, 27, 13}; // cols left→right, INPUT_PULLUP
 
 #define NUM_KEYS   12
 #define KEY_FN      8          // bottom-left key (K9)
+
+// ════════════════════════════════════════════════
+//  KEY MODEL  (defined up here so Arduino's auto-generated prototypes,
+//  inserted before the first function, can see these types)
+// ════════════════════════════════════════════════
+// Rich key model. `type` defaults to KA_BUILTIN (0) so the existing
+// aggregate initializers {"Label", A_ID} still compile and behave exactly
+// as before — everything past `id` zero-initializes.
+enum KAType : uint8_t {
+  KA_BUILTIN = 0,   // fire ACTION_LIB entry `id` (OS-layout aware)
+  KA_KEY,           // single chord: mod + key
+  KA_CONSUMER,      // single media/consumer usage code
+  KA_MACRO,         // ordered sequence of chord steps with delays
+  KA_TEXT,          // type an ASCII string
+};
+
+#define MACRO_MAX 6
+struct MacroStep {
+  uint8_t  mod;       // modifier bitmap (0 if this step is a consumer)
+  uint8_t  key;       // HID keycode  (0 => use `consumer`)
+  uint16_t consumer;  // consumer usage (used when key==0)
+  uint8_t  delayCs;   // post-step delay in centiseconds (×10ms)
+};
+
+struct KeyAction {
+  char      label[9];
+  int16_t   id;                 // KA_BUILTIN action id
+  uint8_t   type;               // KAType
+  uint8_t   mod;                // KA_KEY
+  uint8_t   key;                // KA_KEY
+  uint16_t  consumer;           // KA_CONSUMER
+  uint8_t   nSteps;             // KA_MACRO step count
+  MacroStep steps[MACRO_MAX];   // KA_MACRO
+  char      text[24];           // KA_TEXT
+};
+struct Preset    { char name[10]; KeyAction keys[NUM_KEYS]; };
 
 // ════════════════════════════════════════════════
 //  TUNING
@@ -90,12 +149,13 @@ int           backlightBrightness = 180;
 unsigned long sleepTimeoutMs      = 300000UL;   // 0 = no sleep
 bool          linuxLayout         = false;      // false=Windows, true=Linux
 
-const uint16_t KEY_DEBOUNCE_MS   = 12;
+const uint16_t KEY_DEBOUNCE_MS   = 25;   // raised: bench keys were sticking
+const uint16_t KEY_SCAN_INTERVAL_MS = 5; // fixed scan cadence, not every loop
 const uint16_t KEY_MIN_PRESS_MS  = 30;
 const unsigned long FN_MENU_MS   = 1000;   // FN hold → SYSTEM menu
 const unsigned long PAIR_HOLD_MS = 1500;   // slot key hold → pairing mode
 const unsigned long CLRALL_HOLD_MS = 2000; // devices screen K11 hold → wipe bonds
-const unsigned long FLASH_MS     = 500;
+const unsigned long FLASH_MS     = 250;
 #define WAKEKEY_NONE  -1
 #define RECONNECT_TIMEOUT_MS  8000UL
 
@@ -227,6 +287,8 @@ int slotForAddress(const uint8_t addr[6]) {
 
 class ServerCB : public NimBLEServerCallbacks {
   void onConnect(NimBLEServer* s, NimBLEConnInfo& info) override {
+    Serial.printf("[BLE] connect h=%u peer=%s\n",
+                  info.getConnHandle(), info.getAddress().toString().c_str());
     bleConnected  = true;
     bleConnHandle = info.getConnHandle();
     // Request faster connection interval — critical for Android/Linux responsiveness
@@ -234,7 +296,17 @@ class ServerCB : public NimBLEServerCallbacks {
     NimBLEDevice::stopAdvertising();
   }
   void onAuthenticationComplete(NimBLEConnInfo& info) override {
-    if (!info.isEncrypted()) { pServer->disconnect(info.getConnHandle()); return; }
+    Serial.printf("[BLE] auth enc=%d bonded=%d id=%s pairing=%d slot=%d\n",
+                  info.isEncrypted(), info.isBonded(),
+                  info.getIdAddress().toString().c_str(),
+                  (int)pairingMode, activeSlot);
+    // Require full bonding, not just encryption — a host that encrypts but
+    // fails to store keys (half-completed pairing) must not claim the slot,
+    // otherwise the whitelist deadlocks on a peer that can never reconnect
+    if (!info.isEncrypted() || !info.isBonded()) {
+      pServer->disconnect(info.getConnHandle());
+      return;
+    }
     NimBLEAddress id = info.getIdAddress();
     const uint8_t* idBytes = id.getBase()->val;
     int knownSlot = slotForAddress(idBytes);
@@ -263,6 +335,7 @@ class ServerCB : public NimBLEServerCallbacks {
     }
   }
   void onDisconnect(NimBLEServer* s, NimBLEConnInfo& info, int reason) override {
+    Serial.printf("[BLE] disconnect reason=%d\n", reason);
     bleConnected = false;
     delay(200);
     // Rebuild adv data on every restart — BlueZ requires the flags byte to
@@ -311,6 +384,8 @@ void startAdvertisingForSlot() {
   }
   configureAdvertising();
   pAdv->start();
+  Serial.printf("[BLE] advertising slot=%d filtered=%d pairing=%d\n",
+                activeSlot, (int)filtered, (int)pairingMode);
 }
 
 // Easy-Switch: jump to slot n. forcePair drops the slot's old bond and
@@ -522,10 +597,13 @@ const int ACTION_LIB_SIZE = sizeof(ACTION_LIB)/sizeof(Action);
 //  PRESETS — 12 keys each (4 wide × 3 tall)
 // ════════════════════════════════════════════════
 #define NUM_PRESETS  8
-#define PRESETS_VER  1        // bump to invalidate stored NVS presets
+#define PRESETS_VER  2        // bump to invalidate stored NVS presets
+// KeyAction / MacroStep / Preset are defined near the top of the file.
 
-struct KeyAction { char label[9]; int id; };
-struct Preset    { char name[10]; KeyAction keys[NUM_KEYS]; };
+// A key is "empty" only if it's an unassigned built-in slot
+static inline bool kaEmpty(const KeyAction& ka) {
+  return ka.type == KA_BUILTIN && ka.id == A_NONE;
+}
 
 Preset presets[NUM_PRESETS] = {
   {"ONSHAPE",{
@@ -665,24 +743,24 @@ void savePresets() {
 
 // ════════════════════════════════════════════════
 //  MATRIX SCAN
-//  Rows driven LOW one at a time (inactive rows hi-Z, tolerant of
-//  breadboard wiring without diodes); cols read with pullups.
-//  Logical key idx = colLine*4 + rowLine  → 4-wide × 3-tall UI grid.
+//  Row (drive) lines pulled LOW one at a time, inactive rows hi-Z;
+//  column (read) lines with pullups. Diode cathodes face the rows.
+//  Logical key idx = driveRow*4 + readCol → 4-wide × 3-tall UI grid.
 // ════════════════════════════════════════════════
 void matrixInit() {
-  for (int r = 0; r < 4; r++) pinMode(ROW_PINS[r], INPUT);
-  for (int c = 0; c < 3; c++) pinMode(COL_PINS[c], INPUT_PULLUP);
+  for (int d = 0; d < 3; d++) pinMode(DRIVE_PINS[d], INPUT);
+  for (int j = 0; j < 4; j++) pinMode(READ_PINS[j], INPUT_PULLUP);
 }
 
 uint16_t scanMatrixRaw() {
   uint16_t bits = 0;
-  for (int r = 0; r < 4; r++) {
-    pinMode(ROW_PINS[r], OUTPUT);
-    digitalWrite(ROW_PINS[r], LOW);
+  for (int d = 0; d < 3; d++) {
+    pinMode(DRIVE_PINS[d], OUTPUT);
+    digitalWrite(DRIVE_PINS[d], LOW);
     delayMicroseconds(25);
-    for (int c = 0; c < 3; c++)
-      if (digitalRead(COL_PINS[c]) == LOW) bits |= 1u << (c * 4 + r);
-    pinMode(ROW_PINS[r], INPUT);
+    for (int j = 0; j < 4; j++)
+      if (digitalRead(READ_PINS[j]) == LOW) bits |= 1u << (d * 4 + j);
+    pinMode(DRIVE_PINS[d], INPUT);
   }
   return bits;
 }
@@ -693,6 +771,7 @@ bool keyRaw[NUM_KEYS]     = {};
 unsigned long keyChangeMs[NUM_KEYS] = {};
 unsigned long keyDownMs[NUM_KEYS]   = {};
 bool keyHoldFired[NUM_KEYS] = {};
+bool keyFiredOnDown[NUM_KEYS] = {};
 
 // ════════════════════════════════════════════════
 //  STATUS BAR — slot chips = Easy-Switch "LEDs"
@@ -794,7 +873,7 @@ void drawMain() {
   for (int i = 0; i < NUM_KEYS; i++) {
     KeyAction& ka = presets[activePreset].keys[i];
     bool flash = (i == lastFlashKey);
-    if (ka.id == A_NONE) drawCellEmpty(i);
+    if (kaEmpty(ka)) drawCellEmpty(i);
     else drawCell(i, ka.label, nullptr, accent, flash);
   }
 }
@@ -840,7 +919,8 @@ void drawSettings() {
   drawCell(1, "SLEEP", v, C_AMBER, false);
   drawCell(2, "OS", linuxLayout ? "LINUX" : "WINDOWS", C_GREEN, false);
   drawCell(3, "DEVICES", nullptr, C_MAGENTA, false);
-  for (int i = 4; i < 11; i++) drawCellEmpty(i);
+  drawCell(4, "CONFIG", "WiFi/OTA", C_LTBLUE, false);
+  for (int i = 5; i < 11; i++) drawCellEmpty(i);
   drawCell(11, "SAVE", "+ exit", C_WHITE, false);
 }
 
@@ -926,9 +1006,9 @@ void drawBuildKeys() {
   for (int i = 0; i < NUM_KEYS; i++) {
     KeyAction& ka = presets[buildPreset].keys[i];
     if (i == KEY_FN)
-      drawCell(i, ka.id == A_NONE ? "---" : ka.label, "tap=DONE", C_BUILD, false);
+      drawCell(i, kaEmpty(ka) ? "---" : ka.label, "tap=DONE", C_BUILD, false);
     else
-      drawCell(i, ka.id == A_NONE ? "---" : ka.label, nullptr, C_BUILD, false);
+      drawCell(i, kaEmpty(ka) ? "---" : ka.label, nullptr, C_BUILD, false);
   }
 }
 
@@ -1131,6 +1211,68 @@ void fireAction(int id) {
 }
 
 // ════════════════════════════════════════════════
+//  TYPE-STRING — ASCII → HID for KA_TEXT / macros
+// ════════════════════════════════════════════════
+// Returns HID keycode for a printable ASCII char and sets `shift`.
+static uint8_t asciiToHid(char c, bool& shift) {
+  shift = false;
+  if (c >= 'a' && c <= 'z') return KEY_A + (c - 'a');
+  if (c >= 'A' && c <= 'Z') { shift = true; return KEY_A + (c - 'A'); }
+  if (c >= '1' && c <= '9') return KEY_1 + (c - '1');
+  switch (c) {
+    case '0': return KEY_0;
+    case ' ': return 0x2C;                 // space
+    case '\n': case '\r': return KEY_ENTER;
+    case '\t': return KEY_TAB;
+    case '-': return KEY_MINUS;   case '_': shift = true; return KEY_MINUS;
+    case '=': return KEY_EQUAL;   case '+': shift = true; return KEY_EQUAL;
+    case '`': return KEY_BACKTICK;case '~': shift = true; return KEY_BACKTICK;
+    case '.': return 0x37;        case '>': shift = true; return 0x37;
+    case ',': return 0x36;        case '<': shift = true; return 0x36;
+    case '/': return 0x38;        case '?': shift = true; return 0x38;
+    case ';': return 0x33;        case ':': shift = true; return 0x33;
+    case '\'':return 0x34;        case '"': shift = true; return 0x34;
+    case '[': return 0x2F;        case '{': shift = true; return 0x2F;
+    case ']': return 0x30;        case '}': shift = true; return 0x30;
+    case '\\':return 0x31;        case '|': shift = true; return 0x31;
+    case '!': shift = true; return KEY_1;   case '@': shift = true; return KEY_2;
+    case '#': shift = true; return KEY_3;   case '$': shift = true; return 0x21;
+    case '%': shift = true; return 0x22;    case '^': shift = true; return 0x23;
+    case '&': shift = true; return KEY_7;   case '*': shift = true; return 0x25;
+    case '(': shift = true; return 0x26;    case ')': shift = true; return KEY_0;
+  }
+  return 0;
+}
+
+void typeString(const char* s) {
+  for (const char* p = s; *p; p++) {
+    bool shift; uint8_t k = asciiToHid(*p, shift);
+    if (k) { sendKey(shift ? MOD_LSHIFT : 0, k); delay(6); }
+  }
+}
+
+// ════════════════════════════════════════════════
+//  FIRE KEY — dispatch a rich KeyAction by type
+// ════════════════════════════════════════════════
+void fireKeyAction(const KeyAction& ka) {
+  if (!bleConnected) return;
+  switch (ka.type) {
+    case KA_BUILTIN:  fireAction(ka.id); break;
+    case KA_KEY:      sendKey(ka.mod, ka.key); break;
+    case KA_CONSUMER: sendConsumer(ka.consumer); break;
+    case KA_TEXT:     typeString(ka.text); break;
+    case KA_MACRO:
+      for (int s = 0; s < ka.nSteps && s < MACRO_MAX; s++) {
+        const MacroStep& st = ka.steps[s];
+        if (st.key) sendKey(st.mod, st.key);
+        else if (st.consumer) sendConsumer(st.consumer);
+        if (st.delayCs) delay((unsigned long)st.delayCs * 10);
+      }
+      break;
+  }
+}
+
+// ════════════════════════════════════════════════
 //  INPUT — per-screen tap / hold handlers
 // ════════════════════════════════════════════════
 unsigned long holdThresholdFor(int i) {   // 0 = no hold action for this key
@@ -1184,10 +1326,10 @@ void onKeyTap(int i) {
 
     case SCR_MAIN: {
       KeyAction& ka = presets[activePreset].keys[i];
-      if (ka.id == A_NONE) return;
+      if (kaEmpty(ka)) return;
       lastFlashKey = i; flashUntil = millis() + FLASH_MS;
       drawCell(i, ka.label, nullptr, PRESET_COLORS[activePreset], true);
-      fireAction(ka.id);
+      fireKeyAction(ka);
       break;
     }
 
@@ -1226,6 +1368,7 @@ void onKeyTap(int i) {
       else if (i == 1) { currentScreen = SCR_EDIT_SLEEP;  drawEditor(); }
       else if (i == 2) { linuxLayout = !linuxLayout; drawSettings(); }
       else if (i == 3) { currentScreen = SCR_DEVICES; drawDevices(); }
+      else if (i == 4) { saveSettings(); enterConfigMode(); }  // no return — reboots on exit
       else if (i == 11 || i == KEY_FN) {
         saveSettings();
         currentScreen = SCR_MAIN; drawMain();
@@ -1286,9 +1429,12 @@ void onKeyTap(int i) {
       if (i < 8) {
         int idx = buildActPage * 8 + i;
         if (idx < ACTION_LIB_SIZE) {
-          strncpy(presets[buildPreset].keys[buildSlot].label, ACTION_LIB[idx].label, 8);
-          presets[buildPreset].keys[buildSlot].label[8] = '\0';
-          presets[buildPreset].keys[buildSlot].id = ACTION_LIB[idx].id;
+          KeyAction& ka = presets[buildPreset].keys[buildSlot];
+          ka = KeyAction{};                        // clear macro/text/key fields
+          strncpy(ka.label, ACTION_LIB[idx].label, 8);
+          ka.label[8] = '\0';
+          ka.type = KA_BUILTIN;
+          ka.id   = ACTION_LIB[idx].id;
           currentScreen = SCR_BUILD_KEYS; drawBuildKeys();
         }
       }
@@ -1308,6 +1454,7 @@ void onKeyUp(int i, unsigned long heldMs) {
     currentScreen = SCR_MAIN; drawMain();
     return;
   }
+  if (keyFiredOnDown[i]) { keyFiredOnDown[i] = false; return; }  // already fired
   if (keyHoldFired[i]) return;                 // hold action already consumed it
   if (heldMs < KEY_MIN_PRESS_MS) return;
   onKeyTap(i);
@@ -1333,13 +1480,13 @@ void maybeEnterSleep() {
   esp_sleep_disable_wakeup_source(ESP_SLEEP_WAKEUP_ALL);
   delay(50);
 
-  // Any keypress pulls a col low: drive ALL rows low, wake on any col
-  for (int r = 0; r < 4; r++) {
-    pinMode(ROW_PINS[r], OUTPUT);
-    digitalWrite(ROW_PINS[r], LOW);
+  // Any keypress pulls a read line low: drive ALL rows low, wake on any col
+  for (int d = 0; d < 3; d++) {
+    pinMode(DRIVE_PINS[d], OUTPUT);
+    digitalWrite(DRIVE_PINS[d], LOW);
   }
-  for (int c = 0; c < 3; c++)
-    gpio_wakeup_enable((gpio_num_t)COL_PINS[c], GPIO_INTR_LOW_LEVEL);
+  for (int j = 0; j < 4; j++)
+    gpio_wakeup_enable((gpio_num_t)READ_PINS[j], GPIO_INTR_LOW_LEVEL);
   esp_sleep_enable_gpio_wakeup();
 
   Serial.flush();
@@ -1349,7 +1496,7 @@ void maybeEnterSleep() {
   wakeTimeMs     = millis();
   lastActivityMs = wakeTimeMs;   // reset FIRST — prevents instant re-sleep
 
-  for (int r = 0; r < 4; r++) pinMode(ROW_PINS[r], INPUT);  // back to scan idle
+  for (int d = 0; d < 3; d++) pinMode(DRIVE_PINS[d], INPUT);  // back to scan idle
 
   // Re-attach LEDC — dropped silently during light-sleep
   ledcAttach(TFT_BL, 5000, 8);
@@ -1376,6 +1523,320 @@ void maybeEnterSleep() {
   if (wakeKeyPending && !bleConnected)
     drawReconnectHUD(presets[activePreset].keys[wakeKeyIdx].label);
   else redraw();
+}
+
+// ════════════════════════════════════════════════
+//  CONFIG MODE — WiFi SoftAP + HTTP JSON API + OTA
+//  BLE is torn down on entry (frees radio + RAM); exit = clean reboot.
+// ════════════════════════════════════════════════
+WebServer server(80);
+bool configMode = false;
+volatile bool otaActive = false;
+volatile size_t otaProgress = 0;
+void drawConfigScreen();
+
+const char* kaTypeName(uint8_t t) {
+  switch (t) {
+    case KA_KEY:      return "key";
+    case KA_CONSUMER: return "consumer";
+    case KA_MACRO:    return "macro";
+    case KA_TEXT:     return "text";
+    default:          return "builtin";
+  }
+}
+uint8_t kaTypeFromName(const char* s) {
+  if (!strcmp(s, "key"))      return KA_KEY;
+  if (!strcmp(s, "consumer")) return KA_CONSUMER;
+  if (!strcmp(s, "macro"))    return KA_MACRO;
+  if (!strcmp(s, "text"))     return KA_TEXT;
+  return KA_BUILTIN;
+}
+
+void keyToJson(const KeyAction& ka, JsonObject o) {
+  o["label"] = ka.label;
+  o["type"]  = kaTypeName(ka.type);
+  switch (ka.type) {
+    case KA_KEY:      o["mod"] = ka.mod; o["key"] = ka.key; break;
+    case KA_CONSUMER: o["consumer"] = ka.consumer; break;
+    case KA_TEXT:     o["text"] = ka.text; break;
+    case KA_MACRO: {
+      JsonArray st = o["steps"].to<JsonArray>();
+      for (int i = 0; i < ka.nSteps && i < MACRO_MAX; i++) {
+        JsonObject s = st.add<JsonObject>();
+        s["mod"] = ka.steps[i].mod;   s["key"] = ka.steps[i].key;
+        s["consumer"] = ka.steps[i].consumer; s["delay"] = ka.steps[i].delayCs;
+      }
+      break;
+    }
+    default:          o["id"] = ka.id; break;   // KA_BUILTIN
+  }
+}
+
+void keyFromJson(JsonObjectConst o, KeyAction& ka) {
+  ka = KeyAction{};
+  strncpy(ka.label, o["label"] | "", 8); ka.label[8] = '\0';
+  ka.type = kaTypeFromName(o["type"] | "builtin");
+  switch (ka.type) {
+    case KA_KEY:      ka.mod = o["mod"] | 0; ka.key = o["key"] | 0; break;
+    case KA_CONSUMER: ka.consumer = o["consumer"] | 0; break;
+    case KA_TEXT:     strncpy(ka.text, o["text"] | "", 23); ka.text[23] = '\0'; break;
+    case KA_MACRO: {
+      int n = 0;
+      for (JsonObjectConst s : o["steps"].as<JsonArrayConst>()) {
+        if (n >= MACRO_MAX) break;
+        ka.steps[n].mod = s["mod"] | 0;   ka.steps[n].key = s["key"] | 0;
+        ka.steps[n].consumer = s["consumer"] | 0; ka.steps[n].delayCs = s["delay"] | 0;
+        n++;
+      }
+      ka.nSteps = n;
+      break;
+    }
+    default:          ka.id = o["id"] | A_NONE; break;
+  }
+}
+
+void handleGetInfo() {
+  JsonDocument doc;
+  doc["device"]   = DEVICE_NAME;   doc["fw"]      = FW_VERSION;
+  doc["api"]      = CONFIG_API;     doc["keys"]    = NUM_KEYS;
+  doc["presets"]  = NUM_PRESETS;    doc["slots"]   = NUM_SLOTS;
+  doc["macroMax"] = MACRO_MAX;      doc["heap"]    = ESP.getFreeHeap();
+  String out; serializeJson(doc, out);
+  server.send(200, "application/json", out);
+}
+
+void handleGetActions() {
+  JsonDocument doc;
+  JsonArray a = doc.to<JsonArray>();
+  for (int i = 0; i < ACTION_LIB_SIZE; i++) {
+    JsonObject o = a.add<JsonObject>();
+    o["id"] = ACTION_LIB[i].id;  o["label"] = ACTION_LIB[i].label;
+  }
+  String out; serializeJson(doc, out);
+  server.send(200, "application/json", out);
+}
+
+void handleGetConfig() {
+  JsonDocument doc;
+  doc["api"] = CONFIG_API; doc["fw"] = FW_VERSION; doc["device"] = DEVICE_NAME;
+  JsonObject s = doc["settings"].to<JsonObject>();
+  s["brightness"]   = backlightBrightness;
+  s["sleepMin"]     = (sleepTimeoutMs == 0) ? 0 : (int)(sleepTimeoutMs / 60000UL);
+  s["linux"]        = linuxLayout;
+  s["activePreset"] = activePreset;
+  JsonArray pr = doc["presets"].to<JsonArray>();
+  for (int p = 0; p < NUM_PRESETS; p++) {
+    JsonObject po = pr.add<JsonObject>();
+    po["name"] = presets[p].name;
+    JsonArray ks = po["keys"].to<JsonArray>();
+    for (int k = 0; k < NUM_KEYS; k++) keyToJson(presets[p].keys[k], ks.add<JsonObject>());
+  }
+  String out; serializeJson(doc, out);
+  server.send(200, "application/json", out);
+}
+
+void handlePostConfig() {
+  if (!server.hasArg("plain")) { server.send(400, "application/json", "{\"err\":\"no body\"}"); return; }
+  JsonDocument doc;
+  if (deserializeJson(doc, server.arg("plain"))) {
+    server.send(400, "application/json", "{\"err\":\"bad json\"}"); return;
+  }
+  JsonObjectConst s = doc["settings"];
+  if (!s.isNull()) {
+    if (s["brightness"].is<int>())   backlightBrightness = constrain((int)s["brightness"], 10, 255);
+    if (s["sleepMin"].is<int>())   { int sm = s["sleepMin"]; sleepTimeoutMs = (sm == 0) ? 0UL : (unsigned long)sm * 60000UL; }
+    if (s["linux"].is<bool>())       linuxLayout = s["linux"];
+    if (s["activePreset"].is<int>()) activePreset = constrain((int)s["activePreset"], 0, NUM_PRESETS - 1);
+  }
+  JsonArrayConst pr = doc["presets"];
+  if (!pr.isNull()) {
+    int p = 0;
+    for (JsonObjectConst po : pr) {
+      if (p >= NUM_PRESETS) break;
+      if (po["name"].is<const char*>()) { strncpy(presets[p].name, po["name"], 9); presets[p].name[9] = '\0'; }
+      JsonArrayConst ks = po["keys"];
+      if (!ks.isNull()) {
+        int k = 0;
+        for (JsonObjectConst ko : ks) { if (k >= NUM_KEYS) break; keyFromJson(ko, presets[p].keys[k]); k++; }
+      }
+      p++;
+    }
+  }
+  savePresets();
+  backlightBrightness = constrain(backlightBrightness, 10, 255);
+  ledcWrite(TFT_BL, backlightBrightness);
+  saveSettings();
+  server.send(200, "application/json", "{\"ok\":true}");
+}
+
+void handleExit() {
+  server.send(200, "application/json", "{\"ok\":true}");
+  delay(300);
+  ESP.restart();
+}
+
+void handleUpdateDone() {
+  bool ok = !Update.hasError();
+  server.send(200, "application/json", ok ? "{\"ok\":true}" : "{\"ok\":false}");
+  delay(500);
+  if (ok) ESP.restart();
+}
+
+void handleUpdateUpload() {
+  HTTPUpload& up = server.upload();
+  if (up.status == UPLOAD_FILE_START) {
+    otaActive = true; otaProgress = 0; drawConfigScreen();
+    if (!Update.begin(UPDATE_SIZE_UNKNOWN)) Update.printError(Serial);
+  } else if (up.status == UPLOAD_FILE_WRITE) {
+    if (Update.write(up.buf, up.currentSize) != up.currentSize) Update.printError(Serial);
+    otaProgress = up.totalSize;
+    if ((otaProgress % 65536) < up.currentSize) drawConfigScreen();
+  } else if (up.status == UPLOAD_FILE_END) {
+    if (Update.end(true)) Serial.printf("[OTA] success %u bytes\n", up.totalSize);
+    else Update.printError(Serial);
+  }
+}
+
+// Minimal in-browser config UI — works out of the box, doubles as the
+// reference client for the future companion app.
+static const char CONFIG_HTML[] PROGMEM = R"HTML(<!doctype html><html><head>
+<meta charset=utf-8><meta name=viewport content="width=device-width,initial-scale=1">
+<title>MacroPad Config</title><style>
+body{font-family:system-ui,sans-serif;margin:0;background:#111;color:#eee}
+header{background:#1a6ef5;padding:10px 14px;font-weight:700}
+main{padding:12px;max-width:760px;margin:auto}
+.tabs{display:flex;flex-wrap:wrap;gap:4px;margin:8px 0}
+.tabs button{background:#222;color:#ccc;border:1px solid #444;border-radius:6px;padding:6px 10px;cursor:pointer}
+.tabs button.on{background:#1a6ef5;color:#fff;border-color:#1a6ef5}
+.grid{display:grid;grid-template-columns:repeat(4,1fr);gap:6px}
+.cell{background:#1b1b1b;border:1px solid #333;border-radius:8px;padding:8px;min-height:54px;cursor:pointer}
+.cell b{font-size:11px;color:#7cf} .cell small{color:#888;font-size:10px}
+.row{margin:6px 0} label{display:block;font-size:12px;color:#aaa;margin-top:6px}
+input,select,textarea{width:100%;box-sizing:border-box;background:#000;color:#eee;border:1px solid #444;border-radius:5px;padding:6px}
+button.act{background:#16a34a;color:#fff;border:0;border-radius:6px;padding:9px 14px;cursor:pointer;margin-top:8px}
+button.warn{background:#b4530a} .sec{border-top:1px solid #333;margin-top:16px;padding-top:12px}
+#msg{position:fixed;bottom:10px;left:10px;background:#16a34a;padding:8px 12px;border-radius:6px;display:none}
+</style></head><body>
+<header>MacroPad Config <span id=fw></span></header><main>
+<div class=tabs id=tabs></div>
+<div class=grid id=grid></div>
+<div id=editor style=display:none class=sec></div>
+<div class=sec><button class=act onclick=save()>Save to device</button>
+<button class=act onclick=toggleRaw()>Advanced JSON</button></div>
+<textarea id=raw rows=10 style=display:none></textarea>
+<div class=sec><h3>Firmware update (OTA)</h3>
+<input type=file id=fw_file accept=".bin">
+<button class=act onclick=upload()>Upload &amp; flash</button>
+<div id=prog></div></div>
+<div class=sec><button class="act warn" onclick=exitCfg()>Exit config (reboot)</button></div>
+</main><div id=msg></div><script>
+let cfg=null,acts=[],cur=0,sel=-1;
+const $=x=>document.getElementById(x);
+const MODS=[["Ctrl",1],["Shift",2],["Alt",4],["Gui",8]];
+async function load(){
+ acts=await (await fetch('/api/actions')).json();
+ cfg=await (await fetch('/api/config')).json();
+ $('fw').textContent=cfg.fw; drawTabs(); drawGrid();
+}
+function drawTabs(){$('tabs').innerHTML='';cfg.presets.forEach((p,i)=>{
+ let b=document.createElement('button');b.textContent=p.name;if(i==cur)b.className='on';
+ b.onclick=()=>{cur=i;sel=-1;$('editor').style.display='none';drawTabs();drawGrid()};$('tabs').append(b)})}
+function drawGrid(){$('grid').innerHTML='';cfg.presets[cur].keys.forEach((k,i)=>{
+ let c=document.createElement('div');c.className='cell';
+ c.innerHTML='<b>K'+(i+1)+'</b><br>'+(k.label||'---')+'<br><small>'+k.type+'</small>';
+ c.onclick=()=>edit(i);$('grid').append(c)})}
+function edit(i){sel=i;let k=cfg.presets[cur].keys[i];let e=$('editor');e.style.display='block';
+ let h='<b>Key '+(i+1)+'</b><label>Label</label><input id=e_label value="'+(k.label||'')+'">';
+ h+='<label>Type</label><select id=e_type onchange=fields()>';
+ ['builtin','key','consumer','text','macro'].forEach(t=>h+='<option '+(k.type==t?'selected':'')+'>'+t+'</option>');
+ h+='</select><div id=e_fields></div>';e.innerHTML=h;fields()}
+function fields(){let k=cfg.presets[cur].keys[sel],t=$('e_type').value,f=$('e_fields'),h='';
+ if(t=='builtin'){h='<label>Action</label><select id=e_id>';
+  acts.forEach(a=>h+='<option value='+a.id+' '+(k.id==a.id?'selected':'')+'>'+a.label+'</option>');h+='</select>';}
+ else if(t=='key'){h='<label>Modifiers</label>';MODS.forEach(m=>h+='<label style=display:inline;margin-right:8px><input type=checkbox class=e_mod value='+m[1]+' '+((k.mod||0)&m[1]?'checked':'')+'>'+m[0]+'</label>');
+  h+='<label>HID keycode (decimal)</label><input id=e_key type=number value='+(k.key||0)+'>';}
+ else if(t=='consumer'){h='<label>Consumer code (decimal)</label><input id=e_cons type=number value='+(k.consumer||0)+'>';}
+ else if(t=='text'){h='<label>Text to type</label><input id=e_text value="'+(k.text||'')+'">';}
+ else if(t=='macro'){h='<small>Edit macros in Advanced JSON for now.</small>';}
+ f.innerHTML=h}
+function grab(){let k=cfg.presets[cur].keys[sel];k.label=$('e_label').value;k.type=$('e_type').value;
+ if(k.type=='builtin')k.id=+$('e_id').value;
+ else if(k.type=='key'){k.mod=0;document.querySelectorAll('.e_mod:checked').forEach(c=>k.mod|=+c.value);k.key=+$('e_key').value;}
+ else if(k.type=='consumer')k.consumer=+$('e_cons').value;
+ else if(k.type=='text')k.text=$('e_text').value;}
+async function save(){if(sel>=0&&$('e_type'))grab();
+ if($('raw').style.display!='none'){try{cfg=JSON.parse($('raw').value)}catch(e){return toast('bad json',1)}}
+ let r=await fetch('/api/config',{method:'POST',body:JSON.stringify(cfg)});
+ toast(r.ok?'Saved':'Error',!r.ok);drawTabs();drawGrid()}
+function toggleRaw(){let r=$('raw');if(r.style.display=='none'){if(sel>=0&&$('e_type'))grab();r.value=JSON.stringify(cfg,null,1);r.style.display='block'}else r.style.display='none'}
+async function upload(){let f=$('fw_file').files[0];if(!f)return toast('pick a .bin',1);
+ let fd=new FormData();fd.append('f',f);$('prog').textContent='Uploading...';
+ let r=await fetch('/api/update',{method:'POST',body:fd});
+ $('prog').textContent=r.ok?'Flashed — rebooting':'Update failed'}
+async function exitCfg(){await fetch('/api/exit',{method:'POST'});toast('Rebooting to keyboard mode')}
+function toast(m,bad){let e=$('msg');e.textContent=m;e.style.background=bad?'#b00':'#16a34a';e.style.display='block';setTimeout(()=>e.style.display='none',1800)}
+load();
+</script></body></html>)HTML";
+
+void handleRoot() { server.send_P(200, "text/html", CONFIG_HTML); }
+
+void enterConfigMode() {
+  releaseAll();
+  // Tear BLE all the way down — frees the radio + controller RAM for WiFi,
+  // which the WROOM-32 needs (the two stacks don't coexist reliably)
+  NimBLEDevice::stopAdvertising();
+  if (bleConnected && pServer) pServer->disconnect(bleConnHandle);
+  delay(100);
+  NimBLEDevice::deinit(true);
+  delay(150);
+
+  WiFi.mode(WIFI_AP);
+  WiFi.softAP(AP_SSID, AP_PASS);
+  delay(200);
+
+  server.on("/",            HTTP_GET,  handleRoot);
+  server.on("/api/info",    HTTP_GET,  handleGetInfo);
+  server.on("/api/actions", HTTP_GET,  handleGetActions);
+  server.on("/api/config",  HTTP_GET,  handleGetConfig);
+  server.on("/api/config",  HTTP_POST, handlePostConfig);
+  server.on("/api/exit",    HTTP_POST, handleExit);
+  server.on("/api/update",  HTTP_POST, handleUpdateDone, handleUpdateUpload);
+  server.begin();
+
+  configMode = true;
+  drawConfigScreen();
+}
+
+void drawConfigScreen() {
+  tft.fillScreen(C_BG);
+  drawStatusBar("CONFIG MODE", C_LTBLUE);
+  tft.setTextSize(2);
+  tft.setTextColor(C_WHITE, C_BG);
+  tft.setCursor(10, 40);  tft.print("Wi-Fi Setup");
+  tft.setTextSize(1);
+  tft.setTextColor(C_DIM, C_BG);
+  tft.setCursor(10, 72);  tft.print("1. Join Wi-Fi network:");
+  tft.setTextColor(C_CYAN, C_BG);
+  tft.setCursor(24, 86);  tft.print(AP_SSID);
+  tft.setTextColor(C_DIM, C_BG);
+  tft.setCursor(10, 104); tft.print("   password: ");
+  tft.setTextColor(C_CYAN, C_BG); tft.print(AP_PASS);
+  tft.setTextColor(C_DIM, C_BG);
+  tft.setCursor(10, 122); tft.print("2. Open in browser:");
+  tft.setTextColor(C_AMBER, C_BG);
+  tft.setCursor(24, 136); tft.print("http://" AP_IP_STR);
+
+  if (otaActive) {
+    tft.fillRect(10, 160, 300, 40, C_SURF);
+    tft.drawRect(10, 160, 300, 40, C_GREEN);
+    tft.setTextColor(C_GREEN, C_SURF);
+    tft.setCursor(18, 168); tft.printf("Flashing... %u KB", (unsigned)(otaProgress / 1024));
+    tft.setTextColor(C_RED, C_SURF);
+    tft.setCursor(18, 184); tft.print("do NOT power off");
+  } else {
+    tft.setTextColor(C_DIM, C_BG);
+    tft.setCursor(10, 210); tft.print("Hold FN (K9) to exit + reboot");
+  }
 }
 
 // ════════════════════════════════════════════════
@@ -1449,6 +1910,18 @@ void setup() {
 void loop() {
   unsigned long now = millis();
 
+  // ── Config Mode: WiFi/HTTP only, BLE is torn down ──
+  // Hold FN (K9) ~1.5s to leave and reboot back into keyboard mode.
+  if (configMode) {
+    server.handleClient();
+    static unsigned long fnDown = 0;
+    bool fn = (scanMatrixRaw() >> KEY_FN) & 1;
+    if (fn) { if (fnDown == 0) fnDown = now; else if (now - fnDown > 1500) ESP.restart(); }
+    else fnDown = 0;
+    delay(2);
+    return;
+  }
+
   // BLE events from callback context → UI feedback (loop owns the TFT)
   if (pendingBleEvent != EVT_NONE) {
     uint8_t evt = pendingBleEvent;
@@ -1473,7 +1946,7 @@ void loop() {
         delay(150);
         lastFlashKey = wakeKeyIdx; flashUntil = now + FLASH_MS;
         drawMain();
-        fireAction(presets[activePreset].keys[wakeKeyIdx].id);
+        fireKeyAction(presets[activePreset].keys[wakeKeyIdx]);
         wakeKeyIdx = WAKEKEY_NONE;
       } else redraw();
     } else {
@@ -1514,7 +1987,22 @@ void loop() {
   }
 
   // ── Matrix scan with per-key debounce + tap/hold events ──
+  // Fixed cadence: scanning every loop pass made keys feel sticky on the
+  // bench; 5ms polling + 25ms debounce filters contact bounce cleanly
+  static unsigned long lastScanMs = 0;
+  if (now - lastScanMs < KEY_SCAN_INTERVAL_MS) { maybeEnterSleep(); delay(1); return; }
+  lastScanMs = now;
   uint16_t raw = scanMatrixRaw();
+  static uint16_t lastRawDbg = 0;
+  if (raw != lastRawDbg) {           // bench debug: print electrical position
+    for (int d = 0; d < 3; d++) for (int j = 0; j < 4; j++) {
+      uint16_t m = 1u << (d * 4 + j);
+      if ((raw & m) && !(lastRawDbg & m))
+        Serial.printf("[MX] DOWN row=P%d col=P%d  -> key idx %d\n",
+                      DRIVE_PINS[d], READ_PINS[j], d * 4 + j);
+    }
+    lastRawDbg = raw;
+  }
   for (int i = 0; i < NUM_KEYS; i++) {
     bool r = (raw >> i) & 1;
     if (r != keyRaw[i]) { keyRaw[i] = r; keyChangeMs[i] = now; }
@@ -1524,6 +2012,12 @@ void loop() {
         keyDownMs[i] = now;
         keyHoldFired[i] = false;
         recordActivity();
+        // Instant fire on press for keys with no hold action on this
+        // screen — firing on release made keys feel laggy ("hanging")
+        if (holdThresholdFor(i) == 0) {
+          keyFiredOnDown[i] = true;
+          onKeyTap(i);
+        } else keyFiredOnDown[i] = false;
       } else {
         onKeyUp(i, now - keyDownMs[i]);
       }
