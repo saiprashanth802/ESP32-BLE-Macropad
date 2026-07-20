@@ -160,7 +160,7 @@ const uint16_t KEY_SCAN_INTERVAL_MS = 5; // fixed scan cadence, not every loop
 uint8_t faceMode  = 1;
 uint8_t faceStyle = 0;
 char    faceGif[32] = "";                 // selected SPIFFS path, e.g. "/idle.gif"
-const unsigned long FACE_IDLE_MS   = 8000;  // IDLE: grid → face after this
+// IDLE threshold comes from faceCfg.idleS (configurable, default 12s).
 const unsigned long FACE_ALWAYS_MS = 2000;  // ALWAYS: return to face after this
 
 // Expression pack — every visual parameter of the eyes, uploadable as JSON
@@ -173,8 +173,9 @@ struct FaceCfg {
   uint8_t  blinkMinS, blinkMaxS;    // idle blink interval range (seconds)
   uint8_t  glanceMinS, glanceMaxS;  // idle glance interval range (seconds)
   uint8_t  pairScalePct; // pairing-mode wide-eye width scale (percent)
+  uint8_t  idleS;        // IDLE mode: seconds of no input before face shows
 };
-FaceCfg faceCfg = { 0, 64, 84, 44, 18, 3, 6, 7, 15, 115 };
+FaceCfg faceCfg = { 0, 64, 84, 44, 18, 3, 6, 7, 15, 115, 12 };
 const uint16_t KEY_MIN_PRESS_MS  = 30;
 const unsigned long FN_MENU_MS   = 1000;   // FN hold → SYSTEM menu
 const unsigned long PAIR_HOLD_MS = 1500;   // slot key hold → pairing mode
@@ -792,6 +793,7 @@ void clampFaceCfg() {
   if (faceCfg.glanceMinS < 2) faceCfg.glanceMinS = 2;
   if (faceCfg.glanceMaxS < faceCfg.glanceMinS) faceCfg.glanceMaxS = faceCfg.glanceMinS;
   faceCfg.pairScalePct = constrain(faceCfg.pairScalePct, 100, 130);
+  faceCfg.idleS = constrain(faceCfg.idleS, 3, 120);
 }
 
 void saveSettings() {
@@ -1668,8 +1670,9 @@ void updateFace(unsigned long now) {
   }
 
   // Pre-sleep droop: ease lids down over the last 10s before sleep
+  // (fresh millis() — same unsigned-underflow hazard as the entry check)
   if (sleepTimeoutMs > 0) {
-    unsigned long idle = now - lastActivityMs;
+    unsigned long idle = millis() - lastActivityMs;
     if (idle + 10000 > sleepTimeoutMs) {
       unsigned long left = (sleepTimeoutMs > idle) ? sleepTimeoutMs - idle : 0;
       float droop = 0.18f + 0.82f * ((float)left / 10000.0f);
@@ -1968,6 +1971,7 @@ void handleGetConfig() {
   e["blinkMinS"] = faceCfg.blinkMinS;   e["blinkMaxS"] = faceCfg.blinkMaxS;
   e["glanceMinS"] = faceCfg.glanceMinS; e["glanceMaxS"] = faceCfg.glanceMaxS;
   e["pairScalePct"] = faceCfg.pairScalePct;
+  e["idleS"] = faceCfg.idleS;
   JsonArray pr = doc["presets"].to<JsonArray>();
   for (int p = 0; p < NUM_PRESETS; p++) {
     JsonObject po = pr.add<JsonObject>();
@@ -2016,6 +2020,7 @@ void handlePostConfig() {
       if (e["glanceMinS"].is<int>())   faceCfg.glanceMinS = e["glanceMinS"];
       if (e["glanceMaxS"].is<int>())   faceCfg.glanceMaxS = e["glanceMaxS"];
       if (e["pairScalePct"].is<int>()) faceCfg.pairScalePct = e["pairScalePct"];
+      if (e["idleS"].is<int>())        faceCfg.idleS = e["idleS"];
       saveFaceCfg();                   // clamps + persists
     }
   }
@@ -2505,14 +2510,17 @@ void loop() {
         keyHoldFired[i] = false;
         recordActivity();
         if (currentScreen == SCR_FACE) {
-          // First press only wakes the face — never fires the macro.
-          // Consuming press AND release via keyFiredOnDown.
+          // IDLE: first press only wakes (consumed, never typed).
+          // ALWAYS: the face returns every 2s — eating a press each time
+          // made the pad unusable, so presses fire straight THROUGH it.
           keyFiredOnDown[i] = true;
           faceGifStop();
           if (faceStyle == 0) faceWake();       // happy squint flash
           else screenDirty = true;
           currentScreen = SCR_MAIN;
           drawMain();
+          Serial.printf("[FACE] wake by K%d (mode=%d)\n", i + 1, faceMode);
+          if (faceMode == 2) onKeyTap(i);       // fire through in ALWAYS
         }
         // Instant fire on press for keys with no hold action on this
         // screen — firing on release made keys feel laggy ("hanging")
@@ -2537,8 +2545,15 @@ void loop() {
   // ── Face: idle entry + animation tick ──
   if (faceMode != 0 && currentScreen == SCR_MAIN &&
       toastUntil == 0 && !wakeKeyPending && lastFlashKey < 0) {
-    unsigned long th = (faceMode == 2) ? FACE_ALWAYS_MS : FACE_IDLE_MS;
-    if (now - lastActivityMs > th) { currentScreen = SCR_FACE; faceEnter(); }
+    unsigned long th = (faceMode == 2) ? FACE_ALWAYS_MS
+                                       : (unsigned long)faceCfg.idleS * 1000UL;
+    // MUST be a fresh millis(): recordActivity() may have run later in this
+    // very pass than the loop-top `now`, and unsigned (now - lastActivityMs)
+    // would wrap to ~4e9 → face re-entered on the same pass as the wake press
+    if (millis() - lastActivityMs > th) {
+      Serial.println("[FACE] enter");
+      currentScreen = SCR_FACE; faceEnter();
+    }
   }
   if (currentScreen == SCR_FACE) {
     if (faceStyle == 1) faceGifTick(now);
