@@ -29,10 +29,14 @@ device for ~1.5 s. Either way the device reboots back into keyboard mode.
 | GET  | `/`             | Built-in web config UI (HTML) |
 | GET  | `/api/info`     | Device/firmware/capability info |
 | GET  | `/api/actions`  | Built-in action library (id + label) |
-| GET  | `/api/config`   | Full config (settings + all presets) |
+| GET  | `/api/config`   | Full config (settings + presets + face) |
 | POST | `/api/config`   | Apply + persist config (JSON body) |
 | POST | `/api/update`   | OTA firmware upload (multipart `.bin`) |
 | POST | `/api/exit`     | Save nothing, reboot to keyboard mode |
+| GET  | `/api/anim`        | List uploaded GIF animations + storage usage |
+| POST | `/api/anim`        | Upload a `.gif` (multipart; ≤ ~700 KB free space) |
+| POST | `/api/anim/select` | `{"name":"/x.gif"}` — set as active face animation |
+| POST | `/api/anim/delete` | `{"name":"/x.gif"}` — delete from storage |
 
 ### `GET /api/info`
 ```json
@@ -89,6 +93,39 @@ success the device flashes the inactive OTA partition and reboots into it; on
 failure the running firmware is untouched. Build the `.bin` with the exact
 board options below or the device won't boot it.
 
+## Face / screensaver ("expression packs")
+
+The device shows a state-reactive robot-eyes face (blinks when idle-connected,
+darts when disconnected, widens in pairing, glances toward a slot on
+Easy-Switch, droops before sleep) or an uploaded looping GIF. Everything is
+controlled from the `face` object in `/api/config`:
+
+```jsonc
+"face": {
+  "mode":  "idle",        // "off" | "idle" (screensaver) | "always"
+  "style": "eyes",        // "eyes" (procedural) | "gif" (uploaded loop)
+  "gif":   "/idle.gif",   // active animation (from /api/anim)
+  "eyes": {               // the EXPRESSION PACK — fully generative
+    "color": 0,           // RGB565 eye color; 0 = follow active preset color
+    "eyeW": 64, "eyeH": 84, "gap": 44, "round": 18,
+    "blinkMinS": 3,  "blinkMaxS": 6,      // idle blink interval (s)
+    "glanceMinS": 7, "glanceMaxS": 15,    // idle glance interval (s)
+    "pairScalePct": 115                   // wide-eye scale in pairing mode
+  }
+}
+```
+
+All eye fields are clamped device-side to renderable bounds. A companion app
+"generates a personality" by POSTing a new `eyes` object — no reflash needed.
+GIF notes: hardware cannot decode MP4/H.264; convert to GIF first
+(`ffmpeg -i in.mp4 -vf "fps=12,scale=320:-1" out.gif`). Playback is centered,
+looped, ~10–25 fps depending on GIF complexity. While `style` is `"gif"` the
+face does not react to state (a canned loop can't); `"eyes"` is the reactive
+mode. First press on any key always just wakes the device — it is never typed.
+
+On-device controls: **Settings → FACE** cycles OFF/IDLE/ALWAYS, **Settings →
+STYLE** toggles EYES/GIF.
+
 ## "Launching apps"
 
 True app-launch happens on the host, not the keyboard. Two supported patterns:
@@ -107,10 +144,17 @@ partition layout / boot:
 
 ```
 Board:            ESP32 Dev Module   (esp32:esp32:esp32)
-Partition Scheme: Minimal SPIFFS (1.9MB APP with OTA/128KB SPIFFS)   [min_spiffs]
+Partition Scheme: CUSTOM — firmware/v5/macropad_v5/partitions.csv is picked up
+                  automatically by the esp32 core (dual 1.5MB OTA slots +
+                  896KB SPIFFS for GIF animations). The menu setting is
+                  ignored when that file is present.
 Flash Frequency:  40MHz    (this bench board's Boya flash needs it)
 Upload Speed:     115200   (USB flashing only; OTA ignores this)
 ```
+
+> ⚠️ The switch TO this custom table had to be done once over USB — OTA can
+> never change the partition table. After that one flash, OTA works normally
+> and images must fit the 1.5MB slot.
 
 arduino-cli one-liner (produces `build/.../macropad_v5.ino.bin`):
 ```

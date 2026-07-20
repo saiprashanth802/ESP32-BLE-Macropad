@@ -154,6 +154,13 @@
 - Status bar shows the three slots like Easy-Switch LEDs (green = connected, amber = waiting, magenta = pairing)
 - Firmware: `firmware/v5/macropad_v5.ino` (NimBLE 2.x API, single file)
 
+### Face — state-reactive robot eyes / GIF screensaver
+- Procedural eyes that react to device state: blink when idle-connected, dart when disconnected, widen in pairing mode, glance toward the slot on Easy-Switch, droop before sleep
+- **Expression packs**: every eye parameter (color, geometry, blink/glance timing) is JSON in the config API — the companion app can generate personalities without reflashing
+- Or upload a looping **GIF** (≤ ~700 KB) through the web UI as an ambient screensaver
+- Settings → FACE (OFF/IDLE/ALWAYS) and STYLE (EYES/GIF); first press always just wakes, never types
+- Custom partition table: dual 1.5 MB OTA slots + 896 KB SPIFFS for animations
+
 ### Config Mode — wireless setup + OTA firmware update
 - **Settings → CONFIG (WiFi/OTA)** suspends BLE and raises a WiFi hotspot (`MacroPad-Setup` / `macropad123`, `http://192.168.4.1`)
 - Built-in web UI + JSON API to remap keys, edit presets, and change settings — no re-flash needed

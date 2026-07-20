@@ -45,9 +45,11 @@
 // include guard, which would hide the global `FS` alias WebServer.h needs.
 #include <WiFi.h>
 #include <FS.h>
+#include <SPIFFS.h>
 #include <WebServer.h>
 #include <Update.h>
 #include <ArduinoJson.h>
+#include <AnimatedGIF.h>
 #include <NimBLEDevice.h>
 #include <NimBLEHIDDevice.h>
 #include <TFT_eSPI.h>
@@ -63,7 +65,7 @@
 //  and leaving Config Mode both go through a clean reboot.
 // ════════════════════════════════════════════════
 #define FW_VERSION   "v5-multihost"
-#define CONFIG_API   2            // bump when the JSON schema changes
+#define CONFIG_API   3            // bump when the JSON schema changes
 #define AP_SSID      "MacroPad-Setup"
 #define AP_PASS      "macropad123" // WPA2 needs >=8 chars; changeable via API
 #define AP_IP_STR    "192.168.4.1"
@@ -151,6 +153,28 @@ bool          linuxLayout         = false;      // false=Windows, true=Linux
 
 const uint16_t KEY_DEBOUNCE_MS   = 25;   // raised: bench keys were sticking
 const uint16_t KEY_SCAN_INTERVAL_MS = 5; // fixed scan cadence, not every loop
+
+// ── FACE / screensaver ──────────────────────────
+// faceMode:  0=OFF  1=IDLE (screensaver after idle)  2=ALWAYS (default view)
+// faceStyle: 0=procedural robot eyes  1=uploaded GIF loop (falls back to eyes)
+uint8_t faceMode  = 1;
+uint8_t faceStyle = 0;
+char    faceGif[32] = "";                 // selected SPIFFS path, e.g. "/idle.gif"
+const unsigned long FACE_IDLE_MS   = 8000;  // IDLE: grid → face after this
+const unsigned long FACE_ALWAYS_MS = 2000;  // ALWAYS: return to face after this
+
+// Expression pack — every visual parameter of the eyes, uploadable as JSON
+// via the config API so the companion app can "generate" personalities.
+struct FaceCfg {
+  uint16_t color;        // RGB565 eye color; 0 = follow active preset color
+  uint8_t  eyeW, eyeH;   // eye size at rest (px)
+  uint8_t  gap;          // horizontal gap between the eyes (px)
+  uint8_t  rnd;          // corner radius (px)
+  uint8_t  blinkMinS, blinkMaxS;    // idle blink interval range (seconds)
+  uint8_t  glanceMinS, glanceMaxS;  // idle glance interval range (seconds)
+  uint8_t  pairScalePct; // pairing-mode wide-eye width scale (percent)
+};
+FaceCfg faceCfg = { 0, 64, 84, 44, 18, 3, 6, 7, 15, 115 };
 const uint16_t KEY_MIN_PRESS_MS  = 30;
 const unsigned long FN_MENU_MS   = 1000;   // FN hold → SYSTEM menu
 const unsigned long PAIR_HOLD_MS = 1500;   // slot key hold → pairing mode
@@ -278,6 +302,9 @@ volatile uint16_t bleConnHandle = 0;
 
 void startAdvertisingForSlot();   // fwd
 void saveSlots();                 // fwd
+void faceSlotGlance(int slot);    // fwd
+void enterConfigMode();           // fwd
+void clampFaceCfg();              // fwd
 
 int slotForAddress(const uint8_t addr[6]) {
   for (int i = 0; i < NUM_SLOTS; i++)
@@ -399,6 +426,7 @@ void switchToSlot(int n, bool forcePair) {
   }
   activeSlot  = n;
   pairingMode = forcePair || !hostSlots[n].bonded;
+  faceSlotGlance(n);          // face glances toward the new slot if visible soon
   saveSlots();
   if (bleConnected) {
     pServer->disconnect(bleConnHandle);  // onDisconnect → startAdvertisingForSlot
@@ -655,7 +683,8 @@ Preset presets[NUM_PRESETS] = {
 enum Screen {
   SCR_MAIN, SCR_SYSMENU, SCR_PRESET, SCR_SETTINGS,
   SCR_EDIT_BRIGHT, SCR_EDIT_SLEEP, SCR_DEVICES,
-  SCR_BUILD_PRESET, SCR_BUILD_KEYS, SCR_BUILD_ACTION
+  SCR_BUILD_PRESET, SCR_BUILD_KEYS, SCR_BUILD_ACTION,
+  SCR_FACE
 };
 Screen currentScreen = SCR_MAIN;
 
@@ -690,6 +719,9 @@ Preferences prefs;
 TFT_eSPI    tft    = TFT_eSPI();
 TFT_eSprite sprBar = TFT_eSprite(&tft);   // 320×26 status bar
 TFT_eSprite sprCell= TFT_eSprite(&tft);   // 78×68 reusable key cell
+TFT_eSprite sprEye = TFT_eSprite(&tft);   // 92×110 reusable eye canvas (face)
+#define EYE_SPR_W 92
+#define EYE_SPR_H 110
 
 // Landscape cell grid: 4 cols × 3 rows below the 26px status bar
 static inline int cellX(int i){ return 1 + (i % 4) * 80; }
@@ -721,6 +753,9 @@ void drawSettings(); void drawEditor(); void drawDevices();
 void drawBuildPreset(); void drawBuildKeys(); void drawBuildAction();
 void drawReconnectHUD(const char* keyName);
 void fireAction(int id);
+void faceEnter(); void faceWake(); void faceSleepClose();
+void updateFace(unsigned long now); void faceGifTick(unsigned long now);
+void faceSlotGlance(int slot);
 
 // ════════════════════════════════════════════════
 //  PERSISTENCE (NVS)
@@ -738,6 +773,25 @@ void loadState() {
   if (prefs.getInt("pver", 0) == PRESETS_VER &&
       prefs.getBytesLength("presets") == sizeof(presets))
     prefs.getBytes("presets", presets, sizeof(presets));
+  faceMode  = min((uint8_t)2, (uint8_t)prefs.getUChar("face", 1));
+  faceStyle = min((uint8_t)1, (uint8_t)prefs.getUChar("fstyle", 0));
+  prefs.getString("fgif", faceGif, sizeof(faceGif));
+  if (prefs.getBytesLength("fcfg") == sizeof(faceCfg))
+    prefs.getBytes("fcfg", &faceCfg, sizeof(faceCfg));
+  clampFaceCfg();
+}
+
+// Keep an uploaded expression pack inside sane/renderable bounds
+void clampFaceCfg() {
+  faceCfg.eyeW = constrain(faceCfg.eyeW, 20, 72);
+  faceCfg.eyeH = constrain(faceCfg.eyeH, 28, 96);
+  faceCfg.gap  = constrain(faceCfg.gap, 8, 120);
+  faceCfg.rnd  = constrain(faceCfg.rnd, 2, 40);
+  if (faceCfg.blinkMinS < 1) faceCfg.blinkMinS = 1;
+  if (faceCfg.blinkMaxS < faceCfg.blinkMinS) faceCfg.blinkMaxS = faceCfg.blinkMinS;
+  if (faceCfg.glanceMinS < 2) faceCfg.glanceMinS = 2;
+  if (faceCfg.glanceMaxS < faceCfg.glanceMinS) faceCfg.glanceMaxS = faceCfg.glanceMinS;
+  faceCfg.pairScalePct = constrain(faceCfg.pairScalePct, 100, 130);
 }
 
 void saveSettings() {
@@ -745,6 +799,14 @@ void saveSettings() {
   prefs.putInt("sleepMin", (sleepTimeoutMs == 0) ? 0 : (int)(sleepTimeoutMs / 60000UL));
   prefs.putBool("linux", linuxLayout);
   prefs.putInt("preset", activePreset);
+  prefs.putUChar("face", faceMode);
+  prefs.putUChar("fstyle", faceStyle);
+  prefs.putString("fgif", faceGif);
+}
+
+void saveFaceCfg() {
+  clampFaceCfg();
+  prefs.putBytes("fcfg", &faceCfg, sizeof(faceCfg));
 }
 
 void saveSlots() {
@@ -937,7 +999,10 @@ void drawSettings() {
   drawCell(2, "OS", linuxLayout ? "LINUX" : "WINDOWS", C_GREEN, false);
   drawCell(3, "DEVICES", nullptr, C_MAGENTA, false);
   drawCell(4, "CONFIG", "WiFi/OTA", C_LTBLUE, false);
-  for (int i = 5; i < 11; i++) drawCellEmpty(i);
+  drawCell(5, "FACE", faceMode == 0 ? "OFF" : (faceMode == 1 ? "IDLE" : "ALWAYS"),
+           C_PINK, false);
+  drawCell(6, "STYLE", faceStyle == 0 ? "EYES" : "GIF", C_PINK, false);
+  for (int i = 7; i < 11; i++) drawCellEmpty(i);
   drawCell(11, "SAVE", "+ exit", C_WHITE, false);
 }
 
@@ -1090,6 +1155,7 @@ void redraw() {
     case SCR_BUILD_PRESET: drawBuildPreset();  break;
     case SCR_BUILD_KEYS:   drawBuildKeys();    break;
     case SCR_BUILD_ACTION: drawBuildAction();  break;
+    case SCR_FACE:         faceEnter();        break;
   }
 }
 
@@ -1389,6 +1455,8 @@ void onKeyTap(int i) {
       else if (i == 2) { linuxLayout = !linuxLayout; drawSettings(); }
       else if (i == 3) { currentScreen = SCR_DEVICES; drawDevices(); }
       else if (i == 4) { saveSettings(); enterConfigMode(); }  // no return — reboots on exit
+      else if (i == 5) { faceMode = (faceMode + 1) % 3; drawSettings(); }
+      else if (i == 6) { faceStyle = (faceStyle + 1) % 2; drawSettings(); }
       else if (i == 11 || i == KEY_FN) {
         saveSettings();
         currentScreen = SCR_MAIN; drawMain();
@@ -1481,6 +1549,240 @@ void onKeyUp(int i, unsigned long heldMs) {
 }
 
 // ════════════════════════════════════════════════
+//  FACE — state-reactive robot eyes + optional GIF loop
+//  Procedural: every visual parameter comes from faceCfg (the uploadable
+//  "expression pack"), state from live BLE globals. Renders both eyes
+//  through one reused sprite — no full-screen clears while animating.
+// ════════════════════════════════════════════════
+float eyeOpen = 1.0f, eyeOpenTarget = 1.0f;
+float eyeGlanceX = 0, eyeGlanceY = 0, eyeGlanceTX = 0, eyeGlanceTY = 0;
+bool  faceBlinking = false;
+unsigned long faceNextBlink = 0, faceBlinkEnd = 0;
+unsigned long faceNextGlance = 0, faceGlanceEnd = 0;
+unsigned long faceDartNext = 0;
+unsigned long faceEvtUntil = 0;
+int   faceEvtDir = 0;             // -1 left, 0 up, +1 right (slot glance)
+unsigned long faceFrameMs = 0;
+
+static inline uint32_t frnd(uint32_t lo, uint32_t hi) {   // [lo, hi] ms
+  return lo + (esp_random() % (hi - lo + 1));
+}
+
+uint16_t faceEyeColor() {
+  return faceCfg.color ? faceCfg.color : PRESET_COLORS[activePreset];
+}
+
+// Draw one eye into sprEye and push at center (cx, cy)
+void drawEyeAt(int cx, int cy, float open, float wScale) {
+  sprEye.fillSprite(C_BG);
+  int w = (int)(faceCfg.eyeW * wScale);
+  int h = max(6, (int)(faceCfg.eyeH * open));
+  w = min(w, EYE_SPR_W - 4); h = min(h, EYE_SPR_H - 4);
+  int gx = (int)eyeGlanceX, gy = (int)eyeGlanceY;
+  int x = (EYE_SPR_W - w) / 2 + gx;
+  int y = (EYE_SPR_H - h) / 2 + gy;
+  x = constrain(x, 0, EYE_SPR_W - w);
+  y = constrain(y, 0, EYE_SPR_H - h);
+  int r = min((int)faceCfg.rnd, h / 2);
+  r = min(r, w / 2);
+  sprEye.fillRoundRect(x, y, w, h, r, faceEyeColor());
+  sprEye.pushSprite(cx - EYE_SPR_W / 2, cy - EYE_SPR_H / 2);
+}
+
+void drawFaceFrame(float open, float wScale) {
+  int half = faceCfg.gap / 2 + faceCfg.eyeW / 2;
+  drawEyeAt(160 - half, 120, open, wScale);
+  drawEyeAt(160 + half, 120, open, wScale);
+}
+
+void faceSlotGlance(int slot) {           // called from switchToSlot
+  faceEvtDir  = (slot == 0) ? -1 : (slot == 1 ? 0 : 1);
+  faceEvtUntil = millis() + 3000;         // glance if face shows within 3s
+}
+
+void faceEnter() {
+  beginDraw(SCR_FACE);
+  eyeOpen = 0.0f; eyeOpenTarget = 1.0f;   // eyes open on arrival
+  eyeGlanceX = eyeGlanceY = eyeGlanceTX = eyeGlanceTY = 0;
+  faceBlinking = false;
+  unsigned long now = millis();
+  faceNextBlink  = now + frnd(faceCfg.blinkMinS * 1000UL, faceCfg.blinkMaxS * 1000UL);
+  faceNextGlance = now + frnd(faceCfg.glanceMinS * 1000UL, faceCfg.glanceMaxS * 1000UL);
+  faceGlanceEnd = 0; faceDartNext = 0; faceFrameMs = 0;
+}
+
+// Happy squint flash on the wake press, then caller returns to the grid
+void faceWake() {
+  drawFaceFrame(0.32f, 1.05f);
+  delay(160);
+  screenDirty = true;                     // grid must fully repaint over us
+}
+
+// Lids close animation right before light sleep (eyes style only)
+void faceSleepClose() {
+  for (float o = eyeOpen; o > 0.02f; o *= 0.72f) {
+    drawFaceFrame(o, 1.0f);
+    delay(30);
+  }
+  drawFaceFrame(0.02f, 1.0f);
+  delay(120);
+}
+
+void updateFace(unsigned long now) {
+  if (now - faceFrameMs < 33) return;     // ~30 fps
+  faceFrameMs = now;
+
+  float wScale = 1.0f;
+  bool allowBlink = true;
+
+  if (pairingMode) {                      // wide + curious
+    wScale = faceCfg.pairScalePct / 100.0f;
+    eyeOpenTarget = 1.0f;
+    allowBlink = false;
+    eyeGlanceTX = 0; eyeGlanceTY = -3;
+  } else if (!bleConnected) {             // searching — eyes dart around
+    if (now >= faceDartNext) {
+      faceDartNext = now + frnd(400, 800);
+      eyeGlanceTX = (float)((int)frnd(0, 24)) - 12.0f;
+      eyeGlanceTY = (float)((int)frnd(0, 10)) - 5.0f;
+    }
+    eyeOpenTarget = 0.85f;
+    allowBlink = false;
+  } else {                                // connected, idle — calm
+    eyeOpenTarget = 1.0f;
+    if (faceGlanceEnd != 0 && now >= faceGlanceEnd) {
+      eyeGlanceTX = eyeGlanceTY = 0;
+      faceGlanceEnd = 0;
+    } else if (faceGlanceEnd == 0 && now >= faceNextGlance) {
+      eyeGlanceTX = (frnd(0, 1) ? 10.0f : -10.0f);
+      eyeGlanceTY = (float)((int)frnd(0, 6)) - 3.0f;
+      faceGlanceEnd  = now + frnd(500, 900);
+      faceNextGlance = now + frnd(faceCfg.glanceMinS * 1000UL, faceCfg.glanceMaxS * 1000UL);
+    }
+  }
+
+  // Easy-Switch event: glance toward the slot that was just selected
+  if (now < faceEvtUntil) {
+    eyeGlanceTX = faceEvtDir * 14.0f;
+    eyeGlanceTY = (faceEvtDir == 0) ? -6.0f : 0.0f;
+  }
+
+  // Pre-sleep droop: ease lids down over the last 10s before sleep
+  if (sleepTimeoutMs > 0) {
+    unsigned long idle = now - lastActivityMs;
+    if (idle + 10000 > sleepTimeoutMs) {
+      unsigned long left = (sleepTimeoutMs > idle) ? sleepTimeoutMs - idle : 0;
+      float droop = 0.18f + 0.82f * ((float)left / 10000.0f);
+      if (droop < eyeOpenTarget) eyeOpenTarget = droop;
+      allowBlink = false;
+    }
+  }
+
+  // Blink scheduling
+  if (faceBlinking) {
+    if (now >= faceBlinkEnd) { faceBlinking = false; eyeOpenTarget = 1.0f; }
+    else eyeOpenTarget = 0.0f;
+  } else if (allowBlink && now >= faceNextBlink) {
+    faceBlinking = true;
+    faceBlinkEnd  = now + 110;
+    faceNextBlink = now + frnd(faceCfg.blinkMinS * 1000UL, faceCfg.blinkMaxS * 1000UL);
+  }
+
+  // Ease current values toward targets, then render
+  eyeOpen    += (eyeOpenTarget - eyeOpen) * 0.38f;
+  eyeGlanceX += (eyeGlanceTX - eyeGlanceX) * 0.30f;
+  eyeGlanceY += (eyeGlanceTY - eyeGlanceY) * 0.30f;
+  drawFaceFrame(eyeOpen, wScale);
+}
+
+// ── GIF playback (faceStyle == 1) ───────────────
+AnimatedGIF gifDec;
+File gifFile;
+bool gifOpen = false;
+int  gifOffX = 0, gifOffY = 0;
+unsigned long gifNextFrame = 0;
+static uint16_t gifLineBuf[320];
+
+void* GIFOpenFile(const char* fname, int32_t* pSize) {
+  gifFile = SPIFFS.open(fname);
+  if (gifFile) { *pSize = gifFile.size(); return (void*)&gifFile; }
+  return NULL;
+}
+void GIFCloseFile(void* pHandle) {
+  File* f = static_cast<File*>(pHandle);
+  if (f != NULL) f->close();
+}
+int32_t GIFReadFile(GIFFILE* pFile, uint8_t* pBuf, int32_t iLen) {
+  File* f = static_cast<File*>(pFile->fHandle);
+  int32_t iBytesRead = iLen;
+  if ((pFile->iSize - pFile->iPos) < iLen) iBytesRead = pFile->iSize - pFile->iPos - 1;
+  if (iBytesRead <= 0) return 0;
+  iBytesRead = (int32_t)f->read(pBuf, iBytesRead);
+  pFile->iPos = f->position();
+  return iBytesRead;
+}
+int32_t GIFSeekFile(GIFFILE* pFile, int32_t iPosition) {
+  File* f = static_cast<File*>(pFile->fHandle);
+  f->seek(iPosition);
+  pFile->iPos = (int32_t)f->position();
+  return pFile->iPos;
+}
+
+// Line-at-a-time draw straight to the panel — no framebuffer needed
+void GIFDraw(GIFDRAW* pDraw) {
+  int iWidth = pDraw->iWidth;
+  if (iWidth + pDraw->iX > 320) iWidth = 320 - pDraw->iX;
+  int y = gifOffY + pDraw->iY + pDraw->y;
+  if (y < 0 || y >= 240 || iWidth < 1) return;
+  uint16_t* usPalette = pDraw->pPalette;
+  uint8_t*  s = pDraw->pPixels;
+
+  if (pDraw->ucDisposalMethod == 2) {
+    for (int x = 0; x < iWidth; x++)
+      if (s[x] == pDraw->ucTransparent) s[x] = pDraw->ucBackground;
+    pDraw->ucHasTransparency = 0;
+  }
+  if (pDraw->ucHasTransparency) {
+    uint8_t t = pDraw->ucTransparent;
+    int x = 0;
+    while (x < iWidth) {
+      if (s[x] == t) { x++; continue; }
+      int start = x, n = 0;
+      while (x < iWidth && s[x] != t) gifLineBuf[n++] = usPalette[s[x++]];
+      tft.pushImage(gifOffX + pDraw->iX + start, y, n, 1, gifLineBuf);
+    }
+  } else {
+    for (int x = 0; x < iWidth; x++) gifLineBuf[x] = usPalette[s[x]];
+    tft.pushImage(gifOffX + pDraw->iX, y, iWidth, 1, gifLineBuf);
+  }
+}
+
+void faceGifStop() {
+  if (gifOpen) { gifDec.close(); gifOpen = false; }
+}
+
+void faceGifTick(unsigned long now) {
+  if (!gifOpen) {
+    if (faceGif[0] == '\0' ||
+        !gifDec.open(faceGif, GIFOpenFile, GIFCloseFile, GIFReadFile, GIFSeekFile, GIFDraw)) {
+      updateFace(now);                    // fall back to procedural eyes
+      return;
+    }
+    gifOpen = true;
+    gifOffX = (320 - gifDec.getCanvasWidth()) / 2;
+    gifOffY = (240 - gifDec.getCanvasHeight()) / 2;
+    if (gifOffX < 0) gifOffX = 0;
+    if (gifOffY < 0) gifOffY = 0;
+    gifNextFrame = 0;
+  }
+  if (now < gifNextFrame) return;
+  int frameDelay = 0;
+  int rc = gifDec.playFrame(false, &frameDelay);
+  gifNextFrame = now + (unsigned long)max(frameDelay, 20);
+  if (rc == 0) gifDec.reset();            // loop forever
+}
+
+// ════════════════════════════════════════════════
 //  SLEEP / WAKE
 // ════════════════════════════════════════════════
 void maybeEnterSleep() {
@@ -1488,10 +1790,17 @@ void maybeEnterSleep() {
   if (millis() - lastActivityMs < sleepTimeoutMs) return;
   if (scanMatrixRaw() != 0) { recordActivity(); return; }
 
+  // Face: lids close before the lights go out
+  if (currentScreen == SCR_FACE) {
+    faceGifStop();
+    if (faceStyle == 0) faceSleepClose();
+  }
+
   // Blank display
   ledcWrite(TFT_BL, 0);
   tft.fillScreen(0x0000);
   releaseAll();
+  screenDirty = true;                     // wake must repaint fully
 
   NimBLEDevice::stopAdvertising();
   delay(200);
@@ -1539,6 +1848,9 @@ void maybeEnterSleep() {
       break;
     }
   }
+
+  // Waking by keypress lands on the grid, not back on the face
+  if (currentScreen == SCR_FACE) currentScreen = SCR_MAIN;
 
   if (wakeKeyPending && !bleConnected)
     drawReconnectHUD(presets[activePreset].keys[wakeKeyIdx].label);
@@ -1644,6 +1956,18 @@ void handleGetConfig() {
   s["sleepMin"]     = (sleepTimeoutMs == 0) ? 0 : (int)(sleepTimeoutMs / 60000UL);
   s["linux"]        = linuxLayout;
   s["activePreset"] = activePreset;
+  // Face / screensaver — the "expression pack"
+  JsonObject f = doc["face"].to<JsonObject>();
+  f["mode"]  = (faceMode == 0) ? "off" : (faceMode == 1 ? "idle" : "always");
+  f["style"] = (faceStyle == 0) ? "eyes" : "gif";
+  f["gif"]   = faceGif;
+  JsonObject e = f["eyes"].to<JsonObject>();
+  e["color"] = faceCfg.color;   e["eyeW"] = faceCfg.eyeW;
+  e["eyeH"] = faceCfg.eyeH;     e["gap"] = faceCfg.gap;
+  e["round"] = faceCfg.rnd;
+  e["blinkMinS"] = faceCfg.blinkMinS;   e["blinkMaxS"] = faceCfg.blinkMaxS;
+  e["glanceMinS"] = faceCfg.glanceMinS; e["glanceMaxS"] = faceCfg.glanceMaxS;
+  e["pairScalePct"] = faceCfg.pairScalePct;
   JsonArray pr = doc["presets"].to<JsonArray>();
   for (int p = 0; p < NUM_PRESETS; p++) {
     JsonObject po = pr.add<JsonObject>();
@@ -1667,6 +1991,33 @@ void handlePostConfig() {
     if (s["sleepMin"].is<int>())   { int sm = s["sleepMin"]; sleepTimeoutMs = (sm == 0) ? 0UL : (unsigned long)sm * 60000UL; }
     if (s["linux"].is<bool>())       linuxLayout = s["linux"];
     if (s["activePreset"].is<int>()) activePreset = constrain((int)s["activePreset"], 0, NUM_PRESETS - 1);
+  }
+  JsonObjectConst f = doc["face"];
+  if (!f.isNull()) {
+    if (f["mode"].is<const char*>()) {
+      const char* m = f["mode"];
+      faceMode = !strcmp(m, "always") ? 2 : (!strcmp(m, "idle") ? 1 : 0);
+    }
+    if (f["style"].is<const char*>())
+      faceStyle = !strcmp((const char*)f["style"], "gif") ? 1 : 0;
+    if (f["gif"].is<const char*>()) {
+      strncpy(faceGif, f["gif"], sizeof(faceGif) - 1);
+      faceGif[sizeof(faceGif) - 1] = '\0';
+    }
+    JsonObjectConst e = f["eyes"];
+    if (!e.isNull()) {
+      if (e["color"].is<int>())        faceCfg.color = e["color"];
+      if (e["eyeW"].is<int>())         faceCfg.eyeW = e["eyeW"];
+      if (e["eyeH"].is<int>())         faceCfg.eyeH = e["eyeH"];
+      if (e["gap"].is<int>())          faceCfg.gap = e["gap"];
+      if (e["round"].is<int>())        faceCfg.rnd = e["round"];
+      if (e["blinkMinS"].is<int>())    faceCfg.blinkMinS = e["blinkMinS"];
+      if (e["blinkMaxS"].is<int>())    faceCfg.blinkMaxS = e["blinkMaxS"];
+      if (e["glanceMinS"].is<int>())   faceCfg.glanceMinS = e["glanceMinS"];
+      if (e["glanceMaxS"].is<int>())   faceCfg.glanceMaxS = e["glanceMaxS"];
+      if (e["pairScalePct"].is<int>()) faceCfg.pairScalePct = e["pairScalePct"];
+      saveFaceCfg();                   // clamps + persists
+    }
   }
   JsonArrayConst pr = doc["presets"];
   if (!pr.isNull()) {
@@ -1732,6 +2083,86 @@ void handleUpdateUpload() {
   }
 }
 
+// ── Animation (GIF) file management on SPIFFS ──
+File animUpFile;
+
+void handleAnimList() {
+  JsonDocument doc;
+  JsonArray a = doc["files"].to<JsonArray>();
+  File root = SPIFFS.open("/");
+  File f = root.openNextFile();
+  while (f) {
+    if (!f.isDirectory()) {
+      JsonObject o = a.add<JsonObject>();
+      o["name"] = String(f.path());
+      o["size"] = (uint32_t)f.size();
+    }
+    f = root.openNextFile();
+  }
+  doc["used"]     = (uint32_t)SPIFFS.usedBytes();
+  doc["total"]    = (uint32_t)SPIFFS.totalBytes();
+  doc["selected"] = faceGif;
+  String out; serializeJson(doc, out);
+  server.send(200, "application/json", out);
+}
+
+void handleAnimUploadData() {
+  HTTPUpload& up = server.upload();
+  if (up.status == UPLOAD_FILE_START) {
+    String fn = up.filename;
+    int cut = max((int)fn.lastIndexOf('/'), (int)fn.lastIndexOf('\\'));
+    if (cut >= 0) fn = fn.substring(cut + 1);
+    if (!fn.endsWith(".gif") && !fn.endsWith(".GIF")) fn += ".gif";
+    if (fn.length() > 28) fn = fn.substring(fn.length() - 28);
+    animUpFile = SPIFFS.open("/" + fn, FILE_WRITE);
+  } else if (up.status == UPLOAD_FILE_WRITE) {
+    if (animUpFile) animUpFile.write(up.buf, up.currentSize);
+    yield();
+  } else if (up.status == UPLOAD_FILE_END || up.status == UPLOAD_FILE_ABORTED) {
+    if (animUpFile) {
+      String path = animUpFile.path();
+      animUpFile.close();
+      if (up.status == UPLOAD_FILE_END && faceGif[0] == '\0') {
+        strncpy(faceGif, path.c_str(), sizeof(faceGif) - 1);  // auto-select first
+        saveSettings();
+      }
+    }
+  }
+}
+void handleAnimUploadDone() { server.send(200, "application/json", "{\"ok\":true}"); }
+
+// body: {"name":"/x.gif"}
+static bool animNameFromBody(char* out, size_t outLen) {
+  if (!server.hasArg("plain")) return false;
+  JsonDocument doc;
+  if (deserializeJson(doc, server.arg("plain"))) return false;
+  const char* n = doc["name"];
+  if (!n || n[0] != '/') return false;
+  strncpy(out, n, outLen - 1); out[outLen - 1] = '\0';
+  return true;
+}
+
+void handleAnimSelect() {
+  char name[32];
+  if (!animNameFromBody(name, sizeof(name)) || !SPIFFS.exists(name)) {
+    server.send(400, "application/json", "{\"err\":\"no such file\"}"); return;
+  }
+  strncpy(faceGif, name, sizeof(faceGif) - 1); faceGif[sizeof(faceGif) - 1] = '\0';
+  faceStyle = 1;
+  saveSettings();
+  server.send(200, "application/json", "{\"ok\":true}");
+}
+
+void handleAnimDelete() {
+  char name[32];
+  if (!animNameFromBody(name, sizeof(name))) {
+    server.send(400, "application/json", "{\"err\":\"bad name\"}"); return;
+  }
+  SPIFFS.remove(name);
+  if (!strcmp(name, faceGif)) { faceGif[0] = '\0'; faceStyle = 0; saveSettings(); }
+  server.send(200, "application/json", "{\"ok\":true}");
+}
+
 // Minimal in-browser config UI — works out of the box, doubles as the
 // reference client for the future companion app.
 static const char CONFIG_HTML[] PROGMEM = R"HTML(<!doctype html><html><head>
@@ -1759,6 +2190,10 @@ button.warn{background:#b4530a} .sec{border-top:1px solid #333;margin-top:16px;p
 <div class=sec><button class=act onclick=save()>Save to device</button>
 <button class=act onclick=toggleRaw()>Advanced JSON</button></div>
 <textarea id=raw rows=10 style=display:none></textarea>
+<div class=sec><h3>Face animations (GIF)</h3>
+<input type=file id=gif_file accept=".gif">
+<button class=act onclick=upGif()>Upload GIF</button>
+<div id=gifs></div></div>
 <div class=sec><h3>Firmware update (OTA)</h3>
 <input type=file id=fw_file accept=".bin">
 <button class=act onclick=upload()>Upload &amp; flash</button>
@@ -1771,8 +2206,21 @@ const MODS=[["Ctrl",1],["Shift",2],["Alt",4],["Gui",8]];
 async function load(){
  acts=await (await fetch('/api/actions')).json();
  cfg=await (await fetch('/api/config')).json();
- $('fw').textContent=cfg.fw; drawTabs(); drawGrid();
+ $('fw').textContent=cfg.fw; drawTabs(); drawGrid(); loadGifs();
 }
+async function loadGifs(){let d=await (await fetch('/api/anim')).json();let h='';
+ (d.files||[]).forEach(f=>{h+='<div class=row>'+f.name+' ('+Math.round(f.size/1024)+'KB) '
+  +(d.selected==f.name?'<b style=color:#7cf>[active]</b> ':'')
+  +'<button class=act onclick="selGif(\''+f.name+'\')">use</button> '
+  +'<button class="act warn" onclick="delGif(\''+f.name+'\')">del</button></div>'});
+ h+='<small>'+Math.round(d.used/1024)+' / '+Math.round(d.total/1024)+' KB used</small>';
+ $('gifs').innerHTML=h}
+async function upGif(){let f=$('gif_file').files[0];if(!f)return toast('pick a .gif',1);
+ if(f.size>700000)return toast('too big (max ~700KB)',1);
+ let fd=new FormData();fd.append('f',f);await fetch('/api/anim',{method:'POST',body:fd});
+ toast('Uploaded');loadGifs()}
+async function selGif(n){await fetch('/api/anim/select',{method:'POST',body:JSON.stringify({name:n})});toast('Active');loadGifs()}
+async function delGif(n){await fetch('/api/anim/delete',{method:'POST',body:JSON.stringify({name:n})});loadGifs()}
 function drawTabs(){$('tabs').innerHTML='';cfg.presets.forEach((p,i)=>{
  let b=document.createElement('button');b.textContent=p.name;if(i==cur)b.className='on';
  b.onclick=()=>{cur=i;sel=-1;$('editor').style.display='none';drawTabs();drawGrid()};$('tabs').append(b)})}
@@ -1836,6 +2284,10 @@ void enterConfigMode() {
   server.on("/api/config",  HTTP_POST, handlePostConfig);
   server.on("/api/exit",    HTTP_POST, handleExit);
   server.on("/api/update",  HTTP_POST, handleUpdateDone, handleUpdateUpload);
+  server.on("/api/anim",        HTTP_GET,  handleAnimList);
+  server.on("/api/anim",        HTTP_POST, handleAnimUploadDone, handleAnimUploadData);
+  server.on("/api/anim/select", HTTP_POST, handleAnimSelect);
+  server.on("/api/anim/delete", HTTP_POST, handleAnimDelete);
   server.begin();
 
   configMode = true;
@@ -1883,11 +2335,16 @@ void setup() {
   loadState();
   matrixInit();
 
+  SPIFFS.begin(true);            // media store for uploaded GIF animations
+
   // TFT init first — no backlight yet, BLE init would clobber LEDC
   tft.init();
   tft.setRotation(1);            // landscape 320×240 — use 3 if upside down
+  tft.setSwapBytes(true);        // pushImage byte order for GIF playback
   sprBar.setColorDepth(16);  sprBar.createSprite(320, 26);
   sprCell.setColorDepth(16); sprCell.createSprite(CELL_W, CELL_H);
+  sprEye.setColorDepth(16);  sprEye.createSprite(EYE_SPR_W, EYE_SPR_H);
+  gifDec.begin(GIF_PALETTE_RGB565_BE);
 
   // ── NimBLE init ──────────────────────────────
   // Must happen BEFORE ledcAttach — radio init resets LEDC state
@@ -2047,9 +2504,19 @@ void loop() {
         keyDownMs[i] = now;
         keyHoldFired[i] = false;
         recordActivity();
+        if (currentScreen == SCR_FACE) {
+          // First press only wakes the face — never fires the macro.
+          // Consuming press AND release via keyFiredOnDown.
+          keyFiredOnDown[i] = true;
+          faceGifStop();
+          if (faceStyle == 0) faceWake();       // happy squint flash
+          else screenDirty = true;
+          currentScreen = SCR_MAIN;
+          drawMain();
+        }
         // Instant fire on press for keys with no hold action on this
         // screen — firing on release made keys feel laggy ("hanging")
-        if (holdThresholdFor(i) == 0) {
+        else if (holdThresholdFor(i) == 0) {
           keyFiredOnDown[i] = true;
           onKeyTap(i);
         } else keyFiredOnDown[i] = false;
@@ -2065,6 +2532,17 @@ void loop() {
         onKeyHold(i);
       }
     }
+  }
+
+  // ── Face: idle entry + animation tick ──
+  if (faceMode != 0 && currentScreen == SCR_MAIN &&
+      toastUntil == 0 && !wakeKeyPending && lastFlashKey < 0) {
+    unsigned long th = (faceMode == 2) ? FACE_ALWAYS_MS : FACE_IDLE_MS;
+    if (now - lastActivityMs > th) { currentScreen = SCR_FACE; faceEnter(); }
+  }
+  if (currentScreen == SCR_FACE) {
+    if (faceStyle == 1) faceGifTick(now);
+    else updateFace(now);
   }
 
   maybeEnterSleep();
