@@ -176,6 +176,46 @@ struct FaceCfg {
   uint8_t  idleS;        // IDLE mode: seconds of no input before face shows
 };
 FaceCfg faceCfg = { 0, 64, 84, 44, 18, 3, 6, 7, 15, 115, 12 };
+
+// ── Personality ─────────────────────────────────
+// One renderable posture. Everything the face can express reduces to these
+// eight numbers, so emote keyframes, persona resting poses and the mood
+// engine all speak the same language and can be blended by the frame loop.
+struct EyePose {
+  uint8_t openPct;      // 0-100 lid opening (scales eyeH)
+  uint8_t lidTopPct;    // 0-100 top lid coverage — sleepy/heavy when high
+  int8_t  lidTopAngle;  // -100..100: + outer-deep (sad), - inner-deep (angry)
+  uint8_t lidBotPct;    // 0-100 bottom crescent — the happy squint
+  uint8_t wPct, hPct;   // eye size scale, 100 = rest (surprised goes ~115)
+  int8_t  gx, gy;       // glance bias (px)
+};
+const EyePose POSE_NEUTRAL = { 100, 0, 0, 0, 100, 100, 0, 0 };
+
+// A keyframe holds a pose from tMs until the next frame's tMs.
+// winkMask: bit0 = left eye closed, bit1 = right eye closed.
+struct EmoteKey { uint16_t tMs; EyePose pose; uint8_t winkMask; };
+struct Emote    { const EmoteKey* keys; uint8_t n; uint16_t durMs; };
+
+// Persona = a tuning table. Percentages scale the faceCfg intervals and the
+// emote amplitudes, so one enum changes how the whole face carries itself.
+struct Personality {
+  char    name[8];
+  uint8_t blinkPct, glancePct;              // 100 = faceCfg timings as-is
+  uint8_t emotePct;                         // emote amplitude scale
+  uint8_t saccadePct, dblBlinkPct, yawnPct; // micro-behaviour likelihoods
+  int8_t  energyBias, valenceBias;          // resting mood offsets (-100..100)
+  EyePose rest;                             // posture with nothing happening
+};
+const Personality PERSONAS[] = {
+  // name      blink glance emote sacc dbl yawn  eBias vBias  rest pose
+  { "CALM",     120,  110,   70,   30,  10,  15,   -10,   10, { 100,  8,   0,  0, 100, 100, 0, 0 } },
+  { "PLAYFUL",   70,   60,  130,  100,  40,  10,    25,   25, { 100,  0,   0,  8, 100, 100, 0, 0 } },
+  { "GRUMPY",   140,  130,   60,   20,   5,   5,   -15,  -30, {  92, 18, -35,  0, 100, 100, 0, 0 } },
+  { "SLEEPY",   170,  150,   50,   15,  10,  60,   -40,    0, {  80, 35,  20,  0, 100,  96, 0, 2 } },
+};
+const uint8_t NUM_PERSONAS = sizeof(PERSONAS) / sizeof(PERSONAS[0]);
+uint8_t facePersona = 0;
+
 const uint16_t KEY_MIN_PRESS_MS  = 30;
 const unsigned long FN_MENU_MS   = 1000;   // FN hold → SYSTEM menu
 const unsigned long PAIR_HOLD_MS = 1500;   // slot key hold → pairing mode
@@ -779,6 +819,8 @@ void loadState() {
   prefs.getString("fgif", faceGif, sizeof(faceGif));
   if (prefs.getBytesLength("fcfg") == sizeof(faceCfg))
     prefs.getBytes("fcfg", &faceCfg, sizeof(faceCfg));
+  // Persona is its own key, so an old "fcfg" blob still loads unchanged
+  facePersona = min((uint8_t)(NUM_PERSONAS - 1), (uint8_t)prefs.getUChar("fpers", 0));
   clampFaceCfg();
 }
 
@@ -803,6 +845,7 @@ void saveSettings() {
   prefs.putInt("preset", activePreset);
   prefs.putUChar("face", faceMode);
   prefs.putUChar("fstyle", faceStyle);
+  prefs.putUChar("fpers", facePersona);
   prefs.putString("fgif", faceGif);
 }
 
@@ -1004,7 +1047,8 @@ void drawSettings() {
   drawCell(5, "FACE", faceMode == 0 ? "OFF" : (faceMode == 1 ? "IDLE" : "ALWAYS"),
            C_PINK, false);
   drawCell(6, "STYLE", faceStyle == 0 ? "EYES" : "GIF", C_PINK, false);
-  for (int i = 7; i < 11; i++) drawCellEmpty(i);
+  drawCell(7, "PERSONA", PERSONAS[facePersona].name, C_PINK, false);
+  for (int i = 8; i < 11; i++) drawCellEmpty(i);
   drawCell(11, "SAVE", "+ exit", C_WHITE, false);
 }
 
@@ -1479,6 +1523,7 @@ void onKeyTap(int i) {
       else if (i == 4) { saveSettings(); enterConfigMode(); }  // no return — reboots on exit
       else if (i == 5) { faceMode = (faceMode + 1) % 3; drawSettings(); }
       else if (i == 6) { faceStyle = (faceStyle + 1) % 2; drawSettings(); }
+      else if (i == 7) { facePersona = (facePersona + 1) % NUM_PERSONAS; drawSettings(); }
       else if (i == 11 || i == KEY_FN) {
         saveSettings();
         currentScreen = SCR_MAIN; drawMain();
@@ -1582,23 +1627,65 @@ bool  faceBlinking = false;
 unsigned long faceNextBlink = 0, faceBlinkEnd = 0;
 unsigned long faceNextGlance = 0, faceGlanceEnd = 0;
 unsigned long faceDartNext = 0;
-unsigned long faceEvtUntil = 0;
-int   faceEvtDir = 0;             // -1 left, 0 up, +1 right (slot glance)
 unsigned long faceFrameMs = 0;
+
+// Expression state — everything below eases toward its *T target each frame,
+// so callers only ever set targets and never animate anything by hand.
+float lidTop = 0, lidTopT = 0;          // 0..1 top lid coverage
+float lidAngle = 0, lidAngleT = 0;      // -1..1 (+ sad / - angry)
+float lidBot = 0, lidBotT = 0;          // 0..1 happy crescent
+float eyeScaleW = 1, eyeScaleWT = 1;    // size multipliers on top of faceCfg
+float eyeScaleH = 1, eyeScaleHT = 1;
+uint8_t eyeWinkMask = 0;                // bit0 left eye shut, bit1 right
+
+// Mood: two slow scalars in 0..1. Energy tracks how much you have been using
+// the pad, valence how well things are going (BLE up/down). They bias the
+// resting pose so the face has a baseline mood, not just reactions.
+float moodEnergy = 0.5f, moodValence = 0.5f;
+unsigned long moodTickMs = 0;
+uint8_t  typeBurstCount = 0;      // presses in the current 4s burst window
+unsigned long typeBurstStart = 0;
+uint8_t  moodKeyCount = 0;        // presses since the last 5s mood sample
+float    typeRateEma = 0;
+
+// Emote player — one transient animation at a time, always time-boxed
+const Emote*  emoteCur = nullptr;
+unsigned long emoteStart = 0;
+int8_t        emoteGx = 0, emoteGy = 0;   // direction supplied by the trigger
+const Emote*  emotePending = nullptr;     // queued while the face is off-screen
+unsigned long emotePendingUntil = 0;
+int8_t        emotePendGx = 0, emotePendGy = 0;
+bool          faceBootPending = true;     // first face entry after power-on
+
+// Micro-behaviours
+unsigned long faceNextSaccade = 0;
+unsigned long faceLastYawn = 0;
+bool          faceDblBlink = false;
 
 static inline uint32_t frnd(uint32_t lo, uint32_t hi) {   // [lo, hi] ms
   return lo + (esp_random() % (hi - lo + 1));
+}
+
+// Scale a faceCfg interval by a persona percentage, never below 1s —
+// frnd(lo, hi) needs hi >= lo and a degenerate range would spin.
+static unsigned long personaMs(uint8_t seconds, uint8_t pct) {
+  unsigned long ms = (unsigned long)seconds * 1000UL * pct / 100UL;
+  return ms < 1000UL ? 1000UL : ms;
 }
 
 uint16_t faceEyeColor() {
   return faceCfg.color ? faceCfg.color : PRESET_COLORS[activePreset];
 }
 
-// Draw one eye into sprEye and push at center (cx, cy)
-void drawEyeAt(int cx, int cy, float open, float wScale) {
+// Draw one eye into sprEye and push at center (cx, cy).
+// The eye itself is one rounded rect; expression comes from painting lids
+// back over it in the background colour, which costs 2-3 primitives and
+// keeps every shape inside the sprite the frame already had to clear.
+void drawEyeAt(int cx, int cy, float open, float wScale, bool isLeft) {
   sprEye.fillSprite(C_BG);
-  int w = (int)(faceCfg.eyeW * wScale);
-  int h = max(6, (int)(faceCfg.eyeH * open));
+  if (eyeWinkMask & (isLeft ? 1 : 2)) open = 0.04f;   // this eye is winking
+  int w = (int)(faceCfg.eyeW * wScale * eyeScaleW);
+  int h = max(6, (int)(faceCfg.eyeH * open * eyeScaleH));
   w = min(w, EYE_SPR_W - 4); h = min(h, EYE_SPR_H - 4);
   int gx = (int)eyeGlanceX, gy = (int)eyeGlanceY;
   int x = (EYE_SPR_W - w) / 2 + gx;
@@ -1608,45 +1695,154 @@ void drawEyeAt(int cx, int cy, float open, float wScale) {
   int r = min((int)faceCfg.rnd, h / 2);
   r = min(r, w / 2);
   sprEye.fillRoundRect(x, y, w, h, r, faceEyeColor());
+
+  // Top lid: a flat band plus a wedge. The wedge is deeper on the outer
+  // edge for sadness and on the inner edge for anger — mirrored per eye,
+  // which is what makes a pair of rectangles read as a facial expression.
+  int flat = (int)(lidTop * h);
+  if (flat > 0) sprEye.fillRect(x, y, w, min(flat, h), C_BG);
+  if (lidAngle > 0.02f || lidAngle < -0.02f) {
+    int wedge = (int)(fabsf(lidAngle) * h * 0.55f);
+    int top   = y + flat;
+    bool deepOuter = (lidAngle > 0);                  // sad droops outward
+    bool deepLeft  = isLeft ? deepOuter : !deepOuter; // outer edge flips
+    if (deepLeft) sprEye.fillTriangle(x, top, x + w, top, x, top + wedge, C_BG);
+    else          sprEye.fillTriangle(x, top, x + w, top, x + w, top + wedge, C_BG);
+  }
+
+  // Bottom crescent: a circle rising into the eye from below carves the
+  // convex "^ ^" happy squint that a straight lid can't produce.
+  if (lidBot > 0.02f) {
+    int rad = w;
+    int cyc = y + h + rad - (int)(lidBot * h * 0.62f);
+    sprEye.fillCircle(x + w / 2, cyc, rad, C_BG);
+  }
   sprEye.pushSprite(cx - EYE_SPR_W / 2, cy - EYE_SPR_H / 2);
 }
 
 void drawFaceFrame(float open, float wScale) {
+  // Eye *positions* stay fixed while scale changes: the two 92px sprites sit
+  // shoulder to shoulder, so moving them would overlap and leave trails.
   int half = faceCfg.gap / 2 + faceCfg.eyeW / 2;
-  drawEyeAt(160 - half, 120, open, wScale);
-  drawEyeAt(160 + half, 120, open, wScale);
+  drawEyeAt(160 - half, 120, open, wScale, true);
+  drawEyeAt(160 + half, 120, open, wScale, false);
+}
+
+// Push a pose into the eased targets. Emotes, personas and the mood engine
+// all land here, so they can never disagree about what a pose means.
+void applyPose(const EyePose& p, float amp) {
+  eyeOpenTarget = p.openPct / 100.0f;
+  lidTopT   = (p.lidTopPct / 100.0f) * amp;
+  lidAngleT = (p.lidTopAngle / 100.0f) * amp;
+  lidBotT   = (p.lidBotPct / 100.0f) * amp;
+  eyeScaleWT = 1.0f + ((p.wPct / 100.0f) - 1.0f) * amp;
+  eyeScaleHT = 1.0f + ((p.hPct / 100.0f) - 1.0f) * amp;
+  eyeGlanceTX = p.gx * amp;
+  eyeGlanceTY = p.gy * amp;
+}
+
+// ── Emotes ──────────────────────────────────────
+// Stepped keyframes: the frame loop's easing does the interpolation, so a
+// four-row table is enough to read as a fluid animation.
+//                          open lidT angle lidB   w    h  gx gy
+const EmoteKey EK_BOOT[] = {
+  {   0, {   4, 90,   0,  0, 100, 100, 0, 0 }, 0 },
+  { 380, {  55, 30,   0,  0, 100, 100, 0, 0 }, 0 },
+  { 700, {  15, 70,   0,  0, 100, 100, 0, 0 }, 0 },
+  { 950, { 100,  0,   0,  0, 106, 106, 0,-2 }, 0 },
+};
+const EmoteKey EK_HAPPY[] = {
+  {   0, { 100,  0,   0, 25, 106, 106, 0,-6 }, 0 },
+  { 220, {  70,  0,   0, 55, 100, 100, 0, 2 }, 0 },
+  { 430, { 100,  0,   0, 25, 106, 106, 0,-5 }, 0 },
+  { 650, {  85,  0,   0, 45, 100, 100, 0, 0 }, 0 },
+};
+const EmoteKey EK_SAD[] = {
+  {   0, {  70, 20,  70,  0, 100,  96,-8, 4 }, 0 },
+  { 450, {  62, 28,  80,  0, 100,  94, 8, 5 }, 0 },
+  { 950, {  66, 24,  75,  0, 100,  95,-6, 5 }, 0 },
+};
+const EmoteKey EK_WINK[] = {
+  {   0, { 100,  0,   0, 30, 100, 100, 0, 0 }, 2 },   // right eye shut
+  { 260, { 100,  0,   0, 20, 100, 100, 0, 0 }, 0 },
+};
+const EmoteKey EK_EXCITED[] = {
+  {   0, { 100,  0, -10,  0, 108, 108,-4,-4 }, 0 },
+  { 160, { 100,  0,   0, 15, 108, 108, 4,-4 }, 0 },
+  { 320, { 100,  0, -10,  0, 108, 108,-4,-4 }, 0 },
+  { 480, { 100,  0,   0, 20, 104, 104, 0,-2 }, 0 },
+};
+const EmoteKey EK_GLANCE[] = {
+  {   0, {  62,  0,   0, 10, 100, 100, 0, 0 }, 0 },   // gx/gy from the trigger
+  { 190, { 100,  0,   0,  0, 100, 100, 0, 0 }, 0 },
+};
+const EmoteKey EK_YAWN[] = {
+  {   0, {  90,  5,   0,  0, 100, 106, 0, 0 }, 0 },
+  { 260, { 100,  0,   0,  0, 104, 114, 0,-3 }, 0 },
+  { 620, {   6, 80,   0,  0,  96, 100, 0, 3 }, 0 },
+  { 980, {  85, 12,  15,  0, 100, 100, 0, 1 }, 0 },
+};
+#define EM_DEF(tbl, dur) { tbl, sizeof(tbl)/sizeof(EmoteKey), dur }
+const Emote EM_BOOT    = EM_DEF(EK_BOOT,    1400);
+const Emote EM_HAPPY   = EM_DEF(EK_HAPPY,    900);
+const Emote EM_SAD     = EM_DEF(EK_SAD,     1500);
+const Emote EM_WINK    = EM_DEF(EK_WINK,     520);
+const Emote EM_EXCITED = EM_DEF(EK_EXCITED,  800);
+const Emote EM_GLANCE  = EM_DEF(EK_GLANCE,   380);
+const Emote EM_YAWN    = EM_DEF(EK_YAWN,    1300);
+
+// Queue an emote. If the face is on screen it starts now; otherwise it waits
+// (briefly) so an event that happens on the grid still gets acknowledged
+// when the face comes back.
+void faceEmote(const Emote* e, int8_t gx = 0, int8_t gy = 0, uint16_t waitMs = 2500) {
+  if (pairingMode) return;                // pairing wide-eyes own the face
+  if (currentScreen == SCR_FACE && faceStyle == 0) {
+    emoteCur = e; emoteStart = millis(); emoteGx = gx; emoteGy = gy;
+    emotePending = nullptr;
+  } else {
+    emotePending = e; emotePendGx = gx; emotePendGy = gy;
+    emotePendingUntil = millis() + waitMs;
+  }
 }
 
 // ALWAYS mode: acknowledge a keystroke without leaving the face.
 // Targets only — the frame loop eases toward them, so this never blocks
 // the key path (a delay here would stall the very keystroke it reacts to).
 void faceKeyReact(int i) {
-  eyeGlanceTX = ((float)(i % 4) - 1.5f) * 9.0f;   // look at the key's column
-  eyeGlanceTY = ((float)(i / 4) - 1.0f) * 7.0f;   // ...and its row
-  faceGlanceEnd = millis() + 320;                 // then re-centre
-  eyeOpen = 0.55f;                                // quick squint, eases back open
+  faceEmote(&EM_GLANCE, (int8_t)(((i % 4) - 1.5f) * 9.0f),   // key's column
+                        (int8_t)(((i / 4) - 1.0f) * 7.0f));  // ...and row
 }
 
 void faceSlotGlance(int slot) {           // called from switchToSlot
-  faceEvtDir  = (slot == 0) ? -1 : (slot == 1 ? 0 : 1);
-  faceEvtUntil = millis() + 3000;         // glance if face shows within 3s
+  int8_t dir = (slot == 0) ? -14 : (slot == 1 ? 0 : 14);
+  faceEmote(&EM_WINK, dir, (slot == 1) ? -6 : 0, 3000);
 }
 
 void faceEnter() {
+  const Personality& P = PERSONAS[facePersona];
   beginDraw(SCR_FACE);
   eyeOpen = 0.0f; eyeOpenTarget = 1.0f;   // eyes open on arrival
   eyeGlanceX = eyeGlanceY = eyeGlanceTX = eyeGlanceTY = 0;
-  faceBlinking = false;
+  lidTop = lidTopT = lidAngle = lidAngleT = lidBot = lidBotT = 0;
+  eyeScaleW = eyeScaleWT = eyeScaleH = eyeScaleHT = 1.0f;
+  eyeWinkMask = 0;
+  faceBlinking = false; faceDblBlink = false;
   unsigned long now = millis();
-  faceNextBlink  = now + frnd(faceCfg.blinkMinS * 1000UL, faceCfg.blinkMaxS * 1000UL);
-  faceNextGlance = now + frnd(faceCfg.glanceMinS * 1000UL, faceCfg.glanceMaxS * 1000UL);
-  faceGlanceEnd = 0; faceDartNext = 0; faceFrameMs = 0;
+  faceNextBlink  = now + frnd(personaMs(faceCfg.blinkMinS, P.blinkPct),
+                              personaMs(faceCfg.blinkMaxS, P.blinkPct));
+  faceNextGlance = now + frnd(personaMs(faceCfg.glanceMinS, P.glancePct),
+                              personaMs(faceCfg.glanceMaxS, P.glancePct));
+  faceGlanceEnd = 0; faceDartNext = 0; faceFrameMs = 0; faceNextSaccade = 0;
+  // The very first face of the session gets a proper waking-up animation
+  if (faceBootPending) { faceBootPending = false; faceEmote(&EM_BOOT); }
 }
 
 // Happy squint flash on the wake press, then caller returns to the grid
 void faceWake() {
+  lidBot = 0.5f; lidTop = 0;              // squint reads as pleased, not startled
   drawFaceFrame(0.32f, 1.05f);
   delay(160);
+  lidBot = 0;
   screenDirty = true;                     // grid must fully repaint over us
 }
 
@@ -1660,18 +1856,48 @@ void faceSleepClose() {
   delay(120);
 }
 
+// Mood drifts on a minutes-long clock so the pad has a baseline temperament
+// rather than just twitching per event. Energy follows how much you type,
+// valence follows whether the link is healthy.
+void faceMoodTick(unsigned long now) {
+  if (now - moodTickMs < 5000) return;
+  moodTickMs = now;
+  const Personality& P = PERSONAS[facePersona];
+  typeRateEma = typeRateEma * 0.80f + moodKeyCount * 0.20f;
+  moodKeyCount = 0;
+  float eTarget = constrain(0.35f + typeRateEma * 0.09f + P.energyBias / 200.0f, 0.0f, 1.0f);
+  float vTarget = constrain(0.5f + P.valenceBias / 200.0f, 0.0f, 1.0f);
+  moodEnergy  += (eTarget - moodEnergy) * 0.20f;
+  moodValence += (vTarget - moodValence) * 0.12f;   // grudges outlast moods
+}
+
 void updateFace(unsigned long now) {
   if (now - faceFrameMs < 33) return;     // ~30 fps
   faceFrameMs = now;
+  const Personality& P = PERSONAS[facePersona];
+  faceMoodTick(now);
 
   float wScale = 1.0f;
   bool allowBlink = true;
+  bool calm = false;
+  eyeWinkMask = 0;
 
+  // ── L0: resting posture from persona + mood ──
+  // Low energy adds lid weight, low valence tips the lids into a sad angle,
+  // high valence lifts a hint of the happy crescent.
+  EyePose rest = P.rest;
+  rest.lidTopPct   = min(90, rest.lidTopPct + (int)((1.0f - moodEnergy) * 22.0f));
+  rest.lidTopAngle = constrain(rest.lidTopAngle + (int)((0.5f - moodValence) * 60.0f), -100, 100);
+  rest.lidBotPct   = min(60, rest.lidBotPct + (int)(max(0.0f, moodValence - 0.6f) * 40.0f));
+  applyPose(rest, 1.0f);
+
+  // ── L1: what the pad is actually doing right now ──
   if (pairingMode) {                      // wide + curious
+    emoteCur = emotePending = nullptr;    // functional UI outranks personality
+    applyPose(POSE_NEUTRAL, 1.0f);
     wScale = faceCfg.pairScalePct / 100.0f;
-    eyeOpenTarget = 1.0f;
     allowBlink = false;
-    eyeGlanceTX = 0; eyeGlanceTY = -3;
+    eyeGlanceTY = -3;
   } else if (!bleConnected) {             // searching — eyes dart around
     if (now >= faceDartNext) {
       faceDartNext = now + frnd(400, 800);
@@ -1681,7 +1907,7 @@ void updateFace(unsigned long now) {
     eyeOpenTarget = 0.85f;
     allowBlink = false;
   } else {                                // connected, idle — calm
-    eyeOpenTarget = 1.0f;
+    calm = true;
     if (faceGlanceEnd != 0 && now >= faceGlanceEnd) {
       eyeGlanceTX = eyeGlanceTY = 0;
       faceGlanceEnd = 0;
@@ -1689,18 +1915,50 @@ void updateFace(unsigned long now) {
       eyeGlanceTX = (frnd(0, 1) ? 10.0f : -10.0f);
       eyeGlanceTY = (float)((int)frnd(0, 6)) - 3.0f;
       faceGlanceEnd  = now + frnd(500, 900);
-      faceNextGlance = now + frnd(faceCfg.glanceMinS * 1000UL, faceCfg.glanceMaxS * 1000UL);
+      faceNextGlance = now + frnd(personaMs(faceCfg.glanceMinS, P.glancePct),
+                                  personaMs(faceCfg.glanceMaxS, P.glancePct));
     }
   }
 
-  // Easy-Switch event: glance toward the slot that was just selected
-  if (now < faceEvtUntil) {
-    eyeGlanceTX = faceEvtDir * 14.0f;
-    eyeGlanceTY = (faceEvtDir == 0) ? -6.0f : 0.0f;
+  // ── L2: micro-behaviours — the small motions that sell "alive" ──
+  if (calm && !emoteCur) {
+    if (now >= faceNextSaccade) {         // eyes are never perfectly still
+      faceNextSaccade = now + frnd(300, 900);
+      if ((int)frnd(0, 99) < P.saccadePct) {
+        eyeGlanceTX += (float)((int)frnd(0, 4)) - 2.0f;
+        eyeGlanceTY += (float)((int)frnd(0, 4)) - 2.0f;
+      }
+    }
+    unsigned long idle = millis() - lastActivityMs;
+    if (idle > 60000UL && now - faceLastYawn > 120000UL &&
+        (int)frnd(0, 999) < P.yawnPct) {
+      faceLastYawn = now;
+      faceEmote(&EM_YAWN);
+    }
   }
 
-  // Pre-sleep droop: ease lids down over the last 10s before sleep
-  // (fresh millis() — same unsigned-underflow hazard as the entry check)
+  // ── L3: transient emote overrides everything above ──
+  if (!emoteCur && emotePending && now < emotePendingUntil) {
+    emoteCur = emotePending; emoteStart = now;
+    emoteGx = emotePendGx; emoteGy = emotePendGy;
+    emotePending = nullptr;
+  } else if (emotePending && now >= emotePendingUntil) emotePending = nullptr;
+
+  if (emoteCur) {
+    unsigned long t = now - emoteStart;
+    if (t >= emoteCur->durMs) emoteCur = nullptr;   // always time-boxed
+    else {
+      const EmoteKey* k = &emoteCur->keys[0];
+      for (uint8_t n = 0; n < emoteCur->n; n++)
+        if (t >= emoteCur->keys[n].tMs) k = &emoteCur->keys[n];
+      applyPose(k->pose, P.emotePct / 100.0f);
+      eyeGlanceTX += emoteGx; eyeGlanceTY += emoteGy;
+      eyeWinkMask = k->winkMask;
+      allowBlink = false;                 // the emote owns the lids
+    }
+  }
+
+  // ── Final: pre-sleep droop always wins, it reports a real state ──
   if (sleepTimeoutMs > 0) {
     unsigned long idle = millis() - lastActivityMs;
     if (idle + 10000 > sleepTimeoutMs) {
@@ -1708,23 +1966,37 @@ void updateFace(unsigned long now) {
       float droop = 0.18f + 0.82f * ((float)left / 10000.0f);
       if (droop < eyeOpenTarget) eyeOpenTarget = droop;
       allowBlink = false;
+      emoteCur = nullptr;
     }
   }
 
   // Blink scheduling
   if (faceBlinking) {
-    if (now >= faceBlinkEnd) { faceBlinking = false; eyeOpenTarget = 1.0f; }
-    else eyeOpenTarget = 0.0f;
+    if (now < faceBlinkEnd) eyeOpenTarget = 0.0f;
+    else {
+      faceBlinking = false;
+      if (faceDblBlink) {                 // ...and sometimes twice
+        faceDblBlink = false;
+        faceNextBlink = now + 150;        // reopen, then straight back down
+      }
+    }
   } else if (allowBlink && now >= faceNextBlink) {
     faceBlinking = true;
     faceBlinkEnd  = now + 110;
-    faceNextBlink = now + frnd(faceCfg.blinkMinS * 1000UL, faceCfg.blinkMaxS * 1000UL);
+    faceDblBlink  = ((int)frnd(0, 99) < P.dblBlinkPct);
+    faceNextBlink = now + frnd(personaMs(faceCfg.blinkMinS, P.blinkPct),
+                               personaMs(faceCfg.blinkMaxS, P.blinkPct));
   }
 
   // Ease current values toward targets, then render
   eyeOpen    += (eyeOpenTarget - eyeOpen) * 0.38f;
   eyeGlanceX += (eyeGlanceTX - eyeGlanceX) * 0.30f;
   eyeGlanceY += (eyeGlanceTY - eyeGlanceY) * 0.30f;
+  lidTop     += (lidTopT   - lidTop)   * 0.30f;
+  lidAngle   += (lidAngleT - lidAngle) * 0.30f;
+  lidBot     += (lidBotT   - lidBot)   * 0.30f;
+  eyeScaleW  += (eyeScaleWT - eyeScaleW) * 0.30f;
+  eyeScaleH  += (eyeScaleHT - eyeScaleH) * 0.30f;
   drawFaceFrame(eyeOpen, wScale);
 }
 
@@ -1909,6 +2181,20 @@ const char* kaTypeName(uint8_t t) {
     default:          return "builtin";
   }
 }
+// Personas travel over the API as lowercase names ("calm"), ints also accepted
+const char* personaName(uint8_t p) {
+  static char buf[8];
+  strncpy(buf, PERSONAS[min(p, (uint8_t)(NUM_PERSONAS - 1))].name, sizeof(buf));
+  buf[sizeof(buf) - 1] = 0;
+  for (char* c = buf; *c; c++) *c = tolower(*c);
+  return buf;
+}
+int personaFromName(const char* s) {
+  for (uint8_t p = 0; p < NUM_PERSONAS; p++)
+    if (!strcasecmp(s, PERSONAS[p].name)) return p;
+  return -1;
+}
+
 uint8_t kaTypeFromName(const char* s) {
   if (!strcmp(s, "key"))      return KA_KEY;
   if (!strcmp(s, "consumer")) return KA_CONSUMER;
@@ -1994,6 +2280,7 @@ void handleGetConfig() {
   f["mode"]  = (faceMode == 0) ? "off" : (faceMode == 1 ? "idle" : "always");
   f["style"] = (faceStyle == 0) ? "eyes" : "gif";
   f["gif"]   = faceGif;
+  f["personality"] = personaName(facePersona);
   JsonObject e = f["eyes"].to<JsonObject>();
   e["color"] = faceCfg.color;   e["eyeW"] = faceCfg.eyeW;
   e["eyeH"] = faceCfg.eyeH;     e["gap"] = faceCfg.gap;
@@ -2038,6 +2325,11 @@ void handlePostConfig() {
       strncpy(faceGif, f["gif"], sizeof(faceGif) - 1);
       faceGif[sizeof(faceGif) - 1] = '\0';
     }
+    if (f["personality"].is<const char*>()) {
+      int p = personaFromName(f["personality"]);
+      if (p >= 0) facePersona = p;       // unknown names leave it alone
+    } else if (f["personality"].is<int>())
+      facePersona = constrain((int)f["personality"], 0, NUM_PERSONAS - 1);
     JsonObjectConst e = f["eyes"];
     if (!e.isNull()) {
       if (e["color"].is<int>())        faceCfg.color = e["color"];
@@ -2225,6 +2517,11 @@ button.warn{background:#b4530a} .sec{border-top:1px solid #333;margin-top:16px;p
 <div class=sec><button class=act onclick=save()>Save to device</button>
 <button class=act onclick=toggleRaw()>Advanced JSON</button></div>
 <textarea id=raw rows=10 style=display:none></textarea>
+<div class=sec><h3>Face personality</h3>
+<select id=persona onchange=setPersona()>
+<option value=calm>Calm</option><option value=playful>Playful</option>
+<option value=grumpy>Grumpy</option><option value=sleepy>Sleepy</option>
+</select> <small>how the eyes carry themselves when idle</small></div>
 <div class=sec><h3>Face animations (GIF)</h3>
 <input type=file id=gif_file accept=".gif">
 <button class=act onclick=upGif()>Upload GIF</button>
@@ -2242,7 +2539,13 @@ async function load(){
  acts=await (await fetch('/api/actions')).json();
  cfg=await (await fetch('/api/config')).json();
  $('fw').textContent=cfg.fw; drawTabs(); drawGrid(); loadGifs();
+ if(cfg.face&&cfg.face.personality)$('persona').value=cfg.face.personality;
 }
+async function setPersona(){
+ await fetch('/api/config',{method:'POST',
+  body:JSON.stringify({face:{personality:$('persona').value}})});
+ if(cfg.face)cfg.face.personality=$('persona').value;
+ toast('Personality saved')}
 async function loadGifs(){let d=await (await fetch('/api/anim')).json();let h='';
  (d.files||[]).forEach(f=>{h+='<div class=row>'+f.name+' ('+Math.round(f.size/1024)+'KB) '
   +(d.selected==f.name?'<b style=color:#7cf>[active]</b> ':'')
@@ -2467,6 +2770,10 @@ void loop() {
   // Connection state change → redraw (+ fire buffered wake-key)
   if (bleConnected != lastBleConn) {
     lastBleConn = bleConnected;
+    // The face reacts to the link coming and going — queued, so it plays
+    // whether the event lands on the grid or with the eyes already up
+    if (bleConnected) { faceEmote(&EM_HAPPY); moodValence = min(1.0f, moodValence + 0.20f); }
+    else              { faceEmote(&EM_SAD);   moodValence = max(0.0f, moodValence - 0.25f); }
     if (bleConnected) {
       if (wakeKeyPending && wakeKeyIdx != WAKEKEY_NONE) {
         wakeKeyPending = false;
@@ -2539,6 +2846,13 @@ void loop() {
         keyDownMs[i] = now;
         keyHoldFired[i] = false;
         recordActivity();
+        // Typing burst → the face gets visibly excited and stays perkier
+        if (moodKeyCount < 255) moodKeyCount++;
+        if (now - typeBurstStart > 4000) { typeBurstStart = now; typeBurstCount = 0; }
+        if (++typeBurstCount == 5) {
+          faceEmote(&EM_EXCITED);
+          moodEnergy = min(1.0f, moodEnergy + 0.15f);
+        }
         // IDLE: the face is a screensaver — the first press only wakes it
         // (consumed, never typed) and hands the grid back.
         if (currentScreen == SCR_FACE && faceMode != 2) {

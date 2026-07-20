@@ -96,35 +96,75 @@ board options below or the device won't boot it.
 ## Face / screensaver ("expression packs")
 
 The device shows a state-reactive robot-eyes face (blinks when idle-connected,
-darts when disconnected, widens in pairing, glances toward a slot on
-Easy-Switch, droops before sleep) or an uploaded looping GIF. Everything is
-controlled from the `face` object in `/api/config`:
+darts when disconnected, widens in pairing, winks toward a slot on Easy-Switch,
+droops before sleep) or an uploaded looping GIF. Everything is controlled from
+the `face` object in `/api/config`:
 
 ```jsonc
 "face": {
   "mode":  "idle",        // "off" | "idle" (screensaver) | "always"
   "style": "eyes",        // "eyes" (procedural) | "gif" (uploaded loop)
   "gif":   "/idle.gif",   // active animation (from /api/anim)
+  "personality": "calm",  // "calm" | "playful" | "grumpy" | "sleepy"
   "eyes": {               // the EXPRESSION PACK — fully generative
     "color": 0,           // RGB565 eye color; 0 = follow active preset color
     "eyeW": 64, "eyeH": 84, "gap": 44, "round": 18,
     "blinkMinS": 3,  "blinkMaxS": 6,      // idle blink interval (s)
     "glanceMinS": 7, "glanceMaxS": 15,    // idle glance interval (s)
-    "pairScalePct": 115                   // wide-eye scale in pairing mode
+    "pairScalePct": 115,                  // wide-eye scale in pairing mode
+    "idleS": 12                           // IDLE: seconds before the face shows
   }
 }
 ```
 
 All eye fields are clamped device-side to renderable bounds. A companion app
 "generates a personality" by POSTing a new `eyes` object — no reflash needed.
+
+### Personality
+
+`eyes` sets how the face *looks*; `personality` sets how it *behaves*. Each
+persona is a tuning table baked into firmware that scales blink and glance
+intervals, emote intensity, micro-behaviour rates, and the resting posture of
+the lids:
+
+| Persona   | Feel                                                        |
+|-----------|-------------------------------------------------------------|
+| `calm`    | Steady, slightly heavy lids, unhurried glances (default)     |
+| `playful` | Fast blinks, frequent glances and saccades, big reactions    |
+| `grumpy`  | Slow, inward-slanted lids, damped reactions                  |
+| `sleepy`  | Half-lidded, rare glances, yawns often                       |
+
+POST accepts the name (case-insensitive) or the index `0..3`. Unknown names are
+ignored rather than clamped, so a typo can't silently change the persona.
+
+On top of the persona, a **mood** drifts on a minutes-long clock: energy tracks
+how much you have been typing, valence tracks whether the BLE link is healthy.
+Mood biases lid weight and lid angle, so a busy pad looks alert and a neglected
+one looks bored, without the persona changing.
+
+The face also **emotes** on events: waking up at boot, a happy bounce when a
+host connects, a sad look-around on disconnect, a wink toward the slot on
+Easy-Switch, an excited wobble during a fast typing burst, a glance toward the
+key you just pressed, and an occasional yawn after a long idle. Emotes are
+time-boxed and always yield to pairing mode and the pre-sleep droop, which
+report real device state.
+
+### Mode differences
+
+In `"idle"` mode the face is a screensaver: the first press only wakes it and is
+never typed. In `"always"` mode the face *is* the main screen — keys type
+straight from it with normal tap/hold behaviour, the grid never flashes, and
+holding FN opens the SYSTEM menu.
+
 GIF notes: hardware cannot decode MP4/H.264; convert to GIF first
 (`ffmpeg -i in.mp4 -vf "fps=12,scale=320:-1" out.gif`). Playback is centered,
 looped, ~10–25 fps depending on GIF complexity. While `style` is `"gif"` the
 face does not react to state (a canned loop can't); `"eyes"` is the reactive
-mode. First press on any key always just wakes the device — it is never typed.
+mode.
 
 On-device controls: **Settings → FACE** cycles OFF/IDLE/ALWAYS, **Settings →
-STYLE** toggles EYES/GIF.
+STYLE** toggles EYES/GIF, **Settings → PERSONA** cycles the four personalities.
+The config web UI has a Face personality dropdown.
 
 ## "Launching apps"
 
