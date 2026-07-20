@@ -1730,15 +1730,20 @@ void drawFaceFrame(float open, float wScale) {
 
 // Push a pose into the eased targets. Emotes, personas and the mood engine
 // all land here, so they can never disagree about what a pose means.
-void applyPose(const EyePose& p, float amp) {
+// withGlance is off for the resting pose: glance targets are event-driven and
+// persist between frames, so a per-frame rewrite would cancel every glance
+// the moment it started. Only a full override (an emote, pairing) sets them.
+void applyPose(const EyePose& p, float amp, bool withGlance = false) {
   eyeOpenTarget = p.openPct / 100.0f;
   lidTopT   = (p.lidTopPct / 100.0f) * amp;
   lidAngleT = (p.lidTopAngle / 100.0f) * amp;
   lidBotT   = (p.lidBotPct / 100.0f) * amp;
   eyeScaleWT = 1.0f + ((p.wPct / 100.0f) - 1.0f) * amp;
   eyeScaleHT = 1.0f + ((p.hPct / 100.0f) - 1.0f) * amp;
-  eyeGlanceTX = p.gx * amp;
-  eyeGlanceTY = p.gy * amp;
+  if (withGlance) {
+    eyeGlanceTX = p.gx * amp;
+    eyeGlanceTY = p.gy * amp;
+  }
 }
 
 // ── Emotes ──────────────────────────────────────
@@ -1809,6 +1814,7 @@ void faceEmote(const Emote* e, int8_t gx = 0, int8_t gy = 0, uint16_t waitMs = 2
 // Targets only — the frame loop eases toward them, so this never blocks
 // the key path (a delay here would stall the very keystroke it reacts to).
 void faceKeyReact(int i) {
+  if (emoteCur == &EM_EXCITED) return;    // mid-burst: don't stomp the wobble
   faceEmote(&EM_GLANCE, (int8_t)(((i % 4) - 1.5f) * 9.0f),   // key's column
                         (int8_t)(((i / 4) - 1.0f) * 7.0f));  // ...and row
 }
@@ -1894,10 +1900,11 @@ void updateFace(unsigned long now) {
   // ── L1: what the pad is actually doing right now ──
   if (pairingMode) {                      // wide + curious
     emoteCur = emotePending = nullptr;    // functional UI outranks personality
-    applyPose(POSE_NEUTRAL, 1.0f);
+    applyPose(POSE_NEUTRAL, 1.0f, true);
     wScale = faceCfg.pairScalePct / 100.0f;
     allowBlink = false;
-    eyeGlanceTY = -3;
+    eyeGlanceTX = 0; eyeGlanceTY = -3;
+    faceGlanceEnd = 0;
   } else if (!bleConnected) {             // searching — eyes dart around
     if (now >= faceDartNext) {
       faceDartNext = now + frnd(400, 800);
@@ -1925,8 +1932,10 @@ void updateFace(unsigned long now) {
     if (now >= faceNextSaccade) {         // eyes are never perfectly still
       faceNextSaccade = now + frnd(300, 900);
       if ((int)frnd(0, 99) < P.saccadePct) {
-        eyeGlanceTX += (float)((int)frnd(0, 4)) - 2.0f;
-        eyeGlanceTY += (float)((int)frnd(0, 4)) - 2.0f;
+        // Bounded: these accumulate between glances, and an unclamped
+        // random walk would slowly drag the eyes into a corner
+        eyeGlanceTX = constrain(eyeGlanceTX + ((int)frnd(0, 4) - 2.0f), -14.0f, 14.0f);
+        eyeGlanceTY = constrain(eyeGlanceTY + ((int)frnd(0, 4) - 2.0f), -8.0f, 8.0f);
       }
     }
     unsigned long idle = millis() - lastActivityMs;
@@ -1951,10 +1960,11 @@ void updateFace(unsigned long now) {
       const EmoteKey* k = &emoteCur->keys[0];
       for (uint8_t n = 0; n < emoteCur->n; n++)
         if (t >= emoteCur->keys[n].tMs) k = &emoteCur->keys[n];
-      applyPose(k->pose, P.emotePct / 100.0f);
+      applyPose(k->pose, P.emotePct / 100.0f, true);
       eyeGlanceTX += emoteGx; eyeGlanceTY += emoteGy;
       eyeWinkMask = k->winkMask;
       allowBlink = false;                 // the emote owns the lids
+      faceGlanceEnd = 0;                  // and cancels any idle glance
     }
   }
 
