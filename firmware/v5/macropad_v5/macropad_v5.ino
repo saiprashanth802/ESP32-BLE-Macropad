@@ -756,7 +756,7 @@ void drawReconnectHUD(const char* keyName);
 void fireAction(int id);
 void faceEnter(); void faceWake(); void faceSleepClose();
 void updateFace(unsigned long now); void faceGifTick(unsigned long now);
-void faceSlotGlance(int slot);
+void faceSlotGlance(int slot); void faceKeyReact(int i);
 
 // ════════════════════════════════════════════════
 //  PERSISTENCE (NVS)
@@ -1366,6 +1366,10 @@ void fireKeyAction(const KeyAction& ka) {
 unsigned long holdThresholdFor(int i) {   // 0 = no hold action for this key
   switch (currentScreen) {
     case SCR_MAIN:       return (i == KEY_FN) ? FN_MENU_MS : 0;
+    // ALWAYS mode: the face IS the main screen, so it inherits SCR_MAIN's
+    // hold map. Without this the face path fired taps on key-down and the
+    // FN hold arrived second — FN typed its tap action before opening the menu
+    case SCR_FACE:       return (faceMode == 2 && i == KEY_FN) ? FN_MENU_MS : 0;
     case SCR_SYSMENU:    return (i <= 2) ? PAIR_HOLD_MS : 0;
     case SCR_DEVICES:    return (i <= 2) ? PAIR_HOLD_MS : ((i == 10) ? CLRALL_HOLD_MS : 0);
     case SCR_BUILD_KEYS: return (i == KEY_FN) ? PAIR_HOLD_MS : 0;
@@ -1379,6 +1383,12 @@ void onKeyHold(int i) {
   switch (currentScreen) {
     case SCR_MAIN:
       if (i == KEY_FN) { currentScreen = SCR_SYSMENU; drawSysMenu(); }
+      break;
+    case SCR_FACE:            // ALWAYS mode: FN opens the menu from the face
+      if (i == KEY_FN) {
+        faceGifStop();
+        currentScreen = SCR_SYSMENU; screenDirty = true; drawSysMenu();
+      }
       break;
     case SCR_SYSMENU:
       if (i <= 2) {
@@ -1417,6 +1427,16 @@ void onKeyTap(int i) {
       if (kaEmpty(ka)) return;
       lastFlashKey = i; flashUntil = millis() + FLASH_MS;
       drawCell(i, ka.label, nullptr, PRESET_COLORS[activePreset], true);
+      fireKeyAction(ka);
+      break;
+    }
+
+    // ALWAYS mode types straight from the face — no grid, no cell flash,
+    // the eyes acknowledge the press instead
+    case SCR_FACE: {
+      KeyAction& ka = presets[activePreset].keys[i];
+      if (kaEmpty(ka)) return;
+      faceKeyReact(i);
       fireKeyAction(ka);
       break;
     }
@@ -1595,6 +1615,16 @@ void drawFaceFrame(float open, float wScale) {
   int half = faceCfg.gap / 2 + faceCfg.eyeW / 2;
   drawEyeAt(160 - half, 120, open, wScale);
   drawEyeAt(160 + half, 120, open, wScale);
+}
+
+// ALWAYS mode: acknowledge a keystroke without leaving the face.
+// Targets only — the frame loop eases toward them, so this never blocks
+// the key path (a delay here would stall the very keystroke it reacts to).
+void faceKeyReact(int i) {
+  eyeGlanceTX = ((float)(i % 4) - 1.5f) * 9.0f;   // look at the key's column
+  eyeGlanceTY = ((float)(i / 4) - 1.0f) * 7.0f;   // ...and its row
+  faceGlanceEnd = millis() + 320;                 // then re-centre
+  eyeOpen = 0.55f;                                // quick squint, eases back open
 }
 
 void faceSlotGlance(int slot) {           // called from switchToSlot
@@ -2509,10 +2539,9 @@ void loop() {
         keyDownMs[i] = now;
         keyHoldFired[i] = false;
         recordActivity();
-        if (currentScreen == SCR_FACE) {
-          // IDLE: first press only wakes (consumed, never typed).
-          // ALWAYS: the face returns every 2s — eating a press each time
-          // made the pad unusable, so presses fire straight THROUGH it.
+        // IDLE: the face is a screensaver — the first press only wakes it
+        // (consumed, never typed) and hands the grid back.
+        if (currentScreen == SCR_FACE && faceMode != 2) {
           keyFiredOnDown[i] = true;
           faceGifStop();
           if (faceStyle == 0) faceWake();       // happy squint flash
@@ -2520,8 +2549,10 @@ void loop() {
           currentScreen = SCR_MAIN;
           drawMain();
           Serial.printf("[FACE] wake by K%d (mode=%d)\n", i + 1, faceMode);
-          if (faceMode == 2) onKeyTap(i);       // fire through in ALWAYS
         }
+        // ALWAYS mode and the grid share one path: the face is just the
+        // main screen wearing a different skin, so keys keep full tap/hold
+        // semantics and ALWAYS never bounces through the grid to type.
         // Instant fire on press for keys with no hold action on this
         // screen — firing on release made keys feel laggy ("hanging")
         else if (holdThresholdFor(i) == 0) {
