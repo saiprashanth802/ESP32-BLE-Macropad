@@ -697,6 +697,21 @@ static inline int cellY(int i){ return 28 + (i / 4) * 70; }
 #define CELL_W 78
 #define CELL_H 68
 
+// Anti-stutter: only wipe the whole screen when the layout actually changes.
+// A full tft.fillScreen() over SPI is what causes the black-flash + repaint
+// stutter; on a same-screen refresh the cell/status sprites overwrite their
+// own rectangles, so clearing is unnecessary. Overlays (toast, HUD) set the
+// dirty flag so the next full draw clears their leftovers.
+int  lastClearedScreen = -1;
+bool screenDirty       = true;
+static inline void beginDraw(int screenId) {
+  if (screenId != lastClearedScreen || screenDirty) {
+    tft.fillScreen(C_BG);
+    lastClearedScreen = screenId;
+    screenDirty = false;
+  }
+}
+
 // ════════════════════════════════════════════════
 //  FORWARD DECLARATIONS
 // ════════════════════════════════════════════════
@@ -862,13 +877,14 @@ void showToast(const char* msg, uint16_t color, unsigned long ms) {
   tft.setTextColor(color, C_SURF2);
   tft.setCursor(x + 14, 113);
   tft.print(toastMsg);
+  screenDirty = true;   // next full redraw must clear this overlay
 }
 
 // ════════════════════════════════════════════════
 //  SCREENS
 // ════════════════════════════════════════════════
 void drawMain() {
-  tft.fillScreen(C_BG);
+  beginDraw(SCR_MAIN);
   uint16_t accent = PRESET_COLORS[activePreset];
   drawStatusBar(presets[activePreset].name, accent);
   for (int i = 0; i < NUM_KEYS; i++) {
@@ -880,7 +896,7 @@ void drawMain() {
 }
 
 void drawSysMenu() {
-  tft.fillScreen(C_BG);
+  beginDraw(SCR_SYSMENU);
   drawStatusBar("SYSTEM", C_LTBLUE);
   for (int i = 0; i < NUM_SLOTS; i++) {
     char l1[10]; snprintf(l1, sizeof(l1), "SLOT %d", i + 1);
@@ -900,7 +916,7 @@ void drawSysMenu() {
 }
 
 void drawPresetPicker() {
-  tft.fillScreen(C_BG);
+  beginDraw(SCR_PRESET);
   drawStatusBar("PRESET", C_YELLOW);
   for (int i = 0; i < NUM_PRESETS; i++)
     drawCell(i, presets[i].name, nullptr, PRESET_COLORS[i], i == activePreset);
@@ -909,7 +925,7 @@ void drawPresetPicker() {
 }
 
 void drawSettings() {
-  tft.fillScreen(C_BG);
+  beginDraw(SCR_SETTINGS);
   drawStatusBar("SETTINGS", C_CYAN);
   char v[10];
   snprintf(v, sizeof(v), "%d", backlightBrightness);
@@ -927,7 +943,7 @@ void drawSettings() {
 
 void drawEditor() {
   bool isBright = (currentScreen == SCR_EDIT_BRIGHT);
-  tft.fillScreen(C_BG);
+  beginDraw(currentScreen);
   drawStatusBar(isBright ? "BRIGHTNESS" : "SLEEP", isBright ? C_CYAN : C_AMBER);
 
   char v[12];
@@ -937,6 +953,9 @@ void drawEditor() {
     if (sm == 0) snprintf(v, sizeof(v), "OFF");
     else         snprintf(v, sizeof(v), "%d min", sm);
   }
+  // Clear the number band so a shorter value can't leave ghost digits
+  // (this screen refreshes in place without a full clear)
+  tft.fillRect(0, 66, 320, 48, C_BG);
   tft.setTextSize(4);
   tft.setTextColor(C_WHITE, C_BG);
   int w = strlen(v) * 24;
@@ -959,7 +978,7 @@ void drawEditor() {
 }
 
 void drawDevices() {
-  tft.fillScreen(C_BG);
+  beginDraw(SCR_DEVICES);
   drawStatusBar("DEVICES", C_MAGENTA);
   for (int i = 0; i < NUM_SLOTS; i++) {
     int y = 30 + i * 56;
@@ -991,7 +1010,7 @@ void drawDevices() {
 }
 
 void drawBuildPreset() {
-  tft.fillScreen(C_BG);
+  beginDraw(SCR_BUILD_PRESET);
   drawStatusBar("BUILD: PICK", C_BUILD);
   for (int i = 0; i < NUM_PRESETS; i++)
     drawCell(i, presets[i].name, nullptr, PRESET_COLORS[i], false);
@@ -1000,7 +1019,7 @@ void drawBuildPreset() {
 }
 
 void drawBuildKeys() {
-  tft.fillScreen(C_BG);
+  beginDraw(SCR_BUILD_KEYS);
   char t[16];
   snprintf(t, sizeof(t), "ED:%s", presets[buildPreset].name);
   drawStatusBar(t, C_BUILD);
@@ -1014,7 +1033,7 @@ void drawBuildKeys() {
 }
 
 void drawBuildAction() {
-  tft.fillScreen(C_BG);
+  beginDraw(SCR_BUILD_ACTION);
   int pages = (ACTION_LIB_SIZE + 7) / 8;
   char t[18];
   snprintf(t, sizeof(t), "K%d %d/%d", buildSlot + 1, buildActPage + 1, pages);
@@ -1032,7 +1051,7 @@ void drawBuildAction() {
 }
 
 void drawReconnectHUD(const char* keyName) {
-  tft.fillScreen(C_BG);
+  beginDraw(200);   // distinct id: clears when entered, animates without re-clearing
   drawStatusBar("RECONNECT", C_AMBER);
   uint16_t pulse = ((millis() / 300) % 2) ? C_AMBER : C_SURF2;
   tft.fillCircle(160, 110, 30, C_SURF2);
@@ -1824,7 +1843,7 @@ void enterConfigMode() {
 }
 
 void drawConfigScreen() {
-  tft.fillScreen(C_BG);
+  beginDraw(201);
   drawStatusBar("CONFIG MODE", C_LTBLUE);
   tft.setTextSize(2);
   tft.setTextColor(C_WHITE, C_BG);
