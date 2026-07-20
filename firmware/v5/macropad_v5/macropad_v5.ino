@@ -326,9 +326,11 @@ class ServerCB : public NimBLEServerCallbacks {
       saveSlots();
       pendingBleEvent = EVT_PAIRED;
     } else {
-      // Whitelist filtering should make this impossible, but enforce in
-      // software too: only the active slot's bonded host may stay
-      if (knownSlot != activeSlot) {
+      // Enforce Easy-Switch in software: only kick a host we POSITIVELY know
+      // belongs to a different slot. A host that resolves to knownSlot == -1
+      // (address didn't map cleanly) is kept — better than wrongly rejecting
+      // the legitimate active host and breaking reconnection.
+      if (knownSlot >= 0 && knownSlot != activeSlot) {
         pendingBleEvent = EVT_WRONG_HOST;
         pServer->disconnect(info.getConnHandle());
       }
@@ -364,9 +366,15 @@ void configureAdvertising() {
   pAdv->setMaxInterval(48);
 }
 
-// Advertise for the ACTIVE slot:
-//   bonded slot → accept-list filtered, only that host can reconnect
-//   empty slot / pairing mode → open advertising (discoverable)
+// Advertise for the ACTIVE slot.
+//
+// We advertise OPEN (no controller accept-list / scan filter) even for a
+// bonded slot. Whitelist-filtered advertising silently rejects a bonded host
+// that reconnects from a Resolvable Private Address (phones + Windows use RPAs
+// by default) unless the controller resolving list is perfectly populated —
+// in practice this blocks reconnection after a reboot. Instead any bonded host
+// may reconnect, and onAuthenticationComplete disconnects one that doesn't
+// belong to the active slot. Same Easy-Switch guarantee, reliable reconnect.
 void startAdvertisingForSlot() {
   NimBLEAdvertising* pAdv = NimBLEDevice::getAdvertising();
   if (pAdv->isAdvertising()) pAdv->stop();
@@ -374,18 +382,11 @@ void startAdvertisingForSlot() {
   while (NimBLEDevice::getWhiteListCount() > 0)
     NimBLEDevice::whiteListRemove(NimBLEDevice::getWhiteListAddress(0));
 
-  bool filtered = hostSlots[activeSlot].bonded && !pairingMode;
-  if (filtered) {
-    NimBLEDevice::whiteListAdd(
-      NimBLEAddress(hostSlots[activeSlot].addr, hostSlots[activeSlot].type));
-    pAdv->setScanFilter(false, true);   // scan-req: anyone, connect: whitelist
-  } else {
-    pAdv->setScanFilter(false, false);  // open — pairing / first use
-  }
+  pAdv->setScanFilter(false, false);   // open — bonded hosts resolve via bond DB
   configureAdvertising();
   pAdv->start();
-  Serial.printf("[BLE] advertising slot=%d filtered=%d pairing=%d\n",
-                activeSlot, (int)filtered, (int)pairingMode);
+  Serial.printf("[BLE] advertising slot=%d bonded=%d pairing=%d\n",
+                activeSlot, (int)hostSlots[activeSlot].bonded, (int)pairingMode);
 }
 
 // Easy-Switch: jump to slot n. forcePair drops the slot's old bond and
@@ -1682,18 +1683,33 @@ void handleUpdateDone() {
   if (ok) ESP.restart();
 }
 
+// NOTE: this callback runs inside server.handleClient() for the WHOLE upload.
+// Keep it lean — no TFT redraws here. A full-screen SPI redraw per chunk
+// starves the TCP receive path and stalls the upload. We draw a tiny text
+// progress line only, and only a few times.
 void handleUpdateUpload() {
   HTTPUpload& up = server.upload();
   if (up.status == UPLOAD_FILE_START) {
-    otaActive = true; otaProgress = 0; drawConfigScreen();
+    otaActive = true; otaProgress = 0;
+    tft.fillRect(0, 150, 320, 60, C_SURF);
+    tft.setTextColor(C_GREEN, C_SURF); tft.setTextSize(1);
+    tft.setCursor(12, 158); tft.print("OTA: flashing... do NOT power off");
     if (!Update.begin(UPDATE_SIZE_UNKNOWN)) Update.printError(Serial);
   } else if (up.status == UPLOAD_FILE_WRITE) {
     if (Update.write(up.buf, up.currentSize) != up.currentSize) Update.printError(Serial);
+    size_t prevKB = otaProgress / 1024;
     otaProgress = up.totalSize;
-    if ((otaProgress % 65536) < up.currentSize) drawConfigScreen();
+    // Redraw the KB counter only ~every 128KB, single short text line
+    if (otaProgress / 131072 != (prevKB * 1024) / 131072) {
+      tft.fillRect(12, 176, 200, 12, C_SURF);
+      tft.setTextColor(C_WHITE, C_SURF); tft.setTextSize(1);
+      tft.setCursor(12, 176); tft.printf("%u KB", (unsigned)(otaProgress / 1024));
+    }
+    yield();
   } else if (up.status == UPLOAD_FILE_END) {
     if (Update.end(true)) Serial.printf("[OTA] success %u bytes\n", up.totalSize);
     else Update.printError(Serial);
+    otaActive = false;
   }
 }
 
