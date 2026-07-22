@@ -181,7 +181,9 @@ public partial class EditorWindow : Window
             var b = _prof?.Keys.ElementAtOrDefault(k);
             bool bound = b is not null && b.Type != "none";
             string title = k == 8 ? "K9 · FN" : $"K{k + 1}";
-            string label = bound && b!.Label.Length > 0 ? b.Label : (bound ? b!.Type : "—");
+            // Unbound keys still show their label (grey) — presets 0-6 carry
+            // the pad's firmware shortcuts, which the app displays but doesn't own
+            string label = b is not null && b.Label.Length > 0 ? b.Label : (bound ? b!.Type : "—");
             _keyBtns[k].Content = KeyTile(title, label, bound);
             _keyBtns[k].Template = KeyTileTemplate(k == _keyIdx, bound,
                 string.IsNullOrWhiteSpace(_prof?.Color) ? "#D97757" : _prof!.Color);
