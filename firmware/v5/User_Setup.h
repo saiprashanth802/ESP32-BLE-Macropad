@@ -5,6 +5,11 @@
 
 #define ST7789_DRIVER
 
+// This panel wires its subpixels BGR, not the driver's RGB default — without
+// this, red and blue are swapped and every colour comes out as the wrong hue
+// (robotic blue rendered as orange).
+#define TFT_RGB_ORDER TFT_BGR
+
 #define TFT_WIDTH  240
 #define TFT_HEIGHT 320
 
