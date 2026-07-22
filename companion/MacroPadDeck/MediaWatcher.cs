@@ -73,8 +73,20 @@ public sealed class MediaWatcher : IDisposable
             string title = props?.Title ?? "";
             if (title.Length == 0) { await SendClear(); return; }
 
-            int pos = (int)tl.Position.TotalSeconds;
             int dur = (int)(tl.EndTime - tl.StartTime).TotalSeconds;
+
+            // SMTC's Position is a SNAPSHOT taken at LastUpdatedTime, not a live
+            // clock — it only moves when the player pushes an update. Sending it
+            // raw made the pad's bar creep forward (its own extrapolation) and
+            // then snap back to the stale reading on the next poll. Age it here
+            // so what we send is the real current position.
+            int pos = (int)tl.Position.TotalSeconds;
+            if (playing)
+            {
+                double age = (DateTimeOffset.UtcNow - tl.LastUpdatedTime).TotalSeconds;
+                if (age > 0 && age < 3600) pos += (int)age;      // ignore absurd clocks
+            }
+            if (dur > 0) pos = Math.Min(pos, dur);
 
             // Push on any meaningful change; while playing, a 5 s position
             // bucket refreshes the pad's extrapolation base periodically.
