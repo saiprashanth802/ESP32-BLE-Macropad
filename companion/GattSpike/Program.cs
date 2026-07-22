@@ -74,10 +74,9 @@ if (notifyChar is null)
 
 // ── Spike B ─────────────────────────────────────────────────────────────
 Console.WriteLine("macropad service found — Spike B: subscribing to events...");
-var cccd = await notifyChar.WriteClientCharacteristicConfigurationDescriptorAsync(
-    GattClientCharacteristicConfigurationDescriptorValue.Notify);
-Console.WriteLine($"Subscribe: {cccd}");
 
+// Handler BEFORE subscribe — the device fires its hello the instant the CCCD
+// write lands, and we must not race past it.
 notifyChar.ValueChanged += (_, e) =>
 {
     var r = DataReader.FromBuffer(e.CharacteristicValue);
@@ -86,6 +85,20 @@ notifyChar.ValueChanged += (_, e) =>
     Console.WriteLine($"  EVENT: {Convert.ToHexString(b)}");
 };
 
+// Force an off→on CCCD transition: a re-run may find it already enabled from
+// a previous session, and writing the same value doesn't fire onSubscribe.
+await notifyChar.WriteClientCharacteristicConfigurationDescriptorAsync(
+    GattClientCharacteristicConfigurationDescriptorValue.None);
+var cccd = await notifyChar.WriteClientCharacteristicConfigurationDescriptorAsync(
+    GattClientCharacteristicConfigurationDescriptorValue.Notify);
+Console.WriteLine($"Subscribe: {cccd}");
+
+async Task<GattCommunicationStatus> WriteCmd(byte[] cmd)
+{
+    var w = new DataWriter(); w.WriteBytes(cmd);
+    return await writeChar!.WriteValueAsync(w.DetachBuffer());
+}
+
 if (writeChar is not null)
 {
     // 0x82 setStatus "HI FROM PC"
@@ -93,9 +106,12 @@ if (writeChar is not null)
     byte[] cmd = new byte[2 + status.Length];
     cmd[0] = 0x82; cmd[1] = (byte)status.Length;
     status.CopyTo(cmd, 2);
-    var w = new DataWriter(); w.WriteBytes(cmd);
-    var ws = await writeChar.WriteValueAsync(w.DetachBuffer());
-    Console.WriteLine($"setStatus write: {ws}");
+    Console.WriteLine($"setStatus write: {await WriteCmd(cmd)}");
+
+    // Preset round-trip: setPreset 3 must echo EVENT 03 01 03, then restore 2.
+    Console.WriteLine($"setPreset 3:   {await WriteCmd(new byte[] { 0x83, 1, 3 })}");
+    await Task.Delay(1500);
+    Console.WriteLine($"setPreset 2:   {await WriteCmd(new byte[] { 0x83, 1, 2 })}");
 }
 
 Console.WriteLine("Listening for events — press keys on the pad. Ctrl+C to quit.");
