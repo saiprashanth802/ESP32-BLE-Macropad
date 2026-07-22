@@ -118,8 +118,23 @@
           <TextBlock Text="MacroPad Deck" FontSize="17" FontWeight="Bold"/>
           <TextBlock x:Name="LinkStatus" Style="{StaticResource MutedText}" Text="● connecting…" Margin="0,3,0,10"/>
         </StackPanel>
-        <Button DockPanel.Dock="Bottom" x:Name="AddProfileBtn" Style="{StaticResource GhostBtn}"
-                Content="+ Add profile" Margin="0,10,0,0" Click="AddProfile_Click"/>
+        <StackPanel DockPanel.Dock="Bottom">
+          <TextBlock Style="{StaticResource SectionLabel}" Text="EYE COLOR"/>
+          <StackPanel Orientation="Horizontal">
+            <ItemsControl x:Name="EyeSwatches">
+              <ItemsControl.ItemsPanel>
+                <ItemsPanelTemplate><StackPanel Orientation="Horizontal"/></ItemsPanelTemplate>
+              </ItemsControl.ItemsPanel>
+            </ItemsControl>
+          </StackPanel>
+          <StackPanel Orientation="Horizontal" Margin="0,6,0,0">
+            <TextBox x:Name="EyeColorBox" Width="80" TextChanged="EyeColor_Changed"/>
+            <Button x:Name="EyePresetBtn" Style="{StaticResource GhostBtn}" Content="match preset"
+                    Padding="10,6" Margin="6,0,0,0" Click="EyePreset_Click"/>
+          </StackPanel>
+          <Button x:Name="AddProfileBtn" Style="{StaticResource GhostBtn}"
+                  Content="+ Add profile" Margin="0,12,0,0" Click="AddProfile_Click"/>
+        </StackPanel>
         <ListBox x:Name="ProfileList" Background="Transparent" BorderThickness="0"
                  SelectionChanged="ProfileList_SelectionChanged" HorizontalContentAlignment="Stretch">
           <ListBox.ItemContainerStyle>

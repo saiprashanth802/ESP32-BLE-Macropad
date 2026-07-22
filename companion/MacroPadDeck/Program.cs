@@ -38,6 +38,9 @@ sealed class TrayContext : ApplicationContext
         menu.Items.Add("Edit profiles.json", null, (_, _) =>
             Process.Start(new ProcessStartInfo(ProfileStore.FilePath) { UseShellExecute = true }));
 
+        menu.Items.Add("Update firmware…", null, async (_, _) =>
+            await FirmwareUpdater.Run(s => deck.RaiseStatus(s)));
+
         var autostart = new ToolStripMenuItem("Start with Windows") { CheckOnClick = true, Checked = IsAutostart() };
         autostart.CheckedChanged += (_, _) => SetAutostart(autostart.Checked);
         menu.Items.Add(autostart);

@@ -22,6 +22,7 @@ public static class Protocol
     public const byte CmdKey    = 0x86;
     public const byte CmdCommit = 0x87;
     public const byte CmdText   = 0x88;
+    public const byte CmdEyes   = 0x89;
 
     // firmware KAType values
     public const byte KaBuiltin = 0, KaKey = 1, KaConsumer = 2, KaText = 4, KaHost = 5;
@@ -84,6 +85,22 @@ public static class Protocol
     }
 
     public static byte[] Commit() => new byte[] { CmdCommit, 0 };
+
+    /// Eye color: "#RRGGBB", or "preset" to follow the active preset's accent.
+    public static byte[]? SetEyes(string spec, bool persist)
+    {
+        ushort c565;
+        if (spec.Equals("preset", StringComparison.OrdinalIgnoreCase)) c565 = 0;
+        else
+        {
+            string hex = spec.TrimStart('#');
+            if (hex.Length != 6 || !uint.TryParse(hex, System.Globalization.NumberStyles.HexNumber, null, out uint rgb))
+                return null;
+            int r = (int)(rgb >> 16) & 0xFF, g = (int)(rgb >> 8) & 0xFF, b = (int)rgb & 0xFF;
+            c565 = (ushort)(((r >> 3) << 11) | ((g >> 2) << 5) | (b >> 3));
+        }
+        return new byte[] { CmdEyes, 3, (byte)(c565 >> 8), (byte)(c565 & 0xFF), (byte)(persist ? 1 : 0) };
+    }
 
     /// Key names the editor offers → USB HID usage codes.
     public static readonly (string Name, byte Hid)[] HidKeys = BuildHidKeys();

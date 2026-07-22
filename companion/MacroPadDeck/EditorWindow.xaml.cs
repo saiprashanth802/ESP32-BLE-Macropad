@@ -58,6 +58,19 @@ public partial class EditorWindow : Window
         foreach (var (name, _) in Protocol.HidKeys) BindKeyCombo.Items.Add(name);
         foreach (var (name, _) in Protocol.MediaKeys) BindMedia.Items.Add(name);
 
+        // Eye swatches: robotic blue first (the default face), then the pastels
+        foreach (string hex in new[] { "#3ABEFF" }.Concat(Palette.Take(5)))
+        {
+            var b = new Button
+            {
+                Width = 20, Height = 20, Margin = new Thickness(0, 0, 4, 0),
+                Background = Brush(hex), Tag = hex, Cursor = System.Windows.Input.Cursors.Hand,
+                Template = SwatchTemplate(),
+            };
+            b.Click += (_, _) => { EyeColorBox.Text = (string)b.Tag; };
+            EyeSwatches.Items.Add(b);
+        }
+
         foreach (string hex in Palette)
         {
             var b = new Button
@@ -90,8 +103,18 @@ public partial class EditorWindow : Window
     {
         try { _cfg = JsonSerializer.Deserialize<DeckConfig>(File.ReadAllText(ProfileStore.FilePath), JsonOpts) ?? new(); }
         catch { _cfg = new(); }
+        _loading = true;
+        EyeColorBox.Text = _cfg.EyeColor;
+        _loading = false;
         FillProfileList(selectIndex: 0);
     }
+
+    void EyeColor_Changed(object s, EventArgs e)
+    {
+        if (!_loading) _cfg.EyeColor = EyeColorBox.Text;
+    }
+
+    void EyePreset_Click(object s, RoutedEventArgs e) { EyeColorBox.Text = "preset"; }
 
     void Save_Click(object s, RoutedEventArgs e)
     {

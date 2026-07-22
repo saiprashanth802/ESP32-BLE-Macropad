@@ -179,7 +179,9 @@ struct FaceCfg {
   uint8_t  pairScalePct; // pairing-mode wide-eye width scale (percent)
   uint8_t  idleS;        // IDLE mode: seconds of no input before face shows
 };
-FaceCfg faceCfg = { 0, 64, 84, 44, 18, 3, 6, 7, 15, 115, 12 };
+// color 0x3DFF = robotic blue (#3ABEFF) — the default face. Set to 0 to
+// follow the active preset's accent instead (app: "match preset").
+FaceCfg faceCfg = { 0x3DFF, 64, 84, 44, 18, 3, 6, 7, 15, 115, 12 };
 
 // ── Personality ─────────────────────────────────
 // One renderable posture. Everything the face can express reduces to these
@@ -370,6 +372,7 @@ enum : uint8_t {  // host → device
   HCMD_KEY    = 0x86,  // [preset][key][kaType][mod][hid][cons lo][cons hi][label…]
   HCMD_COMMIT = 0x87,  // persist presets to NVS (send once after a setKey burst)
   HCMD_TEXT   = 0x88,  // [preset][key][utf8 ≤23] — text payload for a KA_TEXT key
+  HCMD_EYES   = 0x89,  // [rgb565 hi][rgb565 lo][persist] — eye color, 0 = follow preset
 };
 
 NimBLECharacteristic* pEvtChar = nullptr;
@@ -1382,6 +1385,15 @@ void hostLinkTick() {
 
       case HCMD_COMMIT:                    // one NVS write per editor save
         savePresets();
+        break;
+
+      case HCMD_EYES:                      // [rgb565 hi][lo][persist]
+        // 0x0000 = follow the active preset's color. Session pushes come
+        // with persist=0 so a reconnect never costs an NVS write.
+        if (n >= 2) {
+          faceCfg.color = (uint16_t)((p[0] << 8) | p[1]);
+          if (n >= 3 && p[2]) saveFaceCfg();
+        }
         break;
     }
     hostCmdTail = (uint8_t)((hostCmdTail + 1) % HOSTCMD_QMAX);

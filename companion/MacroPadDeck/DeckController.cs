@@ -13,6 +13,7 @@ public sealed class DeckController : IDisposable
     string _lastExe = "";
 
     public event Action<string>? StatusChanged;   // tray tooltip / balloon text
+    public void RaiseStatus(string s) => StatusChanged?.Invoke(s);
 
     public DeckController(BleLink ble, ProfileStore store)
     {
@@ -45,7 +46,12 @@ public sealed class DeckController : IDisposable
                 StatusChanged?.Invoke($"Pad online (fw v{p[0]}, preset {p[3]})");
                 _ = Push(async () =>
                 {
-                    await PushColors();          // every profile's accent + eye color
+                    // Colors, eye color and the full key layout are re-pushed on
+                    // every connect (RAM only, no NVS wear) — a pad that missed a
+                    // commit still wakes up wearing the app's configuration.
+                    await PushColors();
+                    await PushEyes(_store.Config.EyeColor, persist: false);
+                    await PushKeys(_store.Config, commit: false);
                     await PushLabels(_activePreset);
                 });
                 break;
@@ -111,11 +117,19 @@ public sealed class DeckController : IDisposable
         }
     }
 
-    /// Editor save: rewrite every app-managed key on the pad, then persist.
-    /// Keys typed "none" are left alone — firmware defaults stay untouched.
+    /// Editor save: rewrite the app-managed keys, persist, sync eye color.
     public Task ApplyPadConfig(DeckConfig cfg) => Task.Run(async () =>
     {
-        if (!_ble.IsUp) { StatusChanged?.Invoke("Pad offline — key changes queued for next save"); return; }
+        if (!_ble.IsUp) { StatusChanged?.Invoke("Pad offline — will sync on next connect"); return; }
+        await PushKeys(cfg, commit: true);
+        await PushEyes(cfg.EyeColor, persist: true);
+        await PushColors();
+        StatusChanged?.Invoke("Layout written to pad");
+    });
+
+    /// Keys typed "none" are left alone — firmware defaults stay untouched.
+    async Task PushKeys(DeckConfig cfg, bool commit)
+    {
         bool any = false;
         foreach (var prof in cfg.Profiles)
         {
@@ -143,12 +157,14 @@ public sealed class DeckController : IDisposable
                 any = true;
             }
         }
-        if (any)
-        {
-            await _ble.Write(Protocol.Commit());
-            StatusChanged?.Invoke("Key layout written to pad");
-        }
-    });
+        if (any && commit) await _ble.Write(Protocol.Commit());
+    }
+
+    async Task PushEyes(string spec, bool persist)
+    {
+        var cmd = Protocol.SetEyes(spec, persist);
+        if (cmd is not null) await _ble.Write(cmd);
+    }
 
     static Task Push(Func<Task> f) => Task.Run(f);
 
