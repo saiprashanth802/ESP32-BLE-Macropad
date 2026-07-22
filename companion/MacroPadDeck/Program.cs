@@ -14,7 +14,8 @@ static class Program
         ulong addr = Convert.ToUInt64(store.Config.DeviceAddress.Replace(":", ""), 16);
         using var ble = new BleLink(addr);
         using var deck = new DeckController(ble, store);
-        using var tray = new TrayContext(deck);
+        using var media = new MediaWatcher(ble) { Enabled = store.Config.NowPlaying };
+        using var tray = new TrayContext(deck, media);
 
         // Hook must live on the message-pump thread.
         using var fg = new ForegroundWatcher();
@@ -31,9 +32,13 @@ sealed class TrayContext : ApplicationContext
 
     readonly NotifyIcon _icon;
 
-    public TrayContext(DeckController deck)
+    public TrayContext(DeckController deck, MediaWatcher media)
     {
         var menu = new ContextMenuStrip();
+
+        var nowPlaying = new ToolStripMenuItem("Now playing → pad") { CheckOnClick = true, Checked = media.Enabled };
+        nowPlaying.CheckedChanged += (_, _) => media.Enabled = nowPlaying.Checked;
+        menu.Items.Add(nowPlaying);
         menu.Items.Add("Open editor", null, (_, _) => EditorWindow.Open(deck));
         menu.Items.Add("Edit profiles.json", null, (_, _) =>
             Process.Start(new ProcessStartInfo(ProfileStore.FilePath) { UseShellExecute = true }));

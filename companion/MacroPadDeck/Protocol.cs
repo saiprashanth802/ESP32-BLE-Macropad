@@ -23,6 +23,7 @@ public static class Protocol
     public const byte CmdCommit = 0x87;
     public const byte CmdText   = 0x88;
     public const byte CmdEyes   = 0x89;
+    public const byte CmdMedia  = 0x8A;
 
     // firmware KAType values
     public const byte KaBuiltin = 0, KaKey = 1, KaConsumer = 2, KaText = 4, KaHost = 5;
@@ -85,6 +86,22 @@ public static class Protocol
     }
 
     public static byte[] Commit() => new byte[] { CmdCommit, 0 };
+
+    /// Now-playing: [playing][pos lo][hi][dur lo][hi][title ≤20]. Seconds
+    /// clamp to uint16 (18 h) — plenty for music, and podcasts just cap.
+    public static byte[] SetMedia(bool playing, int posS, int durS, string title)
+    {
+        ushort pos = (ushort)Math.Clamp(posS, 0, ushort.MaxValue);
+        ushort dur = (ushort)Math.Clamp(durS, 0, ushort.MaxValue);
+        byte[] txt = System.Text.Encoding.ASCII.GetBytes(Sanitize(title, 20));
+        byte[] b = new byte[7 + txt.Length];
+        b[0] = CmdMedia; b[1] = (byte)(5 + txt.Length);
+        b[2] = (byte)(playing ? 1 : 0);
+        b[3] = (byte)(pos & 0xFF); b[4] = (byte)(pos >> 8);
+        b[5] = (byte)(dur & 0xFF); b[6] = (byte)(dur >> 8);
+        txt.CopyTo(b, 7);
+        return b;
+    }
 
     /// Eye color: "#RRGGBB", or "preset" to follow the active preset's accent.
     public static byte[]? SetEyes(string spec, bool persist)

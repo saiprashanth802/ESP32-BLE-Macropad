@@ -373,6 +373,7 @@ enum : uint8_t {  // host → device
   HCMD_COMMIT = 0x87,  // persist presets to NVS (send once after a setKey burst)
   HCMD_TEXT   = 0x88,  // [preset][key][utf8 ≤23] — text payload for a KA_TEXT key
   HCMD_EYES   = 0x89,  // [rgb565 hi][rgb565 lo][persist] — eye color, 0 = follow preset
+  HCMD_MEDIA  = 0x8A,  // [playing][pos lo][pos hi][dur lo][dur hi][title ≤20]
 };
 
 NimBLECharacteristic* pEvtChar = nullptr;
@@ -388,6 +389,15 @@ HostCmd hostCmdQ[HOSTCMD_QMAX];
 volatile uint8_t hostCmdHead = 0, hostCmdTail = 0;   // head=write, tail=read
 
 char hostStatus[24] = "";   // companion status line shown in the main bar
+
+// Now-playing pushed by the companion (Windows media sessions — covers
+// Feishin, Spotify, browsers). Position is extrapolated locally between
+// pushes so the timeline moves without constant BLE traffic.
+char     mediaTitle[24] = "";
+uint16_t mediaPosS = 0, mediaDurS = 0;
+bool     mediaPlaying = false;
+unsigned long mediaRxMs = 0;
+uint8_t  mediaShow = 1;      // Settings → MEDIA, NVS "media"
 
 class EvtCB : public NimBLECharacteristicCallbacks {
   void onSubscribe(NimBLECharacteristic* c, NimBLEConnInfo& info,
@@ -893,6 +903,7 @@ void loadState() {
     prefs.getBytes("fcfg", &faceCfg, sizeof(faceCfg));
   // Persona is its own key, so an old "fcfg" blob still loads unchanged
   facePersona = min((uint8_t)(NUM_PERSONAS - 1), (uint8_t)prefs.getUChar("fpers", 0));
+  mediaShow   = prefs.getUChar("media", 1) ? 1 : 0;
   clampFaceCfg();
 }
 
@@ -918,6 +929,7 @@ void saveSettings() {
   prefs.putUChar("face", faceMode);
   prefs.putUChar("fstyle", faceStyle);
   prefs.putUChar("fpers", facePersona);
+  prefs.putUChar("media", mediaShow);
   prefs.putString("fgif", faceGif);
 }
 
@@ -1120,7 +1132,9 @@ void drawSettings() {
            C_PINK, false);
   drawCell(6, "STYLE", faceStyle == 0 ? "EYES" : "GIF", C_PINK, false);
   drawCell(7, "PERSONA", PERSONAS[facePersona].name, C_PINK, false);
-  for (int i = 8; i < 11; i++) drawCellEmpty(i);
+  drawCellEmpty(8);                        // K9 = FN — taps as SAVE, keep clear
+  drawCell(9, "MEDIA", mediaShow ? "ON" : "OFF", C_PINK, false);
+  drawCellEmpty(10);
   drawCell(11, "SAVE", "+ exit", C_WHITE, false);
 }
 
@@ -1395,9 +1409,63 @@ void hostLinkTick() {
           if (n >= 3 && p[2]) saveFaceCfg();
         }
         break;
+
+      case HCMD_MEDIA:                     // [playing][pos lo][hi][dur lo][hi][title]
+        if (n >= 5) {
+          mediaPlaying = p[0] != 0;
+          mediaPosS = (uint16_t)(p[1] | (p[2] << 8));
+          mediaDurS = (uint16_t)(p[3] | (p[4] << 8));
+          int L = min((int)n - 5, (int)sizeof(mediaTitle) - 1);
+          memcpy(mediaTitle, p + 5, L); mediaTitle[L] = '\0';
+          mediaRxMs = millis();
+        }
+        break;
     }
     hostCmdTail = (uint8_t)((hostCmdTail + 1) % HOSTCMD_QMAX);
   }
+}
+
+// ── Now-playing strip under the face ────────────
+// Reuses sprBar (320×26) pushed at the bottom edge — well clear of the eye
+// sprites. Redrawn once a second; the wipe only ever runs on SCR_FACE.
+void mediaStripTick(unsigned long now) {
+  static unsigned long lastDraw = 0;
+  static bool wasVisible = false;
+  bool live = mediaShow && mediaTitle[0] && (now - mediaRxMs < 30000UL);
+  if (!live) {
+    if (wasVisible) { tft.fillRect(0, 214, 320, 26, C_BG); wasVisible = false; }
+    return;
+  }
+  if (wasVisible && now - lastDraw < 1000) return;
+  lastDraw = now;
+
+  uint32_t pos = mediaPosS;
+  if (mediaPlaying) pos += (now - mediaRxMs) / 1000UL;
+  if (mediaDurS && pos > mediaDurS) pos = mediaDurS;
+
+  uint16_t acc = faceEyeColor();
+  sprBar.fillSprite(C_BG);
+  sprBar.setTextSize(1);
+  sprBar.setTextColor(C_WHITE, C_BG);
+  int w = strlen(mediaTitle) * 6;
+  sprBar.setCursor(max(2, (320 - w) / 2), 0);
+  sprBar.print(mediaTitle);
+
+  sprBar.drawRoundRect(40, 14, 240, 7, 3, C_SURF2);
+  if (mediaDurS) {
+    int fw = (int)(236.0f * pos / mediaDurS);
+    sprBar.fillRoundRect(42, 16, max(2, fw), 3, 1, acc);
+  }
+  char tb[8];
+  snprintf(tb, sizeof(tb), "%lu:%02lu", pos / 60, pos % 60);
+  sprBar.setTextColor(C_DIM, C_BG);
+  sprBar.setCursor(4, 14); sprBar.print(tb);
+  if (mediaDurS) {
+    snprintf(tb, sizeof(tb), "%u:%02u", mediaDurS / 60, mediaDurS % 60);
+    sprBar.setCursor(286, 14); sprBar.print(tb);
+  }
+  sprBar.pushSprite(0, 214);
+  wasVisible = true;
 }
 
 // ════════════════════════════════════════════════
@@ -1728,6 +1796,7 @@ void onKeyTap(int i) {
       else if (i == 5) { faceMode = (faceMode + 1) % 3; drawSettings(); }
       else if (i == 6) { faceStyle = (faceStyle + 1) % 2; drawSettings(); }
       else if (i == 7) { facePersona = (facePersona + 1) % NUM_PERSONAS; drawSettings(); }
+      else if (i == 9) { mediaShow = !mediaShow; drawSettings(); }
       else if (i == 11 || i == KEY_FN) {
         saveSettings();
         currentScreen = SCR_MAIN; drawMain();
@@ -3156,7 +3225,10 @@ void loop() {
   }
   if (currentScreen == SCR_FACE) {
     if (faceStyle == 1) faceGifTick(now);
-    else updateFace(now);
+    else {
+      updateFace(now);
+      mediaStripTick(now);      // now-playing title + timeline under the eyes
+    }
   }
 
   maybeEnterSleep();

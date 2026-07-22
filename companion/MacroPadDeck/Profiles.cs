@@ -40,6 +40,8 @@ public sealed class DeckConfig
     public int DefaultPreset { get; set; } = -1;   // fall back when no AppMatch hits (-1 = stay)
     /// "#RRGGBB", or "preset" to follow the active preset's accent color
     public string EyeColor { get; set; } = "#3ABEFF";   // robotic blue
+    /// Stream Windows now-playing (title + timeline) to the pad's face screen
+    public bool NowPlaying { get; set; } = true;
     public List<Profile> Profiles { get; set; } = new();
 }
 
