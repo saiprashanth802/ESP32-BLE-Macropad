@@ -91,15 +91,21 @@ public sealed class MediaWatcher : IDisposable
 
             // Push on any meaningful change; while playing, a 5 s position
             // bucket refreshes the pad's extrapolation base periodically.
-            string sig = $"{title}|{playing}|{dur}|{pos / 2}";
+            // SMTC has no concept of favorites, so borrow Feishin's flag when
+            // it's clearly the same track (Feishin feeds SMTC, so titles match).
+            bool fav = _feishin is not null && _feishin.SongName.Length > 0 &&
+                       title.StartsWith(_feishin.SongName, StringComparison.OrdinalIgnoreCase) &&
+                       _feishin.IsFavorite;
+
+            string sig = $"{title}|{playing}|{dur}|{pos / 2}|{fav}";
             // Heartbeat: a paused track's signature never changes, and the pad
             // drops the strip after 30 s without a push — refresh before then.
             bool stale = (DateTime.UtcNow - _lastPush).TotalSeconds > 15;
             if (sig == _lastSig && !stale) return;
             _lastSig = sig;
             _lastPush = DateTime.UtcNow;
-            bool ok = await _ble.Write(Protocol.SetMedia(playing, pos, dur, title));
-            Log($"push '{title}' {pos}/{dur}s playing={playing} write={ok}");
+            bool ok = await _ble.Write(Protocol.SetMedia(playing, pos, dur, title, fav));
+            Log($"push '{title}' {pos}/{dur}s playing={playing} fav={fav} write={ok}");
         }
         catch (Exception ex)
         {
@@ -126,13 +132,14 @@ public sealed class MediaWatcher : IDisposable
 
         // 2 s buckets, not 5 — the pad extrapolates between pushes, but a
         // coarse bucket makes every correction land as a visible jump.
-        string sig = $"F|{title}|{playing}|{dur}|{pos / 2}";
+        bool fav = _feishin.IsFavorite;
+        string sig = $"F|{title}|{playing}|{dur}|{pos / 2}|{fav}";
         bool stale = (DateTime.UtcNow - _lastPush).TotalSeconds > 15;
         if (sig == _lastSig && !stale) return true;
         _lastSig = sig;
         _lastPush = DateTime.UtcNow;
-        bool w = await _ble.Write(Protocol.SetMedia(playing, pos, dur, title));
-        Log($"feishin push '{title}' {pos}/{dur}s playing={playing} write={w}");
+        bool w = await _ble.Write(Protocol.SetMedia(playing, pos, dur, title, fav));
+        Log($"feishin push '{title}' {pos}/{dur}s playing={playing} fav={fav} write={w}");
         return true;
     }
 

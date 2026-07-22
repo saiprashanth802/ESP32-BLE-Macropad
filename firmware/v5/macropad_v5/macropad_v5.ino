@@ -373,7 +373,8 @@ enum : uint8_t {  // host → device
   HCMD_COMMIT = 0x87,  // persist presets to NVS (send once after a setKey burst)
   HCMD_TEXT   = 0x88,  // [preset][key][utf8 ≤23] — text payload for a KA_TEXT key
   HCMD_EYES   = 0x89,  // [rgb565 hi][rgb565 lo][persist] — eye color, 0 = follow preset
-  HCMD_MEDIA  = 0x8A,  // [playing][pos lo][pos hi][dur lo][dur hi][title ≤20]
+  HCMD_MEDIA  = 0x8A,  // [flags][pos lo][hi][dur lo][hi][title ≤20]
+                       // flags: bit0 = playing, bit1 = favorited
 };
 
 NimBLECharacteristic* pEvtChar = nullptr;
@@ -396,8 +397,12 @@ char hostStatus[24] = "";   // companion status line shown in the main bar
 char     mediaTitle[24] = "";
 uint16_t mediaPosS = 0, mediaDurS = 0;
 bool     mediaPlaying = false;
+bool     mediaFav = false;          // heart shown beside the title
 unsigned long mediaRxMs = 0;
 uint8_t  mediaShow = 1;      // Settings → MEDIA, NVS "media"
+// Set by the command handler, consumed by the face so the eyes can react to
+// music without the BLE task ever touching the display.
+volatile bool mediaNewSong = false, mediaJustFaved = false;
 
 class EvtCB : public NimBLECharacteristicCallbacks {
   void onSubscribe(NimBLECharacteristic* c, NimBLEConnInfo& info,
@@ -1410,19 +1415,33 @@ void hostLinkTick() {
         }
         break;
 
-      case HCMD_MEDIA:                     // [playing][pos lo][hi][dur lo][hi][title]
+      case HCMD_MEDIA:                     // [flags][pos lo][hi][dur lo][hi][title]
         if (n >= 5) {
-          mediaPlaying = p[0] != 0;
+          mediaPlaying = (p[0] & 0x01) != 0;
+          bool fav     = (p[0] & 0x02) != 0;
           mediaPosS = (uint16_t)(p[1] | (p[2] << 8));
           mediaDurS = (uint16_t)(p[3] | (p[4] << 8));
-          int L = min((int)n - 5, (int)sizeof(mediaTitle) - 1);
-          memcpy(mediaTitle, p + 5, L); mediaTitle[L] = '\0';
+          char t[sizeof(mediaTitle)];
+          int L = min((int)n - 5, (int)sizeof(t) - 1);
+          memcpy(t, p + 5, L); t[L] = '\0';
+          // Edge-detect for the face: a new track, or this one just got loved
+          if (strcmp(t, mediaTitle) != 0 && t[0]) mediaNewSong = true;
+          if (fav && !mediaFav)                   mediaJustFaved = true;
+          memcpy(mediaTitle, t, sizeof(t));
+          mediaFav = fav;
           mediaRxMs = millis();
         }
         break;
     }
     hostCmdTail = (uint8_t)((hostCmdTail + 1) % HOSTCMD_QMAX);
   }
+}
+
+// Small heart for the now-playing strip: two lobes + a point.
+static void drawHeart(int cx, int cy, uint16_t c) {
+  sprBar.fillCircle(cx - 2, cy - 1, 3, c);
+  sprBar.fillCircle(cx + 2, cy - 1, 3, c);
+  sprBar.fillTriangle(cx - 5, cy, cx + 5, cy, cx, cy + 6, c);
 }
 
 // ── Now-playing strip under the face ────────────
@@ -1448,7 +1467,10 @@ void mediaStripTick(unsigned long now) {
   sprBar.setTextSize(1);
   sprBar.setTextColor(C_WHITE, C_BG);
   int w = strlen(mediaTitle) * 6;
-  sprBar.setCursor(max(2, (320 - w) / 2), 0);
+  // Centre title+heart as one unit so the title doesn't shift when it's loved
+  int tx = max(2, (320 - (w + (mediaFav ? 14 : 0))) / 2);
+  if (mediaFav) { drawHeart(tx + 5, 4, C_PINK); tx += 14; }
+  sprBar.setCursor(tx, 0);
   sprBar.print(mediaTitle);
 
   sprBar.drawRoundRect(40, 14, 240, 7, 3, C_SURF2);
@@ -2077,6 +2099,14 @@ const Emote EM_EXCITED = EM_DEF(EK_EXCITED,  800);
 const Emote EM_GLANCE  = EM_DEF(EK_GLANCE,   380);
 const Emote EM_YAWN    = EM_DEF(EK_YAWN,    1300);
 const Emote EM_SQUINT  = EM_DEF(EK_SQUINT,  1900);
+// Loved a track: a big warm squint with the bottom crescent right up.
+const EmoteKey EK_LOVE[] = {
+  {   0, { 100,  0,   0, 20, 110, 110, 0,-4 }, 0 },
+  { 200, {  55,  0,   0, 62, 104, 100, 0, 3 }, 0 },
+  { 620, {  62,  0,   0, 55, 106, 102, 0, 2 }, 0 },
+  { 980, {  95,  0,   0, 22, 100, 100, 0, 0 }, 0 },
+};
+const Emote EM_LOVE = EM_DEF(EK_LOVE, 1300);
 
 // Queue an emote. If the face is on screen it starts now; otherwise it waits
 // (briefly) so an event that happens on the grid still gets acknowledged
@@ -2233,6 +2263,23 @@ void updateFace(unsigned long now) {
       faceNextSquint = now + frnd(9000, 22000);
       if ((int)frnd(0, 99) < P.squintPct) faceEmote(&EM_SQUINT);
     }
+  }
+
+  // ── Music reactions ──────────────────────────
+  // Edge events set by the host-link handler; consumed here so the drawing
+  // always happens on the loop task.
+  if (mediaJustFaved) { mediaJustFaved = false; mediaNewSong = false;
+                        faceEmote(&EM_LOVE); }
+  if (mediaNewSong)   { mediaNewSong = false;
+                        if (mediaShow) faceEmote(&EM_EXCITED); }
+
+  // Gentle bob while a track plays — the pad quietly vibing. Applied after
+  // the branches (which rewrite the glance targets every frame) but before
+  // emotes, so any emote still wins outright.
+  if (mediaShow && mediaPlaying && !emoteCur && (now - mediaRxMs < 30000UL)) {
+    float ph = (float)(now % 2400) / 2400.0f * 6.2832f;
+    eyeGlanceTY += sinf(ph) * 2.0f;
+    eyeGlanceTX += sinf(ph * 0.5f) * 1.2f;
   }
 
   // ── L3: transient emote overrides everything above ──

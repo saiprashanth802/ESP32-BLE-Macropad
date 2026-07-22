@@ -87,16 +87,18 @@ public static class Protocol
 
     public static byte[] Commit() => new byte[] { CmdCommit, 0 };
 
-    /// Now-playing: [playing][pos lo][hi][dur lo][hi][title ≤20]. Seconds
-    /// clamp to uint16 (18 h) — plenty for music, and podcasts just cap.
-    public static byte[] SetMedia(bool playing, int posS, int durS, string title)
+    /// Now-playing: [flags][pos lo][hi][dur lo][hi][title ≤20], flags bit0 =
+    /// playing, bit1 = favorited. Seconds clamp to uint16 (18 h) — plenty for
+    /// music, and podcasts just cap.
+    public static byte[] SetMedia(bool playing, int posS, int durS, string title,
+                                  bool favorite = false)
     {
         ushort pos = (ushort)Math.Clamp(posS, 0, ushort.MaxValue);
         ushort dur = (ushort)Math.Clamp(durS, 0, ushort.MaxValue);
         byte[] txt = System.Text.Encoding.ASCII.GetBytes(Sanitize(title, 20));
         byte[] b = new byte[7 + txt.Length];
         b[0] = CmdMedia; b[1] = (byte)(5 + txt.Length);
-        b[2] = (byte)(playing ? 1 : 0);
+        b[2] = (byte)((playing ? 1 : 0) | (favorite ? 2 : 0));
         b[3] = (byte)(pos & 0xFF); b[4] = (byte)(pos >> 8);
         b[5] = (byte)(dur & 0xFF); b[6] = (byte)(dur >> 8);
         txt.CopyTo(b, 7);

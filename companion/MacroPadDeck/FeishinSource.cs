@@ -31,6 +31,9 @@ public sealed class FeishinSource : IDisposable
     public DateTime LastUpdate { get; private set; } = DateTime.MinValue;
 
     public int Duration => _dur;
+    public bool IsFavorite => _userFavorite;
+    /// Song name without the " - artist" suffix, for matching against SMTC.
+    public string SongName => Title.Split(" - ")[0];
     /// Position extrapolated from the last update, so the pad's bar keeps
     /// moving between Feishin's periodic position events.
     public int Position => Playing && _posAt > DateTime.MinValue
