@@ -48,9 +48,15 @@ sealed class TrayContext : ApplicationContext
         menu.Items.Add(new ToolStripSeparator());
         menu.Items.Add("Exit", null, (_, _) => ExitThread());
 
+        // The exe carries deck.ico (csproj ApplicationIcon) — reuse it here so
+        // the tray, taskbar and Explorer all show the same identity.
+        System.Drawing.Icon appIcon;
+        try { appIcon = System.Drawing.Icon.ExtractAssociatedIcon(WinFormsApp.ExecutablePath)!; }
+        catch { appIcon = System.Drawing.SystemIcons.Application; }
+
         _icon = new NotifyIcon
         {
-            Icon = System.Drawing.SystemIcons.Application,
+            Icon = appIcon,
             Text = "MacroPad Deck — starting…",
             Visible = true,
             ContextMenuStrip = menu,

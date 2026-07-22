@@ -93,7 +93,12 @@ public partial class EditorWindow : Window
         }
 
         deck.StatusChanged += s => Dispatcher.BeginInvoke(() =>
-            LinkStatus.Text = $"● {s}");
+        {
+            LinkStatus.Text = $"● {s}";
+            bool up = s.Contains("online") || s.Contains("Connected") ||
+                      s.Contains("written") || s.Contains("reloaded");
+            LinkStatus.Foreground = Brush(up ? "#4C9A6B" : "#B0553E");
+        });
 
         LoadFromDisk();
     }
@@ -111,7 +116,9 @@ public partial class EditorWindow : Window
 
     void EyeColor_Changed(object s, EventArgs e)
     {
-        if (!_loading) _cfg.EyeColor = EyeColorBox.Text;
+        if (_loading) return;
+        _cfg.EyeColor = EyeColorBox.Text;
+        _deck.PushEyesLive(_cfg.EyeColor);     // live preview on the pad
     }
 
     void EyePreset_Click(object s, RoutedEventArgs e) { EyeColorBox.Text = "preset"; }
@@ -197,7 +204,11 @@ public partial class EditorWindow : Window
         if (_loading || _prof is null) return;
         _prof.Name = ProfName.Text;
         if (ProfPreset.SelectedIndex >= 0) _prof.Preset = ProfPreset.SelectedIndex;
-        _prof.Color = ProfColor.Text;
+        if (_prof.Color != ProfColor.Text)
+        {
+            _prof.Color = ProfColor.Text;
+            _deck.PushColorLive(_prof.Preset, _prof.Color);   // live preview
+        }
         _prof.AppMatch = ProfApps.Text.Split(',', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries).ToList();
         // refresh list row (name/dot) without rebuilding selection
         int keep = ProfileList.SelectedIndex;
@@ -345,10 +356,24 @@ public partial class EditorWindow : Window
         },
     };
 
+    /// White tile washed with ~14% of the profile color — bound keys visibly
+    /// belong to their profile without shouting.
+    static SolidColorBrush Tint(string hex)
+    {
+        try
+        {
+            var c = (Color)ColorConverter.ConvertFromString(hex);
+            return new SolidColorBrush(Color.FromRgb(
+                (byte)(255 - (255 - c.R) * 0.14), (byte)(255 - (255 - c.G) * 0.14),
+                (byte)(255 - (255 - c.B) * 0.14)));
+        }
+        catch { return new SolidColorBrush(Colors.White); }
+    }
+
     static ControlTemplate KeyTileTemplate(bool selected, bool bound, string accent)
     {
         var border = new FrameworkElementFactory(typeof(Border));
-        border.SetValue(Border.BackgroundProperty, Brush(bound ? "#FFFFFF" : "#F7F5EE"));
+        border.SetValue(Border.BackgroundProperty, bound ? Tint(accent) : Brush("#F7F5EE"));
         border.SetValue(Border.CornerRadiusProperty, new CornerRadius(12));
         border.SetValue(Border.BorderThicknessProperty, new Thickness(selected ? 2 : 1));
         border.SetValue(Border.BorderBrushProperty, Brush(selected ? accent : "#DAD5C9"));

@@ -166,6 +166,19 @@ public sealed class DeckController : IDisposable
         if (cmd is not null) await _ble.Write(cmd);
     }
 
+    // Live previews from the editor — RAM only, so clicking around costs nothing.
+    public void PushEyesLive(string spec)
+    {
+        var cmd = Protocol.SetEyes(spec, persist: false);
+        if (cmd is not null && _ble.IsUp) _ = _ble.Write(cmd);
+    }
+
+    public void PushColorLive(int preset, string hex)
+    {
+        var cmd = Protocol.SetColor(preset, hex);
+        if (cmd is not null && _ble.IsUp) _ = _ble.Write(cmd);
+    }
+
     static Task Push(Func<Task> f) => Task.Run(f);
 
     public void Dispose() { }

@@ -9,7 +9,12 @@
     <ImplicitUsings>enable</ImplicitUsings>
     <ApplicationHighDpiMode>PerMonitorV2</ApplicationHighDpiMode>
     <AssemblyTitle>MacroPad Deck</AssemblyTitle>
+    <ApplicationIcon>deck.ico</ApplicationIcon>
     <!-- single-file publish: dotnet publish -r win-x64 -p:PublishSingleFile=true (self-contained) -->
   </PropertyGroup>
+
+  <ItemGroup>
+    <Resource Include="deck.ico" />
+  </ItemGroup>
 
 </Project>
