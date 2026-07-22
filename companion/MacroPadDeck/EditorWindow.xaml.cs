@@ -22,6 +22,9 @@ public partial class EditorWindow : Window
         if (_open is not null) { _open.Activate(); return; }
         _open = new EditorWindow(deck);
         _open.Closed += (_, _) => _open = null;
+        // The tray runs a WinForms pump; without keyboard interop a modeless
+        // WPF window gets mouse but never keystrokes (textboxes look dead).
+        System.Windows.Forms.Integration.ElementHost.EnableModelessKeyboardInterop(_open);
         _open.Show();
     }
 
