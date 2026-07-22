@@ -236,6 +236,7 @@
           <ComboBoxItem Content="Keyboard shortcut"/>
           <ComboBoxItem Content="Media key"/>
           <ComboBoxItem Content="Type text snippet"/>
+          <ComboBoxItem Content="Favorite current song (Feishin)"/>
         </ComboBox>
 
         <TextBlock x:Name="TargetLabel" Style="{StaticResource SectionLabel}" Text="TARGET"/>

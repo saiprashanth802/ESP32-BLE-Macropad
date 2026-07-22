@@ -302,6 +302,7 @@ public partial class EditorWindow : Window
         bool media = t == "media";
         bool text = t == "text";
         bool needsTarget = t is "focusOrLaunch" or "open" or "run" or "text";
+        // favorite takes no parameters — it acts on whatever is playing
         TargetRow.Visibility = needsTarget ? Visibility.Visible : Visibility.Collapsed;
         TargetLabel.Visibility = needsTarget ? Visibility.Visible : Visibility.Collapsed;
         TargetLabel.Text = text ? "TEXT TO TYPE (≤ 23 chars)" : "TARGET";
@@ -319,12 +320,12 @@ public partial class EditorWindow : Window
     static int TypeToIndex(string t) => t.ToLowerInvariant() switch
     {
         "focusorlaunch" => 1, "open" => 2, "run" => 3, "window" => 4,
-        "shortcut" => 5, "media" => 6, "text" => 7, _ => 0,
+        "shortcut" => 5, "media" => 6, "text" => 7, "favorite" => 8, _ => 0,
     };
     static string IndexToType(int i) => i switch
     {
         1 => "focusOrLaunch", 2 => "open", 3 => "run", 4 => "window",
-        5 => "shortcut", 6 => "media", 7 => "text", _ => "none",
+        5 => "shortcut", 6 => "media", 7 => "text", 8 => "favorite", _ => "none",
     };
     static int WindowOpToIndex(string op) => op.ToLowerInvariant() switch
     {

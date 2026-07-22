@@ -8,6 +8,8 @@ public sealed class DeckController : IDisposable
 {
     readonly BleLink _ble;
     readonly ProfileStore _store;
+    FeishinSource? _feishin;
+    public void AttachFeishin(FeishinSource? f) => _feishin = f;
     int _activePreset = -1;               // pad's preset as we last knew it
     DateTime _manualUntil = DateTime.MinValue;
     string _lastExe = "";
@@ -59,7 +61,10 @@ public sealed class DeckController : IDisposable
             case Protocol.EvKey when p.Length >= 2:
             {
                 var binding = _store.ForPreset(p[0])?.Keys.ElementAtOrDefault(p[1]);
-                if (binding is not null)
+                if (binding is null) break;
+                if (binding.Type.Equals("favorite", StringComparison.OrdinalIgnoreCase))
+                    _ = Favorite();                          // needs the Feishin socket
+                else
                     ThreadPool.QueueUserWorkItem(_ => ActionEngine.Execute(binding));
                 break;
             }
@@ -138,7 +143,7 @@ public sealed class DeckController : IDisposable
                 var b = prof.Keys[k];
                 byte[]? cmd = b.Type.ToLowerInvariant() switch
                 {
-                    "focusorlaunch" or "open" or "run" or "window" =>
+                    "focusorlaunch" or "open" or "run" or "window" or "favorite" =>
                         Protocol.SetKey(prof.Preset, k, Protocol.KaHost, 0, 0, 0, b.Label),
                     "shortcut" =>
                         Protocol.SetKey(prof.Preset, k, Protocol.KaKey, (byte)b.Mod,
@@ -158,6 +163,28 @@ public sealed class DeckController : IDisposable
             }
         }
         if (any && commit) await _ble.Write(Protocol.Commit());
+    }
+
+    /// Favorite the current Feishin track and flash confirmation on the pad,
+    /// then restore whatever the status line was showing.
+    async Task Favorite()
+    {
+        if (_feishin is null)
+        {
+            await _ble.Write(Protocol.SetStatus("NO FEISHIN LINK"));
+            StatusChanged?.Invoke("Favorite: Feishin link not configured");
+        }
+        else
+        {
+            var (ok, nowFav, title) = await _feishin.ToggleFavorite();
+            await _ble.Write(Protocol.SetStatus(
+                !ok ? "NOTHING PLAYING" : (nowFav ? "FAVORITED" : "UNFAVORITED")));
+            StatusChanged?.Invoke(ok
+                ? $"{(nowFav ? "Favorited" : "Unfavorited")}: {title}"
+                : "Favorite: nothing playing");
+        }
+        await Task.Delay(1600);
+        await _ble.Write(Protocol.SetStatus(""));   // back to the preset name
     }
 
     async Task PushEyes(string spec, bool persist)

@@ -14,7 +14,15 @@ static class Program
         ulong addr = Convert.ToUInt64(store.Config.DeviceAddress.Replace(":", ""), 16);
         using var ble = new BleLink(addr);
         using var deck = new DeckController(ble, store);
-        using var media = new MediaWatcher(ble, store.Config) { Enabled = store.Config.NowPlaying };
+
+        // One Feishin link, two consumers: now-playing fallback + favorite control
+        FeishinSource? feishin = store.Config.FeishinUrl.Length > 0
+            ? new FeishinSource(store.Config.FeishinUrl, store.Config.FeishinUser,
+                                store.Config.FeishinPassword)
+            : null;
+        deck.AttachFeishin(feishin);
+
+        using var media = new MediaWatcher(ble, feishin) { Enabled = store.Config.NowPlaying };
         using var tray = new TrayContext(deck, media);
 
         // Hook must live on the message-pump thread.
@@ -22,6 +30,7 @@ static class Program
         fg.ExeChanged += deck.OnForegroundExe;
 
         WinFormsApp.Run(tray);
+        feishin?.Dispose();
     }
 }
 

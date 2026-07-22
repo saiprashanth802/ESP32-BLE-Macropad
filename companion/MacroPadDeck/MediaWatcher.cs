@@ -19,11 +19,12 @@ public sealed class MediaWatcher : IDisposable
 
     readonly FeishinSource? _feishin;
 
-    public MediaWatcher(BleLink ble, DeckConfig cfg)
+    // The Feishin link is shared: a now-playing fallback here, and the control
+    // channel for favoriting in DeckController. Owned by Program.
+    public MediaWatcher(BleLink ble, FeishinSource? feishin)
     {
         _ble = ble;
-        if (cfg.FeishinUrl.Length > 0)
-            _feishin = new FeishinSource(cfg.FeishinUrl, cfg.FeishinUser, cfg.FeishinPassword);
+        _feishin = feishin;
         _poll = new System.Threading.Timer(async _ => await Tick(), null,
                                            TimeSpan.FromSeconds(2), TimeSpan.FromSeconds(1));
     }
@@ -142,5 +143,5 @@ public sealed class MediaWatcher : IDisposable
         await _ble.Write(Protocol.SetMedia(false, 0, 0, ""));
     }
 
-    public void Dispose() { _poll.Dispose(); _feishin?.Dispose(); }
+    public void Dispose() => _poll.Dispose();   // _feishin is owned by Program
 }

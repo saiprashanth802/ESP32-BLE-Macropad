@@ -23,6 +23,9 @@ public sealed class FeishinSource : IDisposable
     // Snapshot updated by the receive loop, read by MediaWatcher.
     public volatile string Title = "";
     public volatile bool Playing;
+    volatile string _songId = "";
+    volatile bool _userFavorite;
+    ClientWebSocket? _ws;                 // live socket, for outbound control
     volatile int _pos, _dur;
     DateTime _posAt = DateTime.MinValue;
     public DateTime LastUpdate { get; private set; } = DateTime.MinValue;
@@ -61,7 +64,8 @@ public sealed class FeishinSource : IDisposable
                 await ws.ConnectAsync(_uri, _cts.Token);
                 Log($"connected {_uri}");
                 loggedFail = false;
-                await Receive(ws);
+                _ws = ws;
+                try { await Receive(ws); } finally { _ws = null; }
             }
             catch (OperationCanceledException) { return; }
             catch (Exception ex)
@@ -110,19 +114,58 @@ public sealed class FeishinSource : IDisposable
             case "song":     ReadSong(data); break;
             case "position": SetPos(Num(data)); break;
             case "playback": SetStatus(data); break;
+            case "favorite":                        // server echo — keep in sync
+                if (data.ValueKind == JsonValueKind.Object &&
+                    data.TryGetProperty("id", out var fid) && fid.GetString() == _songId)
+                    _userFavorite = data.TryGetProperty("favorite", out var fv) &&
+                                    fv.ValueKind == JsonValueKind.True;
+                break;
         }
         LastUpdate = DateTime.UtcNow;
     }
 
     void ReadSong(JsonElement s)
     {
-        if (s.ValueKind != JsonValueKind.Object) { Title = ""; return; }
+        if (s.ValueKind != JsonValueKind.Object) { Title = ""; _songId = ""; return; }
         string name = s.TryGetProperty("name", out var n) ? n.GetString() ?? "" : "";
         string artist = s.TryGetProperty("artistName", out var a) ? a.GetString() ?? "" : "";
         // ASCII only — the pad's 5x7 font renders anything else as '?'
         Title = artist.Length > 0 && name.Length > 0 ? $"{name} - {artist}" : name;
         if (s.TryGetProperty("duration", out var du)) _dur = Norm(Num(du));
+        _songId = s.TryGetProperty("id", out var id) ? id.GetString() ?? "" : "";
+        _userFavorite = s.TryGetProperty("userFavorite", out var uf) &&
+                        uf.ValueKind == JsonValueKind.True;
         LastUpdate = DateTime.UtcNow;
+    }
+
+    /// Toggle the favorite flag on whatever is playing.
+    /// Wire format taken from remote.js: {"event":"favorite","favorite":<bool>,"id":<songId>}.
+    /// Feishin echoes a `favorite` event back, which updates our cached state,
+    /// so repeated presses alternate correctly.
+    public async Task<(bool ok, bool nowFavorite, string title)> ToggleFavorite()
+    {
+        var ws = _ws;
+        if (ws is null || ws.State != WebSocketState.Open || _songId.Length == 0)
+        {
+            Log("favorite: no live song/socket");
+            return (false, false, "");
+        }
+        bool target = !_userFavorite;
+        string json = JsonSerializer.Serialize(new
+        {
+            @event = "favorite",
+            favorite = target,
+            id = _songId,
+        });
+        try
+        {
+            await ws.SendAsync(Encoding.UTF8.GetBytes(json), WebSocketMessageType.Text,
+                               true, _cts.Token);
+            _userFavorite = target;         // optimistic; the echo confirms
+            Log($"favorite: {(target ? "set" : "cleared")} on '{Title}'");
+            return (true, target, Title);
+        }
+        catch (Exception ex) { Log($"favorite failed: {ex.Message.Split('\r')[0]}"); return (false, false, ""); }
     }
 
     void SetPos(double v) { _pos = Norm(v); _posAt = DateTime.UtcNow; }
