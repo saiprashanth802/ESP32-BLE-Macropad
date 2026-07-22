@@ -1,3 +1,4 @@
+using System.IO;
 using Windows.Media.Control;
 
 namespace MacroPadDeck;
@@ -12,6 +13,8 @@ public sealed class MediaWatcher : IDisposable
     readonly System.Threading.Timer _poll;
     GlobalSystemMediaTransportControlsSessionManager? _mgr;
     string _lastSig = "";
+    int _emptyPolls;               // consecutive empty polls — drives recycling
+    DateTime _lastPush = DateTime.MinValue;
     public volatile bool Enabled = true;
 
     public MediaWatcher(BleLink ble)
@@ -21,14 +24,42 @@ public sealed class MediaWatcher : IDisposable
                                            TimeSpan.FromSeconds(2), TimeSpan.FromSeconds(3));
     }
 
+    static void Log(string m)
+    {
+        try { File.AppendAllText(Path.Combine(ProfileStore.Dir, "deck.log"),
+                                 $"{DateTime.Now:HH:mm:ss.fff} media: {m}\r\n"); } catch { }
+    }
+
     async Task Tick()
     {
-        if (!Enabled || !_ble.IsUp) return;
+        if (!Enabled) { Log("disabled"); return; }
+        if (!_ble.IsUp) { Log("link down"); return; }
         try
         {
             _mgr ??= await GlobalSystemMediaTransportControlsSessionManager.RequestAsync();
+            // GetCurrentSession() is null unless Windows has designated a
+            // "current" app; fall back to any session that is actually playing,
+            // then to the first one, so background players still register.
             var s = _mgr.GetCurrentSession();
-            if (s is null) { await SendClear(); return; }
+            if (s is null)
+            {
+                var all = _mgr.GetSessions();
+                s = all.FirstOrDefault(x => x.GetPlaybackInfo().PlaybackStatus ==
+                        GlobalSystemMediaTransportControlsSessionPlaybackStatus.Playing)
+                    ?? all.FirstOrDefault();
+                if (s is null)
+                {
+                    // A manager reporting zero sessions is usually stale rather
+                    // than genuinely idle; recycle it every few empty polls.
+                    if (++_emptyPolls % 4 == 0) _mgr = null;
+                    if (_lastSig.Length > 0 || _emptyPolls % 20 == 1)
+                        Log($"no session (sessions={all.Count})");
+                    await SendClear();
+                    return;
+                }
+                _emptyPolls = 0;
+                Log($"using fallback session: {s.SourceAppUserModelId}");
+            }
 
             var props = await s.TryGetMediaPropertiesAsync();
             var tl = s.GetTimelineProperties();
@@ -43,11 +74,24 @@ public sealed class MediaWatcher : IDisposable
             // Push on any meaningful change; while playing, a 5 s position
             // bucket refreshes the pad's extrapolation base periodically.
             string sig = $"{title}|{playing}|{dur}|{pos / 5}";
-            if (sig == _lastSig) return;
+            // Heartbeat: a paused track's signature never changes, and the pad
+            // drops the strip after 30 s without a push — refresh before then.
+            bool stale = (DateTime.UtcNow - _lastPush).TotalSeconds > 15;
+            if (sig == _lastSig && !stale) return;
             _lastSig = sig;
-            await _ble.Write(Protocol.SetMedia(playing, pos, dur, title));
+            _lastPush = DateTime.UtcNow;
+            bool ok = await _ble.Write(Protocol.SetMedia(playing, pos, dur, title));
+            Log($"push '{title}' {pos}/{dur}s playing={playing} write={ok}");
         }
-        catch { /* session vanished mid-query — next tick recovers */ }
+        catch (Exception ex)
+        {
+            // The SMTC manager and its session objects go stale whenever the
+            // set of sessions changes (track end, app focus shift) — the proxy
+            // then throws and reports zero sessions forever. Drop it so the
+            // next tick requests a fresh one.
+            _mgr = null;
+            Log($"EX {ex.GetType().Name} 0x{ex.HResult:X8} — manager reset");
+        }
     }
 
     async Task SendClear()
