@@ -78,6 +78,10 @@ matched positionally (preset 0..7, key 0..11). Saved to NVS immediately.
     { "mod":8, "key":21, "delay":30 },   // Gui+R, wait 300ms
     { "mod":0, "key":40 }                // Enter
 ]}
+
+// host: notify the companion app over the host-link GATT service instead of
+// typing. mod/key is an OPTIONAL fallback chord sent when no app is listening.
+{ "label":"Steam", "type":"host", "mod":0, "key":0 }
 ```
 
 - `mod` bitmask: `Ctrl=1 Shift=2 Alt=4 Gui(Win/Cmd)=8` (combine by OR).
@@ -166,16 +170,46 @@ On-device controls: **Settings → FACE** cycles OFF/IDLE/ALWAYS, **Settings →
 STYLE** toggles EYES/GIF, **Settings → PERSONA** cycles the four personalities.
 The config web UI has a Face personality dropdown.
 
-## "Launching apps"
+## "Launching apps" — the host-link GATT service
 
-True app-launch happens on the host, not the keyboard. Two supported patterns:
+True app-launch happens on the host, not the keyboard. The pad carries a
+custom GATT service alongside HID (same bond, same connection) that a
+companion app uses for two-way communication. Keys of `type":"host"` send an
+*event* over this service instead of typing; the companion decides what to do
+(launch, focus, run a script). If no app is subscribed, the key falls back to
+its embedded `mod`/`key` chord (if any), so the pad degrades gracefully.
 
-1. **OS launcher macro** — e.g. a `macro` of `Gui+R` → (companion isn't needed
-   if the OS run box accepts typed text; note `text` steps aren't inside macros
-   yet, so use a `text` key or a launcher shortcut you've bound in the OS).
-2. **Companion hotkey** — bind a distinctive `key` chord (e.g. Ctrl+Alt+F13-ish)
-   and have your companion app/script listen for it and launch the app. This is
-   the most robust cross-platform route and what the app is expected to use.
+**Service** `6d616372-6f70-6164-0000-000000000001` (ASCII "macropad"):
+
+| Characteristic | UUID suffix | Props | Direction |
+|----------------|-------------|-------|-----------|
+| Events   | `...0002` | Notify | device → host |
+| Commands | `...0003` | Write (encrypted) | host → device |
+
+Wire format both ways: `[opcode:1][len:1][payload:len]`.
+
+**Events (device → host):**
+
+| Op | Name | Payload |
+|----|------|---------|
+| `0x01` | hello  | `[fwMajor][keys][presets][activePreset][faceMode][persona]` — sent on subscribe |
+| `0x02` | key    | `[preset][keyIdx]` — a `host` key was tapped |
+| `0x03` | preset | `[preset]` — active preset changed (either side) |
+
+**Commands (host → device):**
+
+| Op | Name | Payload | Effect |
+|----|------|---------|--------|
+| `0x81` | setLabel  | `[preset][key][utf8 ≤8]` | Live label override (RAM only; persists only if the user saves on-device) |
+| `0x82` | setStatus | `[utf8 ≤23]` | Status-bar line on the main grid; empty clears |
+| `0x83` | setPreset | `[preset]` | Foreground-follow: switch the pad's preset; echoed back as event `0x03` |
+| `0x84` | setFace   | `[mode 0-2][persona 0-3]` | Face mode / personality override (RAM only) |
+
+Notes: commands are queued in the firmware and applied by the display-owning
+loop (bursts of 12 `setLabel`s are fine). `setPreset`/`setLabel` deliberately
+do **not** write NVS — the companion pushes state every session, and flash
+wear matters. Old alternative for scripts without BLE access: bind a
+distinctive `key` chord and use a global-hotkey listener.
 
 ## Build options for OTA `.bin`
 

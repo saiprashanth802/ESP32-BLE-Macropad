@@ -121,6 +121,8 @@ enum KAType : uint8_t {
   KA_CONSUMER,      // single media/consumer usage code
   KA_MACRO,         // ordered sequence of chord steps with delays
   KA_TEXT,          // type an ASCII string
+  KA_HOST,          // notify the companion app over GATT (mod/key = HID
+                    // fallback chord for when no app is listening)
 };
 
 #define MACRO_MAX 6
@@ -341,6 +343,64 @@ NimBLECharacteristic* pCcReport = nullptr;  // Report ID 2
 volatile bool bleConnected = false;
 volatile uint16_t bleConnHandle = 0;
 
+// ════════════════════════════════════════════════
+//  HOST-LINK — custom GATT service for the companion app
+//  Lives alongside HID on the same bond. The app subscribes to EVT and
+//  receives key/preset events; it writes TLV commands to CMD. Wire format:
+//  [opcode:1][len:1][payload]. Spec in docs/CONFIG_API.md.
+// ════════════════════════════════════════════════
+#define HOSTLINK_SVC_UUID "6d616372-6f70-6164-0000-000000000001"  // "macropad"
+#define HOSTLINK_EVT_UUID "6d616372-6f70-6164-0000-000000000002"
+#define HOSTLINK_CMD_UUID "6d616372-6f70-6164-0000-000000000003"
+
+enum : uint8_t {  // device → host
+  HEV_HELLO  = 0x01,   // [fwMajor][keys][presets][activePreset][faceMode][persona]
+  HEV_KEY    = 0x02,   // [preset][keyIdx] — a KA_HOST key was tapped
+  HEV_PRESET = 0x03,   // [preset] — active preset changed (either side)
+};
+enum : uint8_t {  // host → device
+  HCMD_LABEL  = 0x81,  // [preset][key][utf8 ≤8] — live label override
+  HCMD_STATUS = 0x82,  // [utf8 ≤23] — status-bar line; empty clears
+  HCMD_PRESET = 0x83,  // [preset] — foreground-follow switches the pad
+  HCMD_FACE   = 0x84,  // [mode 0-2][persona 0-3]
+};
+
+NimBLECharacteristic* pEvtChar = nullptr;
+volatile bool hostAppSubscribed = false;
+volatile bool hostHelloPending  = false;
+
+// Command mailbox — onWrite runs in the NimBLE task and must never touch the
+// display (same rule as pendingBleEvent). Sized for a full 12-label burst.
+#define HOSTCMD_QMAX   16
+#define HOSTCMD_MAXLEN 28
+struct HostCmd { uint8_t len; uint8_t data[HOSTCMD_MAXLEN]; };
+HostCmd hostCmdQ[HOSTCMD_QMAX];
+volatile uint8_t hostCmdHead = 0, hostCmdTail = 0;   // head=write, tail=read
+
+char hostStatus[24] = "";   // companion status line shown in the main bar
+
+class EvtCB : public NimBLECharacteristicCallbacks {
+  void onSubscribe(NimBLECharacteristic* c, NimBLEConnInfo& info,
+                   uint16_t subValue) override {
+    hostAppSubscribed = (subValue & 0x0001);
+    if (hostAppSubscribed) hostHelloPending = true;   // loop sends the hello
+    Serial.printf("[HOST] subscribe=%u\n", subValue);
+  }
+};
+
+class CmdCB : public NimBLECharacteristicCallbacks {
+  void onWrite(NimBLECharacteristic* c, NimBLEConnInfo& info) override {
+    NimBLEAttValue v = c->getValue();
+    if (v.size() < 2) return;
+    uint8_t next = (uint8_t)((hostCmdHead + 1) % HOSTCMD_QMAX);
+    if (next == hostCmdTail) return;                  // full — drop, don't block
+    HostCmd& q = hostCmdQ[hostCmdHead];
+    q.len = (uint8_t)min((unsigned)HOSTCMD_MAXLEN, (unsigned)v.size());
+    memcpy(q.data, v.data(), q.len);
+    hostCmdHead = next;
+  }
+};
+
 void startAdvertisingForSlot();   // fwd
 void saveSlots();                 // fwd
 void faceSlotGlance(int slot);    // fwd
@@ -407,6 +467,8 @@ class ServerCB : public NimBLEServerCallbacks {
   void onDisconnect(NimBLEServer* s, NimBLEConnInfo& info, int reason) override {
     Serial.printf("[BLE] disconnect reason=%d\n", reason);
     bleConnected = false;
+    hostAppSubscribed = false;   // CCCD subscriptions die with the link
+    hostHelloPending  = false;
     delay(200);
     // Rebuild adv data on every restart — BlueZ requires the flags byte to
     // be present each time, not just on first boot
@@ -993,7 +1055,7 @@ void showToast(const char* msg, uint16_t color, unsigned long ms) {
 void drawMain() {
   beginDraw(SCR_MAIN);
   uint16_t accent = PRESET_COLORS[activePreset];
-  drawStatusBar(presets[activePreset].name, accent);
+  drawStatusBar(hostStatus[0] ? hostStatus : presets[activePreset].name, accent);
   for (int i = 0; i < NUM_KEYS; i++) {
     KeyAction& ka = presets[activePreset].keys[i];
     bool flash = (i == lastFlashKey);
@@ -1206,6 +1268,78 @@ void redraw() {
 }
 
 // ════════════════════════════════════════════════
+//  HOST-LINK — event senders + command drain (loop task only)
+// ════════════════════════════════════════════════
+static void hostNotify(const uint8_t* buf, size_t n) {
+  if (!hostAppSubscribed || !pEvtChar) return;
+  pEvtChar->setValue(buf, n);
+  pEvtChar->notify();
+}
+
+void hostNotifyKey(uint8_t keyIdx) {
+  uint8_t ev[4] = { HEV_KEY, 2, (uint8_t)activePreset, keyIdx };
+  hostNotify(ev, sizeof(ev));
+}
+
+void hostNotifyPreset() {
+  uint8_t ev[3] = { HEV_PRESET, 1, (uint8_t)activePreset };
+  hostNotify(ev, sizeof(ev));
+}
+
+// Drain queued companion commands. Runs every loop pass; the queue is almost
+// always empty so the common case is two array-index compares.
+void hostLinkTick() {
+  if (hostHelloPending) {
+    hostHelloPending = false;
+    uint8_t ev[8] = { HEV_HELLO, 6, 5 /*fw major*/, NUM_KEYS, NUM_PRESETS,
+                      (uint8_t)activePreset, faceMode, facePersona };
+    hostNotify(ev, sizeof(ev));
+  }
+  while (hostCmdTail != hostCmdHead) {
+    HostCmd& q = hostCmdQ[hostCmdTail];
+    uint8_t op = q.data[0], n = q.data[1];
+    const uint8_t* p = q.data + 2;
+    if ((size_t)(2 + n) <= q.len) switch (op) {
+
+      case HCMD_LABEL:                     // [preset][key][utf8 ≤8]
+        if (n >= 2 && p[0] < NUM_PRESETS && p[1] < NUM_KEYS) {
+          KeyAction& ka = presets[p[0]].keys[p[1]];
+          int L = min((int)n - 2, 8);
+          memcpy(ka.label, p + 2, L); ka.label[L] = '\0';
+          if (currentScreen == SCR_MAIN && p[0] == activePreset) drawMain();
+        }
+        break;
+
+      case HCMD_STATUS: {                  // [utf8 ≤23]; empty clears
+        int L = min((int)n, (int)sizeof(hostStatus) - 1);
+        memcpy(hostStatus, p, L); hostStatus[L] = '\0';
+        if (currentScreen == SCR_MAIN)
+          drawStatusBar(hostStatus[0] ? hostStatus : presets[activePreset].name,
+                        PRESET_COLORS[activePreset]);
+        break;
+      }
+
+      case HCMD_PRESET:                    // [preset] — foreground-follow
+        if (n >= 1 && p[0] < NUM_PRESETS && p[0] != activePreset) {
+          activePreset = p[0];
+          hostStatus[0] = '\0';            // stale app status dies with the app
+          if (currentScreen == SCR_MAIN) drawMain();
+          hostNotifyPreset();              // echo so both sides agree
+        }
+        break;
+
+      case HCMD_FACE:                      // [mode 0-2][persona 0-3]
+        if (n >= 2) {
+          if (p[0] <= 2) faceMode = p[0];
+          if (p[1] < NUM_PERSONAS) facePersona = p[1];
+        }
+        break;
+    }
+    hostCmdTail = (uint8_t)((hostCmdTail + 1) % HOSTCMD_QMAX);
+  }
+}
+
+// ════════════════════════════════════════════════
 //  FIRE ACTION  (OS-layout aware)
 // ════════════════════════════════════════════════
 void fireAction(int id) {
@@ -1386,8 +1520,15 @@ void typeString(const char* s) {
 // ════════════════════════════════════════════════
 //  FIRE KEY — dispatch a rich KeyAction by type
 // ════════════════════════════════════════════════
-void fireKeyAction(const KeyAction& ka) {
+void fireKeyAction(const KeyAction& ka, int keyIdx) {
   if (!bleConnected) return;
+  if (ka.type == KA_HOST) {
+    // Companion event, not a keystroke. Falls back to the chord baked into
+    // the key so the pad still does something when no app is listening.
+    if (hostAppSubscribed && keyIdx >= 0) hostNotifyKey((uint8_t)keyIdx);
+    else if (ka.key || ka.mod)            sendKey(ka.mod, ka.key);
+    return;
+  }
   switch (ka.type) {
     case KA_BUILTIN:  fireAction(ka.id); break;
     case KA_KEY:      sendKey(ka.mod, ka.key); break;
@@ -1471,7 +1612,7 @@ void onKeyTap(int i) {
       if (kaEmpty(ka)) return;
       lastFlashKey = i; flashUntil = millis() + FLASH_MS;
       drawCell(i, ka.label, nullptr, PRESET_COLORS[activePreset], true);
-      fireKeyAction(ka);
+      fireKeyAction(ka, i);
       break;
     }
 
@@ -1481,7 +1622,7 @@ void onKeyTap(int i) {
       KeyAction& ka = presets[activePreset].keys[i];
       if (kaEmpty(ka)) return;
       faceKeyReact(i);
-      fireKeyAction(ka);
+      fireKeyAction(ka, i);
       break;
     }
 
@@ -1508,7 +1649,9 @@ void onKeyTap(int i) {
     case SCR_PRESET:
       if (i < NUM_PRESETS) {
         activePreset = i;
+        hostStatus[0] = '\0';        // app status belongs to the old context
         saveSettings();
+        hostNotifyPreset();          // manual switch — tell the companion
         currentScreen = SCR_MAIN; drawMain();
       } else if (i == 11 || i == KEY_FN) {
         currentScreen = SCR_MAIN; drawMain();
@@ -1571,6 +1714,7 @@ void onKeyTap(int i) {
         savePresets();
         activePreset = buildPreset;
         saveSettings();
+        hostNotifyPreset();
         currentScreen = SCR_MAIN; drawMain();
         showToast("PRESET SAVED", C_GREEN, 1200);
       } else {
@@ -2188,6 +2332,7 @@ const char* kaTypeName(uint8_t t) {
     case KA_CONSUMER: return "consumer";
     case KA_MACRO:    return "macro";
     case KA_TEXT:     return "text";
+    case KA_HOST:     return "host";
     default:          return "builtin";
   }
 }
@@ -2210,6 +2355,7 @@ uint8_t kaTypeFromName(const char* s) {
   if (!strcmp(s, "consumer")) return KA_CONSUMER;
   if (!strcmp(s, "macro"))    return KA_MACRO;
   if (!strcmp(s, "text"))     return KA_TEXT;
+  if (!strcmp(s, "host"))     return KA_HOST;
   return KA_BUILTIN;
 }
 
@@ -2218,6 +2364,7 @@ void keyToJson(const KeyAction& ka, JsonObject o) {
   o["type"]  = kaTypeName(ka.type);
   switch (ka.type) {
     case KA_KEY:      o["mod"] = ka.mod; o["key"] = ka.key; break;
+    case KA_HOST:     o["mod"] = ka.mod; o["key"] = ka.key; break;  // fallback chord
     case KA_CONSUMER: o["consumer"] = ka.consumer; break;
     case KA_TEXT:     o["text"] = ka.text; break;
     case KA_MACRO: {
@@ -2239,6 +2386,7 @@ void keyFromJson(JsonObjectConst o, KeyAction& ka) {
   ka.type = kaTypeFromName(o["type"] | "builtin");
   switch (ka.type) {
     case KA_KEY:      ka.mod = o["mod"] | 0; ka.key = o["key"] | 0; break;
+    case KA_HOST:     ka.mod = o["mod"] | 0; ka.key = o["key"] | 0; break;  // fallback chord
     case KA_CONSUMER: ka.consumer = o["consumer"] | 0; break;
     case KA_TEXT:     strncpy(ka.text, o["text"] | "", 23); ka.text[23] = '\0'; break;
     case KA_MACRO: {
@@ -2698,6 +2846,7 @@ void setup() {
   // Must happen BEFORE ledcAttach — radio init resets LEDC state
   NimBLEDevice::init(DEVICE_NAME);
   NimBLEDevice::setPower(ESP_PWR_LVL_P9);
+  NimBLEDevice::setMTU(185);   // host-link writes exceed the 23-byte default
 
   // Just Works bonding — no PIN. BOND alone (no MITM) = Android & BlueZ happy
   NimBLEDevice::setSecurityAuth(BLE_SM_PAIR_AUTHREQ_BOND);
@@ -2718,6 +2867,20 @@ void setup() {
   pCcReport = pHID->getInputReport(2);
 
   pHID->startServices();
+
+  // ── Host-link service (companion app) ────────
+  // Registered before advertising so the GATT DB is stable from boot.
+  // Windows notices the DB-hash change on reconnect and re-discovers;
+  // if a host's cache wedges anyway, clear that slot's bond and re-pair.
+  NimBLEService* pHostSvc = pServer->createService(HOSTLINK_SVC_UUID);
+  pEvtChar = pHostSvc->createCharacteristic(HOSTLINK_EVT_UUID,
+                                            NIMBLE_PROPERTY::NOTIFY);
+  pEvtChar->setCallbacks(new EvtCB());
+  NimBLECharacteristic* pCmdChar = pHostSvc->createCharacteristic(
+      HOSTLINK_CMD_UUID,
+      NIMBLE_PROPERTY::WRITE | NIMBLE_PROPERTY::WRITE_ENC);
+  pCmdChar->setCallbacks(new CmdCB());
+  pHostSvc->start();
 
   // First-boot: nothing bonded anywhere → slot 1 starts in pairing mode
   if (!hostSlots[activeSlot].bonded) pairingMode = true;
@@ -2762,6 +2925,9 @@ void loop() {
     return;
   }
 
+  // Companion-app link: hello + queued commands (loop owns the TFT)
+  hostLinkTick();
+
   // BLE events from callback context → UI feedback (loop owns the TFT)
   if (pendingBleEvent != EVT_NONE) {
     uint8_t evt = pendingBleEvent;
@@ -2790,7 +2956,7 @@ void loop() {
         delay(150);
         lastFlashKey = wakeKeyIdx; flashUntil = now + FLASH_MS;
         drawMain();
-        fireKeyAction(presets[activePreset].keys[wakeKeyIdx]);
+        fireKeyAction(presets[activePreset].keys[wakeKeyIdx], wakeKeyIdx);
         wakeKeyIdx = WAKEKEY_NONE;
       } else redraw();
     } else {

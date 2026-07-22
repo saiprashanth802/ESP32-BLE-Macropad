@@ -1,0 +1,10 @@
+{
+  "version": 2,
+  "dgSpecHash": "3SOvCWsCxNY=",
+  "success": true,
+  "projectFilePath": "C:\\claude_code\\ESP32-BLE-Macropad\\companion\\GattSpike\\GattSpike.csproj",
+  "expectedPackageFiles": [
+    "C:\\Users\\gsaip\\.nuget\\packages\\microsoft.windows.sdk.net.ref\\10.0.19041.57\\microsoft.windows.sdk.net.ref.10.0.19041.57.nupkg.sha512"
+  ],
+  "logs": []
+}
