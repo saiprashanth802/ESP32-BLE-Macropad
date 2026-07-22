@@ -207,15 +207,16 @@ struct Personality {
   uint8_t blinkPct, glancePct;              // 100 = faceCfg timings as-is
   uint8_t emotePct;                         // emote amplitude scale
   uint8_t saccadePct, dblBlinkPct, yawnPct; // micro-behaviour likelihoods
+  uint8_t squintPct;                        // idle thoughtful-squint likelihood
   int8_t  energyBias, valenceBias;          // resting mood offsets (-100..100)
   EyePose rest;                             // posture with nothing happening
 };
 const Personality PERSONAS[] = {
-  // name      blink glance emote sacc dbl yawn  eBias vBias  rest pose
-  { "CALM",     120,  110,   70,   30,  10,  15,   -10,   10, { 100,  8,   0,  0, 100, 100, 0, 0 } },
-  { "PLAYFUL",   70,   60,  130,  100,  40,  10,    25,   25, { 100,  0,   0,  8, 100, 100, 0, 0 } },
-  { "GRUMPY",   140,  130,   60,   20,   5,   5,   -15,  -30, {  92, 18, -35,  0, 100, 100, 0, 0 } },
-  { "SLEEPY",   170,  150,   50,   15,  10,  60,   -40,    0, {  80, 35,  20,  0, 100,  96, 0, 2 } },
+  // name      blink glance emote sacc dbl yawn sqnt  eBias vBias  rest pose
+  { "CALM",     120,  110,   70,   30,  10,  15,  20,   -10,   10, { 100,  8,   0,  0, 100, 100, 0, 0 } },
+  { "PLAYFUL",   70,   60,  130,  100,  40,  10,  25,    25,   25, { 100,  0,   0,  8, 100, 100, 0, 0 } },
+  { "GRUMPY",   140,  130,   60,   20,   5,   5,  50,   -15,  -30, {  92, 18, -35,  0, 100, 100, 0, 0 } },
+  { "SLEEPY",   170,  150,   50,   15,  10,  60,  30,   -40,    0, {  80, 35,  20,  0, 100,  96, 0, 2 } },
 };
 const uint8_t NUM_PERSONAS = sizeof(PERSONAS) / sizeof(PERSONAS[0]);
 uint8_t facePersona = 0;
@@ -1852,6 +1853,7 @@ bool          faceBootPending = true;     // first face entry after power-on
 // Micro-behaviours
 unsigned long faceNextSaccade = 0;
 unsigned long faceLastYawn = 0;
+unsigned long faceNextSquint = 0;
 bool          faceDblBlink = false;
 
 static inline uint32_t frnd(uint32_t lo, uint32_t hi) {   // [lo, hi] ms
@@ -1979,6 +1981,12 @@ const EmoteKey EK_YAWN[] = {
   { 620, {   6, 80,   0,  0,  96, 100, 0, 3 }, 0 },
   { 980, {  85, 12,  15,  0, 100, 100, 0, 1 }, 0 },
 };
+const EmoteKey EK_SQUINT[] = {              // thoughtful squint — narrows, holds
+  {   0, {  62, 22,   0, 26, 103,  96, 0, 0 }, 0 },
+  { 480, {  48, 32,   0, 36, 105,  92, 2, 1 }, 0 },
+  {1050, {  56, 26,   0, 30, 104,  94,-2, 0 }, 0 },
+  {1500, {  85,  8,   0, 10, 100, 100, 0, 0 }, 0 },
+};
 #define EM_DEF(tbl, dur) { tbl, sizeof(tbl)/sizeof(EmoteKey), dur }
 const Emote EM_BOOT    = EM_DEF(EK_BOOT,    1400);
 const Emote EM_HAPPY   = EM_DEF(EK_HAPPY,    900);
@@ -1987,6 +1995,7 @@ const Emote EM_WINK    = EM_DEF(EK_WINK,     520);
 const Emote EM_EXCITED = EM_DEF(EK_EXCITED,  800);
 const Emote EM_GLANCE  = EM_DEF(EK_GLANCE,   380);
 const Emote EM_YAWN    = EM_DEF(EK_YAWN,    1300);
+const Emote EM_SQUINT  = EM_DEF(EK_SQUINT,  1900);
 
 // Queue an emote. If the face is on screen it starts now; otherwise it waits
 // (briefly) so an event that happens on the grid still gets acknowledged
@@ -2031,6 +2040,7 @@ void faceEnter() {
   faceNextGlance = now + frnd(personaMs(faceCfg.glanceMinS, P.glancePct),
                               personaMs(faceCfg.glanceMaxS, P.glancePct));
   faceGlanceEnd = 0; faceDartNext = 0; faceFrameMs = 0; faceNextSaccade = 0;
+  faceNextSquint = now + frnd(6000, 15000);   // no squint the moment we appear
   // The very first face of the session gets a proper waking-up animation
   if (faceBootPending) { faceBootPending = false; faceEmote(&EM_BOOT); }
 }
@@ -2135,6 +2145,12 @@ void updateFace(unsigned long now) {
         (int)frnd(0, 999) < P.yawnPct) {
       faceLastYawn = now;
       faceEmote(&EM_YAWN);
+    }
+    // Thoughtful squint — a "hmm" while watching you. Unlike the yawn it
+    // needs no long idle; it's the face concentrating, not getting bored.
+    if (now >= faceNextSquint) {
+      faceNextSquint = now + frnd(9000, 22000);
+      if ((int)frnd(0, 99) < P.squintPct) faceEmote(&EM_SQUINT);
     }
   }
 
