@@ -90,7 +90,9 @@
 #define C_ORANGE   0xFC60
 #define C_BUILD    0x9F1F
 
-const uint16_t PRESET_COLORS[8] = {
+// RAM (not const): the companion app may recolor presets live over the
+// host-link (HCMD_COLOR). Not persisted — the app re-pushes every session.
+uint16_t PRESET_COLORS[8] = {
   C_CYAN, C_GREEN, C_AMBER, C_MAGENTA,
   C_ORANGE, C_LTBLUE, C_PINK, C_YELLOW,
 };
@@ -363,6 +365,7 @@ enum : uint8_t {  // host → device
   HCMD_STATUS = 0x82,  // [utf8 ≤23] — status-bar line; empty clears
   HCMD_PRESET = 0x83,  // [preset] — foreground-follow switches the pad
   HCMD_FACE   = 0x84,  // [mode 0-2][persona 0-3]
+  HCMD_COLOR  = 0x85,  // [preset][rgb565 hi][rgb565 lo] — preset accent + eye color
 };
 
 NimBLECharacteristic* pEvtChar = nullptr;
@@ -1332,6 +1335,15 @@ void hostLinkTick() {
         if (n >= 2) {
           if (p[0] <= 2) faceMode = p[0];
           if (p[1] < NUM_PERSONAS) facePersona = p[1];
+        }
+        break;
+
+      case HCMD_COLOR:                     // [preset][rgb565 hi][rgb565 lo]
+        if (n >= 3 && p[0] < NUM_PRESETS) {
+          PRESET_COLORS[p[0]] = (uint16_t)((p[1] << 8) | p[2]);
+          // Eyes pick the new color up next frame via faceEyeColor(); the
+          // grid only needs a repaint if this preset is on screen now.
+          if (currentScreen == SCR_MAIN && p[0] == activePreset) drawMain();
         }
         break;
     }

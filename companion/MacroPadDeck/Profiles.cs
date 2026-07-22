@@ -1,3 +1,4 @@
+using System.IO;
 using System.Text.Json;
 using System.Text.Json.Serialization;
 
@@ -19,6 +20,8 @@ public sealed class Profile
 {
     public int Preset { get; set; }                // pad preset index 0..7 this maps to
     public string Name { get; set; } = "";
+    /// "#RRGGBB" — pushed to the pad as this preset's accent + eye color
+    public string Color { get; set; } = "";
     /// exe names (no .exe) that auto-activate this profile when focused
     public List<string> AppMatch { get; set; } = new();
     public List<KeyBinding> Keys { get; set; } = new();   // up to 12, index = key idx
@@ -92,7 +95,7 @@ public sealed class ProfileStore : IDisposable
             {
                 new Profile
                 {
-                    Preset = 7, Name = "DECK",
+                    Preset = 7, Name = "DECK", Color = "#D97757",
                     Keys =
                     {
                         new KeyBinding { Type = "focusOrLaunch", Target = "notepad",  Label = "Notepad" },

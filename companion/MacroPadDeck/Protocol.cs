@@ -18,6 +18,7 @@ public static class Protocol
     public const byte CmdStatus = 0x82;
     public const byte CmdPreset = 0x83;
     public const byte CmdFace   = 0x84;
+    public const byte CmdColor  = 0x85;
 
     public static byte[] SetLabel(int preset, int key, string label)
     {
@@ -39,6 +40,18 @@ public static class Protocol
     }
 
     public static byte[] SetPreset(int preset) => new byte[] { CmdPreset, 1, (byte)preset };
+
+    /// "#RRGGBB" → RGB565 accent + eye color for one preset. Null on bad input.
+    public static byte[]? SetColor(int preset, string hex)
+    {
+        if (string.IsNullOrWhiteSpace(hex)) return null;
+        hex = hex.TrimStart('#');
+        if (hex.Length != 6 || !uint.TryParse(hex, System.Globalization.NumberStyles.HexNumber, null, out uint rgb))
+            return null;
+        int r = (int)(rgb >> 16) & 0xFF, g = (int)(rgb >> 8) & 0xFF, b = (int)rgb & 0xFF;
+        ushort c565 = (ushort)(((r >> 3) << 11) | ((g >> 2) << 5) | (b >> 3));
+        return new byte[] { CmdColor, 3, (byte)preset, (byte)(c565 >> 8), (byte)(c565 & 0xFF) };
+    }
 
     // The pad's 5x7 font is ASCII-only; strip anything else and cap length.
     static string Sanitize(string s, int max)

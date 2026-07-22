@@ -1,4 +1,5 @@
 using System.Diagnostics;
+using WinFormsApp = System.Windows.Forms.Application;
 
 namespace MacroPadDeck;
 
@@ -19,21 +20,28 @@ static class Program
         using var fg = new ForegroundWatcher();
         fg.ExeChanged += deck.OnForegroundExe;
 
-        Application.Run(tray);
+        WinFormsApp.Run(tray);
     }
 }
 
 sealed class TrayContext : ApplicationContext
 {
+    const string RunKey = @"Software\Microsoft\Windows\CurrentVersion\Run";
+    const string RunName = "MacroPadDeck";
+
     readonly NotifyIcon _icon;
 
     public TrayContext(DeckController deck)
     {
         var menu = new ContextMenuStrip();
-        menu.Items.Add("Edit profiles", null, (_, _) =>
+        menu.Items.Add("Open editor", null, (_, _) => EditorWindow.Open(deck));
+        menu.Items.Add("Edit profiles.json", null, (_, _) =>
             Process.Start(new ProcessStartInfo(ProfileStore.FilePath) { UseShellExecute = true }));
-        menu.Items.Add("Open profiles folder", null, (_, _) =>
-            Process.Start(new ProcessStartInfo(ProfileStore.Dir) { UseShellExecute = true }));
+
+        var autostart = new ToolStripMenuItem("Start with Windows") { CheckOnClick = true, Checked = IsAutostart() };
+        autostart.CheckedChanged += (_, _) => SetAutostart(autostart.Checked);
+        menu.Items.Add(autostart);
+
         menu.Items.Add(new ToolStripSeparator());
         menu.Items.Add("Exit", null, (_, _) => ExitThread());
 
@@ -44,12 +52,26 @@ sealed class TrayContext : ApplicationContext
             Visible = true,
             ContextMenuStrip = menu,
         };
+        _icon.DoubleClick += (_, _) => EditorWindow.Open(deck);
 
         deck.StatusChanged += s =>
         {
             string txt = $"MacroPad Deck — {s}";
             _icon.Text = txt.Length > 63 ? txt[..63] : txt;   // NotifyIcon hard limit
         };
+    }
+
+    static bool IsAutostart()
+    {
+        using var k = Microsoft.Win32.Registry.CurrentUser.OpenSubKey(RunKey);
+        return k?.GetValue(RunName) is not null;
+    }
+
+    static void SetAutostart(bool on)
+    {
+        using var k = Microsoft.Win32.Registry.CurrentUser.CreateSubKey(RunKey);
+        if (on) k.SetValue(RunName, $"\"{WinFormsApp.ExecutablePath}\"");
+        else k.DeleteValue(RunName, throwOnMissingValue: false);
     }
 
     protected override void ExitThreadCore()

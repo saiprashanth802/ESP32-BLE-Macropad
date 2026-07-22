@@ -26,9 +26,15 @@ public sealed class DeckController : IDisposable
         _store.Reloaded += () =>
         {
             StatusChanged?.Invoke("Profiles reloaded");
-            if (_activePreset >= 0) _ = PushLabels(_activePreset);
+            _ = Push(async () =>
+            {
+                await PushColors();
+                if (_activePreset >= 0) await PushLabels(_activePreset);
+            });
         };
     }
+
+    public int ActivePreset => _activePreset;
 
     void OnPadEvent(byte op, byte[] p)
     {
@@ -37,7 +43,11 @@ public sealed class DeckController : IDisposable
             case Protocol.EvHello when p.Length >= 4:
                 _activePreset = p[3];
                 StatusChanged?.Invoke($"Pad online (fw v{p[0]}, preset {p[3]})");
-                _ = PushLabels(_activePreset);
+                _ = Push(async () =>
+                {
+                    await PushColors();          // every profile's accent + eye color
+                    await PushLabels(_activePreset);
+                });
                 break;
 
             case Protocol.EvKey when p.Length >= 2:
@@ -88,6 +98,16 @@ public sealed class DeckController : IDisposable
             var b = prof.Keys[k];
             if (b.Type != "none" && b.Label.Length > 0)
                 await _ble.Write(Protocol.SetLabel(preset, k, b.Label));
+        }
+    }
+
+    /// Colors are per-preset device state (picker screen, eyes), so push all.
+    async Task PushColors()
+    {
+        foreach (var prof in _store.Config.Profiles)
+        {
+            var cmd = Protocol.SetColor(prof.Preset, prof.Color);
+            if (cmd is not null) await _ble.Write(cmd);
         }
     }
 
