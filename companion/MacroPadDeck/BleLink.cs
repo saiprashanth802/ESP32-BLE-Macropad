@@ -22,6 +22,13 @@ public sealed class BleLink : IDisposable
 
     public bool IsUp => _up;
 
+    static readonly string LogPath = Path.Combine(ProfileStore.Dir, "deck.log");
+    static void Log(string msg)
+    {
+        try { File.AppendAllText(LogPath, $"{DateTime.Now:HH:mm:ss.fff} {msg}\r\n"); }
+        catch { }
+    }
+
     public BleLink(ulong address)
     {
         _address = address;
@@ -37,20 +44,23 @@ public sealed class BleLink : IDisposable
         {
             Drop();
             _dev = await BluetoothLEDevice.FromBluetoothAddressAsync(_address);
-            if (_dev is null) return;
+            if (_dev is null) { Log("acquire: device null"); return; }
             _dev.ConnectionStatusChanged += OnConnChanged;
 
-            var svc = await _dev.GetGattServicesForUuidAsync(Protocol.Service, BluetoothCacheMode.Uncached);
-            if (svc.Status != GattCommunicationStatus.Success || svc.Services.Count == 0) return;
-            var s = svc.Services[0];
+            // Full enumeration, not GetGattServicesForUuidAsync — the filtered
+            // call throws 0x80070016 ERROR_BAD_COMMAND on this stack.
+            var svc = await _dev.GetGattServicesAsync(BluetoothCacheMode.Uncached);
+            if (svc.Status != GattCommunicationStatus.Success)
+            { Log($"acquire: services {svc.Status}"); return; }
+            var s = svc.Services.FirstOrDefault(x => x.Uuid == Protocol.Service);
+            if (s is null) { Log("acquire: macropad service absent"); return; }
 
-            var evt = await s.GetCharacteristicsForUuidAsync(Protocol.EvtChar, BluetoothCacheMode.Uncached);
-            var cmd = await s.GetCharacteristicsForUuidAsync(Protocol.CmdChar, BluetoothCacheMode.Uncached);
-            if (evt.Status != GattCommunicationStatus.Success || evt.Characteristics.Count == 0 ||
-                cmd.Status != GattCommunicationStatus.Success || cmd.Characteristics.Count == 0) return;
-
-            _evt = evt.Characteristics[0];
-            _cmd = cmd.Characteristics[0];
+            var chars = await s.GetCharacteristicsAsync(BluetoothCacheMode.Uncached);
+            if (chars.Status != GattCommunicationStatus.Success)
+            { Log($"acquire: chars {chars.Status}"); return; }
+            _evt = chars.Characteristics.FirstOrDefault(c => c.Uuid == Protocol.EvtChar);
+            _cmd = chars.Characteristics.FirstOrDefault(c => c.Uuid == Protocol.CmdChar);
+            if (_evt is null || _cmd is null) { Log("acquire: evt/cmd char absent"); return; }
 
             // Handler BEFORE subscribe (the hello races the CCCD status), and
             // cycle the CCCD off→on: it persists per-bond, and rewriting the
@@ -60,14 +70,16 @@ public sealed class BleLink : IDisposable
                 GattClientCharacteristicConfigurationDescriptorValue.None);
             var st = await _evt.WriteClientCharacteristicConfigurationDescriptorAsync(
                 GattClientCharacteristicConfigurationDescriptorValue.Notify);
-            if (st != GattCommunicationStatus.Success) return;
+            if (st != GattCommunicationStatus.Success) { Log($"acquire: subscribe {st}"); return; }
 
+            Log("acquire: UP");
             _up = true;
             LinkChanged?.Invoke(true);
         }
-        catch
+        catch (Exception ex)
         {
             // 0x8000FFFF etc. — stale cache or mid-reconnect; next tick retries
+            Log($"acquire: EX {ex.GetType().Name} 0x{ex.HResult:X8} {ex.Message.Split('\r')[0]}");
         }
         finally { _gate.Release(); }
     }
