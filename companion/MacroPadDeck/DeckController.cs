@@ -9,7 +9,9 @@ public sealed class DeckController : IDisposable
     readonly BleLink _ble;
     readonly ProfileStore _store;
     FeishinSource? _feishin;
+    MediaWatcher? _media;
     public void AttachFeishin(FeishinSource? f) => _feishin = f;
+    public void AttachMedia(MediaWatcher m) => _media = m;
     int _activePreset = -1;               // pad's preset as we last knew it
     DateTime _manualUntil = DateTime.MinValue;
     string _lastExe = "";
@@ -176,12 +178,12 @@ public sealed class DeckController : IDisposable
         }
         else
         {
-            var (ok, nowFav, title) = await _feishin.ToggleFavorite();
+            var (ok, nowFav, title, err) = await _feishin.ToggleFavorite(_media?.CurrentTitle ?? "");
             await _ble.Write(Protocol.SetStatus(
-                !ok ? "NOTHING PLAYING" : (nowFav ? "FAVORITED" : "UNFAVORITED")));
+                ok ? (nowFav ? "FAVORITED" : "UNFAVORITED") : err));
             StatusChanged?.Invoke(ok
                 ? $"{(nowFav ? "Favorited" : "Unfavorited")}: {title}"
-                : "Favorite: nothing playing");
+                : $"Favorite: {err}");
         }
         await Task.Delay(1600);
         await _ble.Write(Protocol.SetStatus(""));   // back to the preset name

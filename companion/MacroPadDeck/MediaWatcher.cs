@@ -15,6 +15,8 @@ public sealed class MediaWatcher : IDisposable
     string _lastSig = "";
     int _emptyPolls;               // consecutive empty polls — drives recycling
     DateTime _lastPush = DateTime.MinValue;
+    /// What the pad is currently displaying — the favorite guard checks this.
+    public volatile string CurrentTitle = "";
     public volatile bool Enabled = true;
 
     readonly FeishinSource? _feishin;
@@ -104,6 +106,7 @@ public sealed class MediaWatcher : IDisposable
             if (sig == _lastSig && !stale) return;
             _lastSig = sig;
             _lastPush = DateTime.UtcNow;
+            CurrentTitle = title;
             bool ok = await _ble.Write(Protocol.SetMedia(playing, pos, dur, title, fav));
             Log($"push '{title}' {pos}/{dur}s playing={playing} fav={fav} write={ok}");
         }
@@ -138,6 +141,7 @@ public sealed class MediaWatcher : IDisposable
         if (sig == _lastSig && !stale) return true;
         _lastSig = sig;
         _lastPush = DateTime.UtcNow;
+        CurrentTitle = title;
         bool w = await _ble.Write(Protocol.SetMedia(playing, pos, dur, title, fav));
         Log($"feishin push '{title}' {pos}/{dur}s playing={playing} fav={fav} write={w}");
         return true;

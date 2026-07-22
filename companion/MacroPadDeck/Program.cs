@@ -23,6 +23,7 @@ static class Program
         deck.AttachFeishin(feishin);
 
         using var media = new MediaWatcher(ble, feishin) { Enabled = store.Config.NowPlaying };
+        deck.AttachMedia(media);
         using var tray = new TrayContext(deck, media);
 
         // Hook must live on the message-pump thread.

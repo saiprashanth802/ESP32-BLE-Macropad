@@ -68,6 +68,11 @@ public sealed class FeishinSource : IDisposable
                 Log($"connected {_uri}");
                 loggedFail = false;
                 _ws = ws;
+                // Feishin's own client authenticates right after connecting;
+                // without it we're a passive listener that receives the initial
+                // state and then no live `song` updates — which silently leaves
+                // the cached track stale (and favorites would hit the wrong song).
+                await SendAuthenticate(ws);
                 try { await Receive(ws); } finally { _ws = null; }
             }
             catch (OperationCanceledException) { return; }
@@ -80,6 +85,26 @@ public sealed class FeishinSource : IDisposable
             // MediaWatcher's staleness check retires it if we stay down.
             try { await Task.Delay(1500, _cts.Token); } catch { return; }
         }
+    }
+
+    /// {"event":"authenticate","header":<value from GET /credentials>} — same
+    /// handshake remote.js performs. Best-effort: if /credentials refuses we
+    /// still listen, we just may not get live updates.
+    async Task SendAuthenticate(ClientWebSocket ws)
+    {
+        try
+        {
+            using var http = new System.Net.Http.HttpClient { Timeout = TimeSpan.FromSeconds(5) };
+            http.DefaultRequestHeaders.Add("Authorization", "Basic " + _basic);
+            var resp = await http.GetAsync(_uri.ToString().Replace("ws://", "http://")
+                                                          .Replace("wss://", "https://") + "credentials");
+            if (!resp.IsSuccessStatusCode) { Log($"credentials: {(int)resp.StatusCode} — check feishinPassword"); return; }
+            string header = (await resp.Content.ReadAsStringAsync()).Trim().Trim('"');
+            string json = JsonSerializer.Serialize(new { @event = "authenticate", header });
+            await ws.SendAsync(Encoding.UTF8.GetBytes(json), WebSocketMessageType.Text, true, _cts.Token);
+            Log("authenticated");
+        }
+        catch (Exception ex) { Log($"authenticate failed: {ex.Message.Split('\r')[0]}"); }
     }
 
     async Task Receive(ClientWebSocket ws)
@@ -145,13 +170,36 @@ public sealed class FeishinSource : IDisposable
     /// Wire format taken from remote.js: {"event":"favorite","favorite":<bool>,"id":<songId>}.
     /// Feishin echoes a `favorite` event back, which updates our cached state,
     /// so repeated presses alternate correctly.
-    public async Task<(bool ok, bool nowFavorite, string title)> ToggleFavorite()
+    /// `displayedTitle` is what the pad is currently showing. Favoriting is
+    /// refused unless Feishin agrees it's the same track — a stale cached song
+    /// once caused the wrong track to be favorited, and silently editing the
+    /// user's library is far worse than doing nothing.
+    public async Task<(bool ok, bool nowFavorite, string title, string error)>
+        ToggleFavorite(string displayedTitle)
     {
+        // The socket is dropped and re-established routinely; wait briefly
+        // rather than failing a press that landed during a reconnect.
         var ws = _ws;
-        if (ws is null || ws.State != WebSocketState.Open || _songId.Length == 0)
+        for (int i = 0; i < 12 && (ws is null || ws.State != WebSocketState.Open); i++)
         {
-            Log("favorite: no live song/socket");
-            return (false, false, "");
+            await Task.Delay(250, _cts.Token);
+            ws = _ws;
+        }
+        if (ws is null || ws.State != WebSocketState.Open)
+        { Log("favorite: no socket"); return (false, false, "", "NO FEISHIN LINK"); }
+        if (_songId.Length == 0)
+        { Log("favorite: no song"); return (false, false, "", "NOTHING PLAYING"); }
+
+        if (displayedTitle.Length > 0)
+        {
+            string mine = SongName.Trim();
+            if (mine.Length > 0 &&
+                !displayedTitle.StartsWith(mine, StringComparison.OrdinalIgnoreCase) &&
+                !displayedTitle.Contains(mine, StringComparison.OrdinalIgnoreCase))
+            {
+                Log($"favorite: REFUSED — pad shows '{displayedTitle}', feishin has '{mine}'");
+                return (false, false, "", "TRACK MISMATCH");
+            }
         }
         bool target = !_userFavorite;
         string json = JsonSerializer.Serialize(new
@@ -166,9 +214,13 @@ public sealed class FeishinSource : IDisposable
                                true, _cts.Token);
             _userFavorite = target;         // optimistic; the echo confirms
             Log($"favorite: {(target ? "set" : "cleared")} on '{Title}'");
-            return (true, target, Title);
+            return (true, target, Title, "");
         }
-        catch (Exception ex) { Log($"favorite failed: {ex.Message.Split('\r')[0]}"); return (false, false, ""); }
+        catch (Exception ex)
+        {
+            Log($"favorite failed: {ex.Message.Split('\r')[0]}");
+            return (false, false, "", "FAVORITE FAILED");
+        }
     }
 
     void SetPos(double v) { _pos = Norm(v); _posAt = DateTime.UtcNow; }
