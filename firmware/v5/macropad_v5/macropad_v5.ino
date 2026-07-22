@@ -3003,7 +3003,9 @@ void loop() {
     int k = lastFlashKey; lastFlashKey = -1;
     if (currentScreen == SCR_MAIN) {
       KeyAction& ka = presets[activePreset].keys[k];
-      if (ka.id == A_NONE) drawCellEmpty(k);
+      // kaEmpty, not id==A_NONE: rich key types (host/key/text/…) all have
+      // id 0 — the old test blanked their cells after every flash
+      if (kaEmpty(ka)) drawCellEmpty(k);
       else drawCell(k, ka.label, nullptr, PRESET_COLORS[activePreset], false);
     }
   }

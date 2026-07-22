@@ -25,10 +25,11 @@ public partial class EditorWindow : Window
         _open.Show();
     }
 
+    // Pastels — chosen to read well on the pad's dark screen and in this UI
     static readonly string[] Palette =
     {
-        "#D97757", "#5AC8FA", "#4CD964", "#FFCC00",
-        "#FF2D78", "#AF7AFF", "#FF9500", "#8E8E93",
+        "#A9C7E8", "#A6D9C3", "#F5D7A0", "#CBB3E6",
+        "#F2A6A0", "#A6E0DC", "#F7E8A6", "#EFB6CE",
     };
 
     static readonly JsonSerializerOptions JsonOpts = new()

@@ -89,13 +89,16 @@ public sealed class ProfileStore : IDisposable
 
     void WriteDefault()
     {
-        var cfg = new DeckConfig
-        {
-            Profiles =
-            {
+        var cfg = new DeckConfig();
+        // One profile per pad preset, pastel-coded — names mirror the firmware
+        string[] names  = { "ONSHAPE", "KICAD", "MUSIC", "LTSPICE", "GAMING", "SYS", "DEV" };
+        string[] pastel = { "#A9C7E8", "#A6D9C3", "#F5D7A0", "#CBB3E6", "#F2A6A0", "#A6E0DC", "#F7E8A6" };
+        for (int i = 0; i < 7; i++)
+            cfg.Profiles.Add(new Profile { Preset = i, Name = names[i], Color = pastel[i] });
+        cfg.Profiles.Add(
                 new Profile
                 {
-                    Preset = 7, Name = "DECK", Color = "#D97757",
+                    Preset = 7, Name = "DECK", Color = "#EFB6CE",
                     Keys =
                     {
                         new KeyBinding { Type = "focusOrLaunch", Target = "notepad",  Label = "Notepad" },
@@ -111,9 +114,7 @@ public sealed class ProfileStore : IDisposable
                         new KeyBinding(),
                         new KeyBinding(),
                     },
-                },
-            },
-        };
+                });
         File.WriteAllText(FilePath, JsonSerializer.Serialize(cfg, JsonOpts));
     }
 
