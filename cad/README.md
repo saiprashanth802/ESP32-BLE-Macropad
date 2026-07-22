@@ -10,14 +10,17 @@ the earlier encoder-based design.
 
 ```
 cad/stl/v5/
-├── v5_case_part1.stl    ← case
-├── v5_case_part2.stl    ← case
-├── v5_case_part3.stl    ← case
-└── v5_switchplate.stl   ← switch plate (12 × MX cutouts, 19.05mm pitch)
+├── v5_case_bottom.stl     ← bottom shell (ESP32 + wiring bay)
+├── v5_case_top_plate.stl  ← top plate (key openings + display shelf)
+├── v5_display_mount.stl   ← display mount (2" IPS TFT carrier)
+└── v5_switchplate.stl     ← switch plate (12 × MX cutouts, 19.05mm pitch)
 ```
 
-Printed in white PLA with black/white spiral-top keycaps; the case takes M3
-screws at the corners and the TFT mounts on the raised shelf. Assembled unit is
+**Stack-up, bottom to top:** case bottom → switch plate (switches clip in) →
+top plate → display mount carrying the TFT on the raised shelf. M3 screws pass
+through the corner bosses to hold the sandwich together.
+
+Printed in white PLA with black/white spiral-top keycaps. The assembled unit is
 lit by a blue LED strip behind the left-hand vent slots.
 
 ## Earlier design (v2/v3, encoder-based)
