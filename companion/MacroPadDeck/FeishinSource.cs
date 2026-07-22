@@ -1,38 +1,45 @@
 using System.IO;
-using System.Net.Http;
-using System.Net.Http.Headers;
+using System.Net.WebSockets;
 using System.Text;
 using System.Text.Json;
 
 namespace MacroPadDeck;
 
-/// Reads now-playing from Feishin's Remote server (HTTP Basic auth), used as
-/// a fallback when Windows' media sessions report nothing — Feishin does not
-/// publish to SMTC, so this is the only way to see its playback.
+/// Now-playing from Feishin's Remote server. Feishin never publishes to
+/// Windows media sessions, so this is the only way to see its playback.
 ///
-/// Credentials come from profiles.json (feishinUser / feishinPassword); they
-/// are never stored anywhere else. The endpoint and JSON shape are discovered
-/// at runtime: Feishin's remote API has changed across releases, so we probe
-/// a candidate list and pull recognised fields wherever they appear.
-public sealed class FeishinSource
+/// The remote is a WebSocket, not REST (every /api/* path 404s): connect to
+/// ws://host:port/ with HTTP Basic auth and receive {"event":…,"data":…}
+/// frames. Events seen in remote.js: state (full snapshot on connect), song,
+/// position, playback, volume, repeat, shuffle, favorite, rating, proxy.
+///
+/// Credentials come from profiles.json and are used only for this handshake.
+public sealed class FeishinSource : IDisposable
 {
-    static readonly string[] Candidates =
-    {
-        "/api/state", "/api/playback", "/api/song", "/api/nowplaying",
-        "/api/current", "/api/status", "/state", "/nowplaying",
-    };
+    readonly Uri _uri;
+    readonly string _basic;
+    readonly CancellationTokenSource _cts = new();
 
-    readonly HttpClient _http = new() { Timeout = TimeSpan.FromSeconds(4) };
-    readonly string _baseUrl;
-    string? _endpoint;             // remembered once something works
-    bool _warned;
+    // Snapshot updated by the receive loop, read by MediaWatcher.
+    public volatile string Title = "";
+    public volatile bool Playing;
+    volatile int _pos, _dur;
+    DateTime _posAt = DateTime.MinValue;
+    public DateTime LastUpdate { get; private set; } = DateTime.MinValue;
+
+    public int Duration => _dur;
+    /// Position extrapolated from the last update, so the pad's bar keeps
+    /// moving between Feishin's periodic position events.
+    public int Position => Playing && _posAt > DateTime.MinValue
+        ? _pos + (int)(DateTime.UtcNow - _posAt).TotalSeconds
+        : _pos;
 
     public FeishinSource(string baseUrl, string user, string password)
     {
-        _baseUrl = baseUrl.TrimEnd('/');
-        if (user.Length > 0 || password.Length > 0)
-            _http.DefaultRequestHeaders.Authorization = new AuthenticationHeaderValue(
-                "Basic", Convert.ToBase64String(Encoding.UTF8.GetBytes($"{user}:{password}")));
+        var http = new Uri(baseUrl);
+        _uri = new Uri((http.Scheme == "https" ? "wss://" : "ws://") + http.Authority + "/");
+        _basic = Convert.ToBase64String(Encoding.UTF8.GetBytes($"{user}:{password}"));
+        _ = Task.Run(RunLoop);
     }
 
     static void Log(string m)
@@ -41,70 +48,101 @@ public sealed class FeishinSource
                                  $"{DateTime.Now:HH:mm:ss.fff} feishin: {m}\r\n"); } catch { }
     }
 
-    public async Task<(bool ok, string title, int pos, int dur, bool playing)> Poll()
+    async Task RunLoop()
     {
-        foreach (string path in _endpoint is null ? Candidates : new[] { _endpoint })
+        bool loggedFail = false;
+        while (!_cts.IsCancellationRequested)
         {
             try
             {
-                var resp = await _http.GetAsync(_baseUrl + path);
-                if (resp.StatusCode == System.Net.HttpStatusCode.Unauthorized)
-                {
-                    if (!_warned) { _warned = true; Log("401 — set feishinUser/feishinPassword in profiles.json"); }
-                    return default;
-                }
-                if (!resp.IsSuccessStatusCode) continue;
-                string body = await resp.Content.ReadAsStringAsync();
-                if (!body.TrimStart().StartsWith('{')) continue;
-
-                using var doc = JsonDocument.Parse(body);
-                string title = FindString(doc.RootElement, "title", "name", "song", "track") ?? "";
-                if (title.Length == 0) continue;
-
-                if (_endpoint != path) { _endpoint = path; Log($"using {path}"); }
-
-                double pos = FindNumber(doc.RootElement, "position", "positionsec", "elapsed", "currenttime", "progress") ?? 0;
-                double dur = FindNumber(doc.RootElement, "duration", "durationsec", "length", "totaltime") ?? 0;
-                // Some builds report milliseconds — normalise anything implausibly large
-                if (dur > 100000) { dur /= 1000; pos /= 1000; }
-                bool playing = FindBool(doc.RootElement, "isplaying", "playing") ??
-                               (FindString(doc.RootElement, "status", "state") ?? "").ToLowerInvariant() == "playing";
-                return (true, title, (int)pos, (int)dur, playing);
+                using var ws = new ClientWebSocket();
+                ws.Options.SetRequestHeader("Authorization", "Basic " + _basic);
+                ws.Options.KeepAliveInterval = TimeSpan.FromSeconds(15);   // server drops idle sockets
+                await ws.ConnectAsync(_uri, _cts.Token);
+                Log($"connected {_uri}");
+                loggedFail = false;
+                await Receive(ws);
             }
-            catch { /* server sleeping or endpoint absent — try the next */ }
+            catch (OperationCanceledException) { return; }
+            catch (Exception ex)
+            {
+                if (!loggedFail) { loggedFail = true; Log($"connect failed: {ex.Message.Split('\r')[0]}"); }
+            }
+            // Keep the last known track across a reconnect — the server closes
+            // idle sockets routinely and blanking the pad each time flickers.
+            // MediaWatcher's staleness check retires it if we stay down.
+            try { await Task.Delay(1500, _cts.Token); } catch { return; }
         }
-        return default;
     }
 
-    // ── tolerant JSON field lookup (case-insensitive, recurses one level) ──
-    static string? FindString(JsonElement e, params string[] keys) =>
-        Find(e, keys, JsonValueKind.String)?.GetString();
-
-    static double? FindNumber(JsonElement e, params string[] keys)
+    async Task Receive(ClientWebSocket ws)
     {
-        var v = Find(e, keys, JsonValueKind.Number);
-        return v?.GetDouble();
-    }
-
-    static bool? FindBool(JsonElement e, params string[] keys)
-    {
-        var v = Find(e, keys, JsonValueKind.True) ?? Find(e, keys, JsonValueKind.False);
-        return v?.GetBoolean();
-    }
-
-    static JsonElement? Find(JsonElement e, string[] keys, JsonValueKind kind, int depth = 0)
-    {
-        if (e.ValueKind != JsonValueKind.Object || depth > 2) return null;
-        foreach (var prop in e.EnumerateObject())
+        var buf = new byte[16 * 1024];
+        var sb = new StringBuilder();
+        while (ws.State == WebSocketState.Open && !_cts.IsCancellationRequested)
         {
-            string n = prop.Name.ToLowerInvariant();
-            if (prop.Value.ValueKind == kind && keys.Contains(n)) return prop.Value;
+            var r = await ws.ReceiveAsync(buf, _cts.Token);
+            if (r.MessageType == WebSocketMessageType.Close) return;
+            sb.Append(Encoding.UTF8.GetString(buf, 0, r.Count));
+            if (!r.EndOfMessage) continue;          // frames can span reads
+            string msg = sb.ToString();
+            sb.Clear();
+            try { Handle(msg); } catch { /* unexpected shape — ignore this frame */ }
         }
-        foreach (var prop in e.EnumerateObject())      // then descend
-        {
-            var hit = Find(prop.Value, keys, kind, depth + 1);
-            if (hit is not null) return hit;
-        }
-        return null;
     }
+
+    void Handle(string json)
+    {
+        using var doc = JsonDocument.Parse(json);
+        if (!doc.RootElement.TryGetProperty("event", out var ev)) return;
+        var data = doc.RootElement.TryGetProperty("data", out var d) ? d : default;
+
+        switch (ev.GetString())
+        {
+            case "state":                            // full snapshot on connect
+                if (data.ValueKind == JsonValueKind.Object)
+                {
+                    if (data.TryGetProperty("song", out var sng)) ReadSong(sng);
+                    if (data.TryGetProperty("position", out var p)) SetPos(Num(p));
+                    if (data.TryGetProperty("status", out var st)) SetStatus(st);
+                }
+                break;
+            case "song":     ReadSong(data); break;
+            case "position": SetPos(Num(data)); break;
+            case "playback": SetStatus(data); break;
+        }
+        LastUpdate = DateTime.UtcNow;
+    }
+
+    void ReadSong(JsonElement s)
+    {
+        if (s.ValueKind != JsonValueKind.Object) { Title = ""; return; }
+        string name = s.TryGetProperty("name", out var n) ? n.GetString() ?? "" : "";
+        string artist = s.TryGetProperty("artistName", out var a) ? a.GetString() ?? "" : "";
+        // ASCII only — the pad's 5x7 font renders anything else as '?'
+        Title = artist.Length > 0 && name.Length > 0 ? $"{name} - {artist}" : name;
+        if (s.TryGetProperty("duration", out var du)) _dur = Norm(Num(du));
+        LastUpdate = DateTime.UtcNow;
+    }
+
+    void SetPos(double v) { _pos = Norm(v); _posAt = DateTime.UtcNow; }
+
+    void SetStatus(JsonElement st)
+    {
+        Playing = st.ValueKind switch
+        {
+            JsonValueKind.String => (st.GetString() ?? "").ToLowerInvariant() is "playing" or "play",
+            JsonValueKind.Number => st.GetDouble() != 0,
+            JsonValueKind.True => true,
+            _ => false,
+        };
+        _pos = Position;                 // re-base extrapolation on state change
+        _posAt = DateTime.UtcNow;
+    }
+
+    static double Num(JsonElement e) => e.ValueKind == JsonValueKind.Number ? e.GetDouble() : 0;
+    /// Feishin reports milliseconds in some builds, seconds in others.
+    static int Norm(double v) => (int)(v > 10000 ? v / 1000 : v);
+
+    public void Dispose() { _cts.Cancel(); _cts.Dispose(); }
 }

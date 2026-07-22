@@ -104,8 +104,12 @@ public sealed class MediaWatcher : IDisposable
     async Task<bool> TryFeishin()
     {
         if (_feishin is null) return false;
-        var (ok, title, pos, dur, playing) = await _feishin.Poll();
-        if (!ok || title.Length == 0) return false;
+        string title = _feishin.Title;
+        // Stale guard: if the socket dropped, stop claiming the pad's strip
+        if (title.Length == 0 || (DateTime.UtcNow - _feishin.LastUpdate).TotalSeconds > 30)
+            return false;
+        int pos = _feishin.Position, dur = _feishin.Duration;
+        bool playing = _feishin.Playing;
 
         string sig = $"F|{title}|{playing}|{dur}|{pos / 5}";
         bool stale = (DateTime.UtcNow - _lastPush).TotalSeconds > 15;
@@ -124,5 +128,5 @@ public sealed class MediaWatcher : IDisposable
         await _ble.Write(Protocol.SetMedia(false, 0, 0, ""));
     }
 
-    public void Dispose() => _poll.Dispose();
+    public void Dispose() { _poll.Dispose(); _feishin?.Dispose(); }
 }
