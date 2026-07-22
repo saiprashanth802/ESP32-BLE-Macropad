@@ -10,18 +10,30 @@ the earlier encoder-based design.
 
 ```
 cad/stl/v5/
-├── v5_case_bottom.stl     ← bottom shell (ESP32 + wiring bay)
-├── v5_case_top_plate.stl  ← top plate (key openings + display shelf)
-├── v5_display_mount.stl   ← display mount (2" IPS TFT carrier)
-└── v5_switchplate.stl     ← switch plate (12 × MX cutouts, 19.05mm pitch)
+├── v5_case_bottom.stl        ← bottom shell (ESP32 + wiring bay)
+├── v5_case_top_plate.stl     ← top plate (key openings + display shelf)
+├── v5_display_mount.stl      ← display mount (2" IPS TFT carrier)
+├── v5_switchplate.stl        ← switch plate (12 × MX cutouts, 19.05mm pitch)
+└── v5_keycap_low_profile.stl ← low-profile keycap, print 12×
 ```
 
 **Stack-up, bottom to top:** case bottom → switch plate (switches clip in) →
 top plate → display mount carrying the TFT on the raised shelf. M3 screws pass
 through the corner bosses to hold the sandwich together.
 
-Printed in white PLA with black/white spiral-top keycaps. The assembled unit is
-lit by a blue LED strip behind the left-hand vent slots.
+### Print settings (as actually printed)
+
+| Part | Qty | Layer | Walls | Infill |
+|------|-----|-------|-------|--------|
+| Case parts, switch plate | 1 each | 0.2 mm | 3 | 30% adaptive cubic |
+| `v5_keycap_low_profile.stl` | 12 | 0.12 mm | 3 | 100% |
+
+White PLA for the case; the build in the photos alternates black and white
+keycaps in a checkerboard. The fine layer height plus solid infill is what gives
+the keycaps their crisp concentric spiral top surface — the pattern is the
+slicer's top-surface path, so **keep the 100% infill and 0.12 mm layers if you
+want that look**. The assembled unit is lit by a blue LED strip behind the
+left-hand vent slots.
 
 ## Earlier design (v2/v3, encoder-based)
 
