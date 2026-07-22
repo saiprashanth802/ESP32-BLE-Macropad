@@ -8,12 +8,21 @@
 
 ## Versions
 
-| Version | Status | Description |
-|---------|--------|-------------|
-| v3 | ✅ Complete | 8-button, ST7735 128×160, ESP32-BLE-Keyboard — flagship build |
-| v4 | ✅ Stable | NimBLE stack, ghost connection fix, BUILD MODE |
-| v4 + Media Remote | 🔬 Testing | Wireless AS5600 scroll wheel via ESP-NOW |
-| v5 | ✅ Built & Running | 12-key MX matrix, ST7789 240×320, multi-host BLE, robot face, Windows companion app |
+Every version lives side by side in this repo — `firmware/v4/`, `firmware/v5/`,
+`cad/stl/v5/` and so on. **`main` is always the latest working state**; released
+versions are marked with **git tags**, so you can grab any of them:
+
+```bash
+git clone https://github.com/saiprashanth802/ESP32-BLE-Macropad.git
+git checkout v4.1     # or v5.0 — see Releases for downloadable zips
+```
+
+| Version | Tag | Status | Description |
+|---------|-----|--------|-------------|
+| v3 | — | ✅ Complete | 8-button, ST7735 128×160, ESP32-BLE-Keyboard — flagship build |
+| v4 | `v4.1` | ✅ Stable | NimBLE stack, ghost connection fix, BUILD MODE |
+| v4 + Media Remote | — | 🔬 Testing | Wireless AS5600 scroll wheel via ESP-NOW |
+| v5 | `v5.0` | ✅ Built & Running | 12-key MX matrix, ST7789 240×320, multi-host BLE, robot face, Windows companion app |
 
 ---
 
