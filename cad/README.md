@@ -2,7 +2,25 @@
 
 All STL files are export-ready. Slice and print as-is.
 
-## 📁 Folder Structure
+## v5 — the built pad (current)
+
+These are the parts in the photos in the main README — 12-key 4×3 layout with a
+2" IPS TFT above the grid. **Use these for a v5 build**; the folders below are
+the earlier encoder-based design.
+
+```
+cad/stl/v5/
+├── v5_case_part1.stl    ← case
+├── v5_case_part2.stl    ← case
+├── v5_case_part3.stl    ← case
+└── v5_switchplate.stl   ← switch plate (12 × MX cutouts, 19.05mm pitch)
+```
+
+Printed in white PLA with black/white spiral-top keycaps; the case takes M3
+screws at the corners and the TFT mounts on the raised shelf. Assembled unit is
+lit by a blue LED strip behind the left-hand vent slots.
+
+## Earlier design (v2/v3, encoder-based)
 
 ```
 cad/stl/

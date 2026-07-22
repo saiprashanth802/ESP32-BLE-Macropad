@@ -13,7 +13,7 @@
 | v3 | ✅ Complete | 8-button, ST7735 128×160, ESP32-BLE-Keyboard — flagship build |
 | v4 | ✅ Stable | NimBLE stack, ghost connection fix, BUILD MODE |
 | v4 + Media Remote | 🔬 Testing | Wireless AS5600 scroll wheel via ESP-NOW |
-| v5 | 🚧 In Development | 12-key MX matrix, ST7789 240×320, AS5600 encoder, custom PCB |
+| v5 | ✅ Built & Running | 12-key MX matrix, ST7789 240×320, multi-host BLE, robot face, Windows companion app |
 
 ---
 
@@ -142,9 +142,24 @@
 
 ---
 
-## v5 — In Development
+## v5 — Built & Running
 
-> Full redesign. 12-key MX mechanical switch matrix (4×3 landscape), ST7789 240×320 IPS display, **multi-host BLE with 3 device slots (Logitech Easy-Switch style)**, wireless AS5600 encoder puck, and custom copper-tape ridge substrate PCB.
+> Full redesign, **assembled and working**. 12-key MX mechanical switch matrix (4×3 landscape), ST7789 240×320 IPS display, **multi-host BLE with 3 device slots (Logitech Easy-Switch style)**, a state-reactive robot face with personalities, and a Windows companion app that turns the pad into a Stream Deck.
+
+### Build Photos
+
+| | |
+|---|---|
+| ![Assembled v5, angled](docs/images/v5-build-angled.jpg) | ![v5 from above](docs/images/v5-build-top.jpg) |
+| Assembled v5 — printed case, spiral-top keycaps, blue accent lighting | Top-down: 4×3 MX grid and the 2" IPS display |
+
+![v5 front view](docs/images/v5-build-front.jpg)
+
+*The screen shows the pad's two live features at once: the procedural robot eyes in
+their default robotic blue, and the now-playing strip — track title with a progress
+bar and elapsed/total time, streamed from the host by the companion app.*
+
+**Print files:** [`cad/stl/v5/`](cad/stl/v5) — three case parts plus the switch plate.
 
 ### Multi-Host BLE — use it like a Pebble Keys
 - 3 host slots, each remembers one bonded device (NVS persisted across power cycles)
