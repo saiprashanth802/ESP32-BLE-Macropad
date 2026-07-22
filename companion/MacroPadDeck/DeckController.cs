@@ -120,7 +120,9 @@ public sealed class DeckController : IDisposable
         foreach (var prof in _store.Config.Profiles)
         {
             var cmd = Protocol.SetColor(prof.Preset, prof.Color);
-            if (cmd is not null) await _ble.Write(cmd);
+            if (cmd is null) { BleLink.Diag($"color: preset {prof.Preset} bad hex '{prof.Color}'"); continue; }
+            bool ok = await _ble.Write(cmd);
+            BleLink.Diag($"color: preset {prof.Preset} {prof.Color} -> 0x{cmd[3]:X2}{cmd[4]:X2} write={ok}");
         }
     }
 

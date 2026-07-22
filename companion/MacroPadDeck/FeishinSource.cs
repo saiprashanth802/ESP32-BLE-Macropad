@@ -34,6 +34,15 @@ public sealed class FeishinSource : IDisposable
     public bool IsFavorite => _userFavorite;
     /// Song name without the " - artist" suffix, for matching against SMTC.
     public string SongName => Title.Split(" - ")[0];
+
+    /// Does our cached track look like what the pad is displaying?
+    bool Matches(string displayed)
+    {
+        string mine = SongName.Trim();
+        return mine.Length > 0 &&
+               (displayed.StartsWith(mine, StringComparison.OrdinalIgnoreCase) ||
+                displayed.Contains(mine, StringComparison.OrdinalIgnoreCase));
+    }
     /// Position extrapolated from the last update, so the pad's bar keeps
     /// moving between Feishin's periodic position events.
     public int Position => Playing && _posAt > DateTime.MinValue
@@ -107,13 +116,31 @@ public sealed class FeishinSource : IDisposable
         catch (Exception ex) { Log($"authenticate failed: {ex.Message.Split('\r')[0]}"); }
     }
 
+    /// Feishin pushes a full `state` on connect and then sends nothing further —
+    /// no incremental song/position events. (It only ever appeared to work
+    /// because the server was dropping idle sockets, and each reconnect
+    /// delivered a fresh state.) So refresh deliberately: dropping the socket
+    /// makes RunLoop reconnect and pull current state.
+    public void ForceRefresh()
+    {
+        try { _ws?.Abort(); } catch { }
+    }
+
     async Task Receive(ClientWebSocket ws)
     {
         var buf = new byte[16 * 1024];
         var sb = new StringBuilder();
         while (ws.State == WebSocketState.Open && !_cts.IsCancellationRequested)
         {
-            var r = await ws.ReceiveAsync(buf, _cts.Token);
+            // Bounded wait: Feishin goes silent after the initial state, so a
+            // plain ReceiveAsync would block forever. Timing out cycles the
+            // socket, which is how we re-sync.
+            using var timeout = CancellationTokenSource.CreateLinkedTokenSource(_cts.Token);
+            timeout.CancelAfter(TimeSpan.FromSeconds(10));
+            System.Net.WebSockets.WebSocketReceiveResult r;
+            try { r = await ws.ReceiveAsync(buf, timeout.Token); }
+            catch (OperationCanceledException) when (!_cts.IsCancellationRequested)
+            { return; }                              // re-sync tick
             if (r.MessageType == WebSocketMessageType.Close) return;
             sb.Append(Encoding.UTF8.GetString(buf, 0, r.Count));
             if (!r.EndOfMessage) continue;          // frames can span reads
@@ -123,8 +150,12 @@ public sealed class FeishinSource : IDisposable
         }
     }
 
+    int _rawSeen;
+
     void Handle(string json)
     {
+        if (_rawSeen < 10)
+        { _rawSeen++; Log("RAW " + (json.Length > 300 ? json[..300] : json)); }
         using var doc = JsonDocument.Parse(json);
         if (!doc.RootElement.TryGetProperty("event", out var ev)) return;
         var data = doc.RootElement.TryGetProperty("data", out var d) ? d : default;
@@ -190,16 +221,23 @@ public sealed class FeishinSource : IDisposable
         if (_songId.Length == 0)
         { Log("favorite: no song"); return (false, false, "", "NOTHING PLAYING"); }
 
-        if (displayedTitle.Length > 0)
+        if (displayedTitle.Length > 0 && !Matches(displayedTitle))
         {
-            string mine = SongName.Trim();
-            if (mine.Length > 0 &&
-                !displayedTitle.StartsWith(mine, StringComparison.OrdinalIgnoreCase) &&
-                !displayedTitle.Contains(mine, StringComparison.OrdinalIgnoreCase))
+            // Cached track is stale — force a re-sync and give it a moment
+            // rather than refusing outright.
+            Log($"favorite: stale ('{SongName}' vs '{displayedTitle}') — resyncing");
+            ForceRefresh();
+            for (int i = 0; i < 20 && !Matches(displayedTitle); i++)
+                await Task.Delay(250, _cts.Token);
+
+            ws = _ws;
+            if (!Matches(displayedTitle))
             {
-                Log($"favorite: REFUSED — pad shows '{displayedTitle}', feishin has '{mine}'");
+                Log($"favorite: REFUSED — pad shows '{displayedTitle}', feishin has '{SongName}'");
                 return (false, false, "", "TRACK MISMATCH");
             }
+            if (ws is null || ws.State != WebSocketState.Open)
+                return (false, false, "", "NO FEISHIN LINK");
         }
         bool target = !_userFavorite;
         string json = JsonSerializer.Serialize(new

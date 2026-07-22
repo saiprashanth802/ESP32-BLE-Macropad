@@ -25,6 +25,8 @@ public sealed class BleLink : IDisposable
     public bool IsUp => _up;
 
     static readonly string LogPath = Path.Combine(ProfileStore.Dir, "deck.log");
+    /// Shared diagnostic sink so other modules log to the same file.
+    public static void Diag(string msg) => Log(msg);
     static void Log(string msg)
     {
         try { File.AppendAllText(LogPath, $"{DateTime.Now:HH:mm:ss.fff} {msg}\r\n"); }
