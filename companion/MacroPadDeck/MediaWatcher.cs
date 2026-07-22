@@ -17,9 +17,13 @@ public sealed class MediaWatcher : IDisposable
     DateTime _lastPush = DateTime.MinValue;
     public volatile bool Enabled = true;
 
-    public MediaWatcher(BleLink ble)
+    readonly FeishinSource? _feishin;
+
+    public MediaWatcher(BleLink ble, DeckConfig cfg)
     {
         _ble = ble;
+        if (cfg.FeishinUrl.Length > 0)
+            _feishin = new FeishinSource(cfg.FeishinUrl, cfg.FeishinUser, cfg.FeishinPassword);
         _poll = new System.Threading.Timer(async _ => await Tick(), null,
                                            TimeSpan.FromSeconds(2), TimeSpan.FromSeconds(3));
     }
@@ -52,6 +56,7 @@ public sealed class MediaWatcher : IDisposable
                     // A manager reporting zero sessions is usually stale rather
                     // than genuinely idle; recycle it every few empty polls.
                     if (++_emptyPolls % 4 == 0) _mgr = null;
+                    if (await TryFeishin()) return;      // Feishin never reaches SMTC
                     if (_lastSig.Length > 0 || _emptyPolls % 20 == 1)
                         Log($"no session (sessions={all.Count})");
                     await SendClear();
@@ -92,6 +97,24 @@ public sealed class MediaWatcher : IDisposable
             _mgr = null;
             Log($"EX {ex.GetType().Name} 0x{ex.HResult:X8} — manager reset");
         }
+    }
+
+    /// Feishin Remote fallback. Shares the dedup/heartbeat logic so the pad
+    /// sees one consistent stream regardless of which source produced it.
+    async Task<bool> TryFeishin()
+    {
+        if (_feishin is null) return false;
+        var (ok, title, pos, dur, playing) = await _feishin.Poll();
+        if (!ok || title.Length == 0) return false;
+
+        string sig = $"F|{title}|{playing}|{dur}|{pos / 5}";
+        bool stale = (DateTime.UtcNow - _lastPush).TotalSeconds > 15;
+        if (sig == _lastSig && !stale) return true;
+        _lastSig = sig;
+        _lastPush = DateTime.UtcNow;
+        bool w = await _ble.Write(Protocol.SetMedia(playing, pos, dur, title));
+        Log($"feishin push '{title}' {pos}/{dur}s playing={playing} write={w}");
+        return true;
     }
 
     async Task SendClear()

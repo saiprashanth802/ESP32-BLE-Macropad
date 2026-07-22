@@ -14,7 +14,7 @@ static class Program
         ulong addr = Convert.ToUInt64(store.Config.DeviceAddress.Replace(":", ""), 16);
         using var ble = new BleLink(addr);
         using var deck = new DeckController(ble, store);
-        using var media = new MediaWatcher(ble) { Enabled = store.Config.NowPlaying };
+        using var media = new MediaWatcher(ble, store.Config) { Enabled = store.Config.NowPlaying };
         using var tray = new TrayContext(deck, media);
 
         // Hook must live on the message-pump thread.
