@@ -6,14 +6,20 @@ namespace MacroPadDeck;
 
 public sealed class KeyBinding
 {
-    /// none | focusOrLaunch | open | run | window
+    /// none | focusOrLaunch | open | run | window | shortcut | media | text
+    /// App actions (focusOrLaunch/open/run/window) make the pad key type
+    /// "host"; shortcut/media/text rewrite the pad key itself over BLE.
     public string Type { get; set; } = "none";
     /// focusOrLaunch: exe path (or bare process name); open: url/file/folder;
-    /// run: command line; window: left|right|maximize|minimize|nextMonitor
+    /// run: command line; window: left|right|maximize|minimize|nextMonitor;
+    /// text: the snippet to type
     public string Target { get; set; } = "";
     public string Args { get; set; } = "";
     public bool Hidden { get; set; } = true;       // run: no console window
     public string Label { get; set; } = "";        // pushed to the pad (≤8 chars)
+    public int Mod { get; set; }                   // shortcut: Ctrl=1 Shift=2 Alt=4 Win=8
+    public string Key { get; set; } = "";          // shortcut: name from Protocol.HidKeys
+    public string Media { get; set; } = "";        // media: name from Protocol.MediaKeys
 }
 
 public sealed class Profile

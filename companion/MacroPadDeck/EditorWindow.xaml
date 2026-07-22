@@ -199,11 +199,14 @@
 
         <TextBlock Style="{StaticResource SectionLabel}" Text="ACTION"/>
         <ComboBox x:Name="BindType" SelectionChanged="BindType_Changed">
-          <ComboBoxItem Content="None"/>
+          <ComboBoxItem Content="None (keep firmware key)"/>
           <ComboBoxItem Content="Focus or launch app"/>
           <ComboBoxItem Content="Open URL / file / folder"/>
           <ComboBoxItem Content="Run command"/>
           <ComboBoxItem Content="Window control"/>
+          <ComboBoxItem Content="Keyboard shortcut"/>
+          <ComboBoxItem Content="Media key"/>
+          <ComboBoxItem Content="Type text snippet"/>
         </ComboBox>
 
         <TextBlock x:Name="TargetLabel" Style="{StaticResource SectionLabel}" Text="TARGET"/>
@@ -224,6 +227,18 @@
           <ComboBoxItem Content="Minimize"/>
           <ComboBoxItem Content="Next monitor"/>
         </ComboBox>
+
+        <StackPanel x:Name="ShortcutPanel" Visibility="Collapsed">
+          <StackPanel Orientation="Horizontal" Margin="0,2,0,6">
+            <CheckBox x:Name="ModCtrl"  Content="Ctrl"  Margin="0,0,10,0" Checked="Bind_Changed" Unchecked="Bind_Changed"/>
+            <CheckBox x:Name="ModShift" Content="Shift" Margin="0,0,10,0" Checked="Bind_Changed" Unchecked="Bind_Changed"/>
+            <CheckBox x:Name="ModAlt"   Content="Alt"   Margin="0,0,10,0" Checked="Bind_Changed" Unchecked="Bind_Changed"/>
+            <CheckBox x:Name="ModWin"   Content="Win"   Checked="Bind_Changed" Unchecked="Bind_Changed"/>
+          </StackPanel>
+          <ComboBox x:Name="BindKeyCombo" SelectionChanged="Bind_Changed"/>
+        </StackPanel>
+
+        <ComboBox x:Name="BindMedia" SelectionChanged="Bind_Changed" Visibility="Collapsed"/>
 
         <TextBlock x:Name="ArgsLabel" Style="{StaticResource SectionLabel}" Text="ARGUMENTS"/>
         <TextBox x:Name="BindArgs" TextChanged="Bind_Changed"/>

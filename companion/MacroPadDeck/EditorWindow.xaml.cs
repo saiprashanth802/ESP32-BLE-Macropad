@@ -44,12 +44,16 @@ public partial class EditorWindow : Window
     int _keyIdx = -1;
     bool _loading;                       // suppress change-handlers during UI fill
     readonly Button[] _keyBtns = new Button[12];
+    readonly DeckController _deck;
 
     EditorWindow(DeckController deck)
     {
         InitializeComponent();
+        _deck = deck;
 
         for (int p = 0; p < 8; p++) ProfPreset.Items.Add(p.ToString());
+        foreach (var (name, _) in Protocol.HidKeys) BindKeyCombo.Items.Add(name);
+        foreach (var (name, _) in Protocol.MediaKeys) BindMedia.Items.Add(name);
 
         foreach (string hex in Palette)
         {
@@ -89,6 +93,7 @@ public partial class EditorWindow : Window
     void Save_Click(object s, RoutedEventArgs e)
     {
         File.WriteAllText(ProfileStore.FilePath, JsonSerializer.Serialize(_cfg, JsonOpts));
+        _ = _deck.ApplyPadConfig(_cfg);    // rewrite app-managed keys on the pad
         Hint.Text = $"Saved {DateTime.Now:HH:mm:ss} — pushed to pad.";
     }
 
@@ -211,6 +216,12 @@ public partial class EditorWindow : Window
             BindArgs.Text = b.Args;
             BindHidden.IsChecked = b.Hidden;
             BindLabel.Text = b.Label;
+            ModCtrl.IsChecked  = (b.Mod & 1) != 0;
+            ModShift.IsChecked = (b.Mod & 2) != 0;
+            ModAlt.IsChecked   = (b.Mod & 4) != 0;
+            ModWin.IsChecked   = (b.Mod & 8) != 0;
+            BindKeyCombo.SelectedIndex = Array.FindIndex(Protocol.HidKeys, h => h.Name == b.Key);
+            BindMedia.SelectedIndex = Array.FindIndex(Protocol.MediaKeys, m => m.Name == b.Media);
         }
         _loading = false;
         UpdateFieldVisibility();
@@ -227,6 +238,10 @@ public partial class EditorWindow : Window
         b.Args = BindArgs.Text;
         b.Hidden = BindHidden.IsChecked == true;
         b.Label = BindLabel.Text;
+        b.Mod = (ModCtrl.IsChecked == true ? 1 : 0) | (ModShift.IsChecked == true ? 2 : 0)
+              | (ModAlt.IsChecked == true ? 4 : 0) | (ModWin.IsChecked == true ? 8 : 0);
+        b.Key = BindKeyCombo.SelectedIndex >= 0 ? Protocol.HidKeys[BindKeyCombo.SelectedIndex].Name : "";
+        b.Media = BindMedia.SelectedIndex >= 0 ? Protocol.MediaKeys[BindMedia.SelectedIndex].Name : "";
         RefreshKeyGrid();
     }
 
@@ -246,9 +261,16 @@ public partial class EditorWindow : Window
         bool win = t == "window";
         bool run = t == "run";
         bool none = t == "none";
-        TargetRow.Visibility = win || none ? Visibility.Collapsed : Visibility.Visible;
-        TargetLabel.Visibility = none ? Visibility.Collapsed : Visibility.Visible;
+        bool shortcut = t == "shortcut";
+        bool media = t == "media";
+        bool text = t == "text";
+        bool needsTarget = t is "focusOrLaunch" or "open" or "run" or "text";
+        TargetRow.Visibility = needsTarget ? Visibility.Visible : Visibility.Collapsed;
+        TargetLabel.Visibility = needsTarget ? Visibility.Visible : Visibility.Collapsed;
+        TargetLabel.Text = text ? "TEXT TO TYPE (≤ 23 chars)" : "TARGET";
         BindWindowOp.Visibility = win ? Visibility.Visible : Visibility.Collapsed;
+        ShortcutPanel.Visibility = shortcut ? Visibility.Visible : Visibility.Collapsed;
+        BindMedia.Visibility = media ? Visibility.Visible : Visibility.Collapsed;
         ArgsLabel.Visibility = run || t == "focusOrLaunch" ? Visibility.Visible : Visibility.Collapsed;
         BindArgs.Visibility = ArgsLabel.Visibility;
         BindHidden.Visibility = run ? Visibility.Visible : Visibility.Collapsed;
@@ -259,11 +281,13 @@ public partial class EditorWindow : Window
     // ── helpers ─────────────────────────────────
     static int TypeToIndex(string t) => t.ToLowerInvariant() switch
     {
-        "focusorlaunch" => 1, "open" => 2, "run" => 3, "window" => 4, _ => 0,
+        "focusorlaunch" => 1, "open" => 2, "run" => 3, "window" => 4,
+        "shortcut" => 5, "media" => 6, "text" => 7, _ => 0,
     };
     static string IndexToType(int i) => i switch
     {
-        1 => "focusOrLaunch", 2 => "open", 3 => "run", 4 => "window", _ => "none",
+        1 => "focusOrLaunch", 2 => "open", 3 => "run", 4 => "window",
+        5 => "shortcut", 6 => "media", 7 => "text", _ => "none",
     };
     static int WindowOpToIndex(string op) => op.ToLowerInvariant() switch
     {

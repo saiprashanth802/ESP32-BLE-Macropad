@@ -111,6 +111,45 @@ public sealed class DeckController : IDisposable
         }
     }
 
+    /// Editor save: rewrite every app-managed key on the pad, then persist.
+    /// Keys typed "none" are left alone — firmware defaults stay untouched.
+    public Task ApplyPadConfig(DeckConfig cfg) => Task.Run(async () =>
+    {
+        if (!_ble.IsUp) { StatusChanged?.Invoke("Pad offline — key changes queued for next save"); return; }
+        bool any = false;
+        foreach (var prof in cfg.Profiles)
+        {
+            for (int k = 0; k < prof.Keys.Count && k < 12; k++)
+            {
+                var b = prof.Keys[k];
+                byte[]? cmd = b.Type.ToLowerInvariant() switch
+                {
+                    "focusorlaunch" or "open" or "run" or "window" =>
+                        Protocol.SetKey(prof.Preset, k, Protocol.KaHost, 0, 0, 0, b.Label),
+                    "shortcut" =>
+                        Protocol.SetKey(prof.Preset, k, Protocol.KaKey, (byte)b.Mod,
+                            Protocol.HidKeys.FirstOrDefault(h => h.Name == b.Key).Hid, 0, b.Label),
+                    "media" =>
+                        Protocol.SetKey(prof.Preset, k, Protocol.KaConsumer, 0, 0,
+                            Protocol.MediaKeys.FirstOrDefault(m => m.Name == b.Media).Usage, b.Label),
+                    "text" =>
+                        Protocol.SetKey(prof.Preset, k, Protocol.KaText, 0, 0, 0, b.Label),
+                    _ => null,
+                };
+                if (cmd is null) continue;
+                await _ble.Write(cmd);
+                if (b.Type.Equals("text", StringComparison.OrdinalIgnoreCase))
+                    await _ble.Write(Protocol.SetText(prof.Preset, k, b.Target));
+                any = true;
+            }
+        }
+        if (any)
+        {
+            await _ble.Write(Protocol.Commit());
+            StatusChanged?.Invoke("Key layout written to pad");
+        }
+    });
+
     static Task Push(Func<Task> f) => Task.Run(f);
 
     public void Dispose() { }

@@ -366,6 +366,9 @@ enum : uint8_t {  // host → device
   HCMD_PRESET = 0x83,  // [preset] — foreground-follow switches the pad
   HCMD_FACE   = 0x84,  // [mode 0-2][persona 0-3]
   HCMD_COLOR  = 0x85,  // [preset][rgb565 hi][rgb565 lo] — preset accent + eye color
+  HCMD_KEY    = 0x86,  // [preset][key][kaType][mod][hid][cons lo][cons hi][label…]
+  HCMD_COMMIT = 0x87,  // persist presets to NVS (send once after a setKey burst)
+  HCMD_TEXT   = 0x88,  // [preset][key][utf8 ≤23] — text payload for a KA_TEXT key
 };
 
 NimBLECharacteristic* pEvtChar = nullptr;
@@ -1345,6 +1348,39 @@ void hostLinkTick() {
           // grid only needs a repaint if this preset is on screen now.
           if (currentScreen == SCR_MAIN && p[0] == activePreset) drawMain();
         }
+        break;
+
+      case HCMD_KEY:                       // full key reassignment from the app
+        // [preset][key][kaType][mod][hid][cons lo][cons hi][label…]
+        if (n >= 7 && p[0] < NUM_PRESETS && p[1] < NUM_KEYS && p[2] <= KA_HOST
+            && p[2] != KA_MACRO) {         // macros stay web-UI-only (steps > MTU)
+          KeyAction& ka = presets[p[0]].keys[p[1]];
+          char keepText[24];               // KA_TEXT payload arrives via HCMD_TEXT
+          memcpy(keepText, ka.text, sizeof(keepText));
+          ka = KeyAction{};
+          ka.type = p[2];
+          ka.mod  = p[3];
+          ka.key  = p[4];
+          ka.consumer = (uint16_t)(p[5] | (p[6] << 8));
+          if (ka.type == KA_BUILTIN) ka.id = (int16_t)ka.consumer;  // field reused as id
+          if (ka.type == KA_TEXT) memcpy(ka.text, keepText, sizeof(ka.text));
+          int L = min((int)n - 7, 8);
+          if (L > 0) memcpy(ka.label, p + 7, L);
+          ka.label[max(0, L)] = '\0';
+          if (currentScreen == SCR_MAIN && p[0] == activePreset) drawMain();
+        }
+        break;
+
+      case HCMD_TEXT:                      // [preset][key][utf8 ≤23]
+        if (n >= 2 && p[0] < NUM_PRESETS && p[1] < NUM_KEYS) {
+          KeyAction& ka = presets[p[0]].keys[p[1]];
+          int L = min((int)n - 2, 23);
+          memcpy(ka.text, p + 2, L); ka.text[L] = '\0';
+        }
+        break;
+
+      case HCMD_COMMIT:                    // one NVS write per editor save
+        savePresets();
         break;
     }
     hostCmdTail = (uint8_t)((hostCmdTail + 1) % HOSTCMD_QMAX);
