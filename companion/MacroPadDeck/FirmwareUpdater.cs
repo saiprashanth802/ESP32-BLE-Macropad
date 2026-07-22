@@ -14,7 +14,23 @@ public static class FirmwareUpdater
     const string UpdateUrl = "http://192.168.4.1/api/update";
     const string InfoUrl = "http://192.168.4.1/api/info";
 
+    // Two concurrent POSTs to /api/update would interleave into the same OTA
+    // partition and brick the image — one flash at a time, always.
+    static int _busy;
+
     public static async Task Run(Action<string> status)
+    {
+        if (Interlocked.Exchange(ref _busy, 1) == 1)
+        {
+            MessageBox.Show("A firmware update is already in progress.",
+                            "MacroPad Deck", MessageBoxButtons.OK, MessageBoxIcon.Information);
+            return;
+        }
+        try { await RunCore(status); }
+        finally { Interlocked.Exchange(ref _busy, 0); }
+    }
+
+    static async Task RunCore(Action<string> status)
     {
         using var dlg = new OpenFileDialog
         {
