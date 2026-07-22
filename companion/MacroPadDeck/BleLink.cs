@@ -14,6 +14,7 @@ public sealed class BleLink : IDisposable
     readonly ulong _address;
     readonly System.Threading.Timer _retry;
     BluetoothLEDevice? _dev;
+    GattDeviceService? _svc;
     GattCharacteristic? _evt, _cmd;
     volatile bool _up;
     readonly SemaphoreSlim _gate = new(1, 1);
@@ -53,8 +54,17 @@ public sealed class BleLink : IDisposable
             var svc = await _dev.GetGattServicesAsync(BluetoothCacheMode.Uncached);
             if (svc.Status != GattCommunicationStatus.Success)
             { Log($"acquire: services {svc.Status}"); return; }
-            var s = svc.Services.FirstOrDefault(x => x.Uuid == Protocol.Service);
+            // Dispose every service we are NOT keeping — WinRT holds a session
+            // per undisposed GattDeviceService, and leaked sessions eventually
+            // lock the service (GetCharacteristics starts failing AccessDenied).
+            GattDeviceService? s = null;
+            foreach (var x in svc.Services)
+            {
+                if (s is null && x.Uuid == Protocol.Service) s = x;
+                else x.Dispose();
+            }
             if (s is null) { Log("acquire: macropad service absent"); return; }
+            _svc = s;
 
             var chars = await s.GetCharacteristicsAsync(BluetoothCacheMode.Uncached);
             if (chars.Status != GattCommunicationStatus.Success)
@@ -119,6 +129,8 @@ public sealed class BleLink : IDisposable
     {
         if (_evt is not null) { try { _evt.ValueChanged -= OnValueChanged; } catch { } }
         _evt = null; _cmd = null;
+        if (_svc is not null) { try { _svc.Dispose(); } catch { } }
+        _svc = null;
         if (_dev is not null)
         {
             try { _dev.ConnectionStatusChanged -= OnConnChanged; _dev.Dispose(); } catch { }
