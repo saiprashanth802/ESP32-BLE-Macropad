@@ -25,7 +25,7 @@ public sealed class MediaWatcher : IDisposable
         if (cfg.FeishinUrl.Length > 0)
             _feishin = new FeishinSource(cfg.FeishinUrl, cfg.FeishinUser, cfg.FeishinPassword);
         _poll = new System.Threading.Timer(async _ => await Tick(), null,
-                                           TimeSpan.FromSeconds(2), TimeSpan.FromSeconds(3));
+                                           TimeSpan.FromSeconds(2), TimeSpan.FromSeconds(1));
     }
 
     static void Log(string m)
@@ -78,7 +78,7 @@ public sealed class MediaWatcher : IDisposable
 
             // Push on any meaningful change; while playing, a 5 s position
             // bucket refreshes the pad's extrapolation base periodically.
-            string sig = $"{title}|{playing}|{dur}|{pos / 5}";
+            string sig = $"{title}|{playing}|{dur}|{pos / 2}";
             // Heartbeat: a paused track's signature never changes, and the pad
             // drops the strip after 30 s without a push — refresh before then.
             bool stale = (DateTime.UtcNow - _lastPush).TotalSeconds > 15;
@@ -111,7 +111,9 @@ public sealed class MediaWatcher : IDisposable
         int pos = _feishin.Position, dur = _feishin.Duration;
         bool playing = _feishin.Playing;
 
-        string sig = $"F|{title}|{playing}|{dur}|{pos / 5}";
+        // 2 s buckets, not 5 — the pad extrapolates between pushes, but a
+        // coarse bucket makes every correction land as a visible jump.
+        string sig = $"F|{title}|{playing}|{dur}|{pos / 2}";
         bool stale = (DateTime.UtcNow - _lastPush).TotalSeconds > 15;
         if (sig == _lastSig && !stale) return true;
         _lastSig = sig;

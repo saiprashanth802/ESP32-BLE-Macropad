@@ -42,10 +42,11 @@ public sealed class DeckConfig
     public string EyeColor { get; set; } = "#3ABEFF";   // robotic blue
     /// Stream Windows now-playing (title + timeline) to the pad's face screen
     public bool NowPlaying { get; set; } = true;
-    /// Feishin Remote fallback — Feishin doesn't publish to Windows media
-    /// sessions, so it's polled directly. Fill in the credentials you set in
-    /// Feishin → Settings → Remote; leave the URL blank to disable.
-    public string FeishinUrl { get; set; } = "http://127.0.0.1:4333";
+    /// Optional Feishin Remote fallback, OFF by default. Only needed if
+    /// Feishin's own "mediaSession" setting is disabled — with it on, Feishin
+    /// publishes to Windows media sessions like any other player and this
+    /// path is redundant. Set the URL (and the remote credentials) to enable.
+    public string FeishinUrl { get; set; } = "";
     public string FeishinUser { get; set; } = "";
     public string FeishinPassword { get; set; } = "";
     public List<Profile> Profiles { get; set; } = new();
