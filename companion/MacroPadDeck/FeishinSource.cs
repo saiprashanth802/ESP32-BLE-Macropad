@@ -77,12 +77,12 @@ public sealed class FeishinSource : IDisposable
                 Log($"connected {_uri}");
                 loggedFail = false;
                 _ws = ws;
-                // NOTE: do NOT send the `authenticate` event here. Feishin's own
-                // web client does, but when we did, every subsequent connection
-                // was served a frozen state snapshot — the cached track stopped
-                // advancing and favorites targeted the wrong song. Connecting as
-                // a plain listener gets current state on each reconnect, which is
-                // what the 10s re-sync in Receive() relies on.
+                // Required for OUTBOUND commands: Feishin streams state to any
+                // listener, but silently drops favorite/play/next from clients
+                // that haven't authenticated. (An earlier theory blamed this
+                // handshake for stale state — that was really just Feishin being
+                // paused, which stops its state updates regardless.)
+                await SendAuthenticate(ws);
                 try { await Receive(ws); } finally { _ws = null; }
             }
             catch (OperationCanceledException) { return; }
