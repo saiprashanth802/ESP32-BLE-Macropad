@@ -108,7 +108,8 @@ public sealed class MediaWatcher : IDisposable
             _lastPush = DateTime.UtcNow;
             CurrentTitle = title;
             bool ok = await _ble.Write(Protocol.SetMedia(playing, pos, dur, title, fav));
-            Log($"push '{title}' {pos}/{dur}s playing={playing} fav={fav} write={ok}");
+            // Source app matters: if it isn't Feishin, favoriting can't work.
+            Log($"push '{title}' {pos}/{dur}s playing={playing} fav={fav} src={s.SourceAppUserModelId} write={ok}");
         }
         catch (Exception ex)
         {

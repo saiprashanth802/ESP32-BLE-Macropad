@@ -2393,6 +2393,10 @@ void GIFDraw(GIFDRAW* pDraw) {
       if (s[x] == pDraw->ucTransparent) s[x] = pDraw->ucBackground;
     pDraw->ucHasTransparency = 0;
   }
+  // Byte swap is needed for the decoder's palette order, but ONLY here —
+  // leaving it on globally byte-swaps every sprite push too, which wrecks the
+  // hue of every colour on screen (greys survive, being symmetric).
+  tft.setSwapBytes(true);
   if (pDraw->ucHasTransparency) {
     uint8_t t = pDraw->ucTransparent;
     int x = 0;
@@ -2406,6 +2410,7 @@ void GIFDraw(GIFDRAW* pDraw) {
     for (int x = 0; x < iWidth; x++) gifLineBuf[x] = usPalette[s[x]];
     tft.pushImage(gifOffX + pDraw->iX, y, iWidth, 1, gifLineBuf);
   }
+  tft.setSwapBytes(false);
 }
 
 void faceGifStop() {
@@ -3028,7 +3033,8 @@ void setup() {
   // TFT init first — no backlight yet, BLE init would clobber LEDC
   tft.init();
   tft.setRotation(1);            // landscape 320×240 — use 3 if upside down
-  tft.setSwapBytes(true);        // pushImage byte order for GIF playback
+  tft.setSwapBytes(false);       // sprites push in native order; GIFDraw
+                                 // flips this only around its own pushImage
   sprBar.setColorDepth(16);  sprBar.createSprite(320, 26);
   sprCell.setColorDepth(16); sprCell.createSprite(CELL_W, CELL_H);
   sprEye.setColorDepth(16);  sprEye.createSprite(EYE_SPR_W, EYE_SPR_H);

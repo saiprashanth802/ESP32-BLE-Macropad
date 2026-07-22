@@ -77,11 +77,12 @@ public sealed class FeishinSource : IDisposable
                 Log($"connected {_uri}");
                 loggedFail = false;
                 _ws = ws;
-                // Feishin's own client authenticates right after connecting;
-                // without it we're a passive listener that receives the initial
-                // state and then no live `song` updates — which silently leaves
-                // the cached track stale (and favorites would hit the wrong song).
-                await SendAuthenticate(ws);
+                // NOTE: do NOT send the `authenticate` event here. Feishin's own
+                // web client does, but when we did, every subsequent connection
+                // was served a frozen state snapshot — the cached track stopped
+                // advancing and favorites targeted the wrong song. Connecting as
+                // a plain listener gets current state on each reconnect, which is
+                // what the 10s re-sync in Receive() relies on.
                 try { await Receive(ws); } finally { _ws = null; }
             }
             catch (OperationCanceledException) { return; }
@@ -150,12 +151,8 @@ public sealed class FeishinSource : IDisposable
         }
     }
 
-    int _rawSeen;
-
     void Handle(string json)
     {
-        if (_rawSeen < 10)
-        { _rawSeen++; Log("RAW " + (json.Length > 300 ? json[..300] : json)); }
         using var doc = JsonDocument.Parse(json);
         if (!doc.RootElement.TryGetProperty("event", out var ev)) return;
         var data = doc.RootElement.TryGetProperty("data", out var d) ? d : default;
@@ -191,9 +188,11 @@ public sealed class FeishinSource : IDisposable
         // ASCII only — the pad's 5x7 font renders anything else as '?'
         Title = artist.Length > 0 && name.Length > 0 ? $"{name} - {artist}" : name;
         if (s.TryGetProperty("duration", out var du)) _dur = Norm(Num(du));
-        _songId = s.TryGetProperty("id", out var id) ? id.GetString() ?? "" : "";
+        string newId = s.TryGetProperty("id", out var id) ? id.GetString() ?? "" : "";
         _userFavorite = s.TryGetProperty("userFavorite", out var uf) &&
                         uf.ValueKind == JsonValueKind.True;
+        if (newId != _songId) Log($"state: '{Title}' fav={_userFavorite}");
+        _songId = newId;
         LastUpdate = DateTime.UtcNow;
     }
 
