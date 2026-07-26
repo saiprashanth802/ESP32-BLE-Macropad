@@ -9,7 +9,7 @@ namespace MacroPadDeck;
 /// subscription and writes; raises plain .NET events for everyone else.
 /// Disconnects are normal life (sleep, Easy-Switch, out of range) — this
 /// class quietly re-acquires on a timer rather than treating them as errors.
-public sealed class BleLink : IDisposable
+public sealed class BleLink : IBleLink
 {
     readonly ulong _address;
     readonly System.Threading.Timer _retry;

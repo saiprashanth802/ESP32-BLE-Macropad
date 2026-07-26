@@ -5,7 +5,7 @@ namespace MacroPadDeck;
 /// Raises ExeChanged("chrome") whenever a different process takes the
 /// foreground. Must be created on a thread with a message pump (the UI
 /// thread) — SetWinEventHook delivers via window messages.
-public sealed class ForegroundWatcher : IDisposable
+public sealed class ForegroundWatcher : IForegroundWatcher
 {
     readonly IntPtr _hook;
     readonly Win32.WinEventDelegate _proc;   // kept alive — the hook holds a raw pointer

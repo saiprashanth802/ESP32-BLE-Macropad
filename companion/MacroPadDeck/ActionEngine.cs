@@ -3,11 +3,12 @@ using System.IO;
 
 namespace MacroPadDeck;
 
-/// Executes a KeyBinding. Stateless; every method tolerates missing targets
-/// (a bad path must never crash the tray app — worst case nothing happens).
-public static class ActionEngine
+/// Executes a KeyBinding on Windows. Stateless; every method tolerates missing
+/// targets (a bad path must never crash the tray app — worst case nothing
+/// happens).
+public sealed class ActionEngine : IActionEngine
 {
-    public static void Execute(KeyBinding b)
+    public void Execute(KeyBinding b)
     {
         try
         {

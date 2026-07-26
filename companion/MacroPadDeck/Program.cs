@@ -10,10 +10,11 @@ static class Program
     {
         ApplicationConfiguration.Initialize();
 
+        ProfileStore.DeckSampleKeys = WindowsDefaults.DeckSampleKeys;
         using var store = new ProfileStore();
         ulong addr = Convert.ToUInt64(store.Config.DeviceAddress.Replace(":", ""), 16);
         using var ble = new BleLink(addr);
-        using var deck = new DeckController(ble, store);
+        using var deck = new DeckController(ble, store, new ActionEngine());
 
         // One Feishin link, two consumers: now-playing fallback + favorite control
         FeishinSource? feishin = store.Config.FeishinUrl.Length > 0
@@ -22,7 +23,7 @@ static class Program
             : null;
         deck.AttachFeishin(feishin);
 
-        using var media = new MediaWatcher(ble, feishin) { Enabled = store.Config.NowPlaying };
+        using var media = new MediaPusher(ble, new SmtcMediaSource(), feishin) { Enabled = store.Config.NowPlaying };
         deck.AttachMedia(media);
         using var tray = new TrayContext(deck, media);
 
@@ -42,7 +43,7 @@ sealed class TrayContext : ApplicationContext
 
     readonly NotifyIcon _icon;
 
-    public TrayContext(DeckController deck, MediaWatcher media)
+    public TrayContext(DeckController deck, MediaPusher media)
     {
         var menu = new ContextMenuStrip();
 

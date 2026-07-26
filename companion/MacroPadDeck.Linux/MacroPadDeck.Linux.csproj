@@ -1,0 +1,30 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <!-- Linux front-end for the MacroPad companion. Talks to the pad over BlueZ,
+       reads now-playing from MPRIS, follows the foreground app via X11, runs
+       host actions through wmctrl/xdg-open, and presents a GTK tray + editor.
+       Shares all wire-protocol / profile / orchestration logic with the
+       Windows build via MacroPadDeck.Core. -->
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <TargetFramework>net9.0</TargetFramework>
+    <Nullable>enable</Nullable>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <RootNamespace>MacroPadDeck</RootNamespace>
+    <!-- CA1416: P/Invoke into libX11 / libayatana-appindicator is resolved at
+         runtime on Linux; silence the "only supported on..." analyzer for a
+         Linux-only executable. -->
+    <NoWarn>$(NoWarn);CA1416</NoWarn>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <ProjectReference Include="..\MacroPadDeck.Core\MacroPadDeck.Core.csproj" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <PackageReference Include="GtkSharp" Version="3.24.24.95" />
+    <PackageReference Include="Linux.Bluetooth" Version="5.67.1" />
+    <PackageReference Include="Tmds.DBus" Version="0.94.2" />
+  </ItemGroup>
+
+</Project>

@@ -1,0 +1,14 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <!-- Platform-agnostic core: wire protocol, profile store, Feishin client,
+       the DeckController orchestration, and the interfaces the Windows and
+       Linux front-ends implement. No OS-specific APIs live here, so this
+       builds and runs on any .NET 9 target. -->
+  <PropertyGroup>
+    <TargetFramework>net9.0</TargetFramework>
+    <Nullable>enable</Nullable>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <RootNamespace>MacroPadDeck</RootNamespace>
+  </PropertyGroup>
+
+</Project>

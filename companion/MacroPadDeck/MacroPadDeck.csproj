@@ -17,4 +17,8 @@
     <Resource Include="deck.ico" />
   </ItemGroup>
 
+  <ItemGroup>
+    <ProjectReference Include="..\MacroPadDeck.Core\MacroPadDeck.Core.csproj" />
+  </ItemGroup>
+
 </Project>
