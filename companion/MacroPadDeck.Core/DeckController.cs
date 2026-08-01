@@ -13,6 +13,11 @@ public sealed class DeckController : IDisposable
     ICurrentTrack? _media;
     public void AttachFeishin(FeishinSource? f) => _feishin = f;
     public void AttachMedia(ICurrentTrack m) => _media = m;
+
+    /// The pad's builtin action library, fetched live so the editor's picker
+    /// never drifts from the firmware's ACTION_LIB.
+    public PadActions? Actions { get; private set; }
+    public void AttachActions(PadActions a) => Actions = a;
     int _activePreset = -1;               // pad's preset as we last knew it
     DateTime _manualUntil = DateTime.MinValue;
     string _lastExe = "";
@@ -158,6 +163,11 @@ public sealed class DeckController : IDisposable
                             Protocol.MediaKeys.FirstOrDefault(m => m.Name == b.Media).Usage, b.Label),
                     "text" =>
                         Protocol.SetKey(prof.Preset, k, Protocol.KaText, 0, 0, 0, b.Label),
+                    // Builtin: the firmware reuses the consumer field as the
+                    // action id when kaType is KA_BUILTIN (see HCMD_KEY).
+                    "padaction" =>
+                        Protocol.SetKey(prof.Preset, k, Protocol.KaBuiltin, 0, 0,
+                            (ushort)b.ActionId, b.Label),
                     _ => null,
                 };
                 if (cmd is null) continue;

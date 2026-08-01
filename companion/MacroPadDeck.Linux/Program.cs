@@ -16,7 +16,9 @@ static class LinuxProgram
             : null;
         deck.AttachFeishin(feishin);
 
-        using var media = new MediaPusher(ble, new MprisMediaSource(), feishin) { Enabled = store.Config.NowPlaying };
+        using var media = new MediaPusher(ble, new MprisMediaSource(), feishin,
+                                          src => store.Config.IsMusicSource(src))
+                          { Enabled = store.Config.NowPlaying };
         deck.AttachMedia(media);
 
         // `--editor`: open the GTK editor directly, without the tray. Handy where

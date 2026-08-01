@@ -7,8 +7,11 @@ namespace MacroPadDeck;
 public sealed class KeyBinding
 {
     /// none | focusOrLaunch | open | run | window | shortcut | media | text
+    ///      | favorite | padAction
     /// App actions (focusOrLaunch/open/run/window) make the pad key type
     /// "host"; shortcut/media/text rewrite the pad key itself over BLE.
+    /// padAction fires one of the pad's own builtin actions (ACTION_LIB) and
+    /// never involves the host at all.
     public string Type { get; set; } = "none";
     /// focusOrLaunch: exe path (or bare process name); open: url/file/folder;
     /// run: command line; window: left|right|maximize|minimize|nextMonitor;
@@ -20,6 +23,9 @@ public sealed class KeyBinding
     public int Mod { get; set; }                   // shortcut: Ctrl=1 Shift=2 Alt=4 Win=8
     public string Key { get; set; } = "";          // shortcut: name from Protocol.HidKeys
     public string Media { get; set; } = "";        // media: name from Protocol.MediaKeys
+    /// padAction: id from the pad's ACTION_LIB, fetched live via PadActions.
+    /// Stored as the id rather than the label so a renamed label still works.
+    public int ActionId { get; set; }
 }
 
 public sealed class Profile
@@ -42,6 +48,33 @@ public sealed class DeckConfig
     public string EyeColor { get; set; } = "#3ABEFF";   // robotic blue
     /// Stream Windows now-playing (title + timeline) to the pad's face screen
     public bool NowPlaying { get; set; } = true;
+
+    /// Sources whose playback counts as *music*, which is what drives the
+    /// pad's bob and new-track reaction. Matched case-insensitively as a
+    /// substring of the SMTC/MPRIS source id.
+    ///
+    /// An allowlist rather than a browser blocklist on purpose: a browser can
+    /// be playing a song or a three-hour video and the session gives no way to
+    /// tell, so browsers default to "not music". Add one here if you want the
+    /// pad reacting to it. Editing profiles.json is enough — it hot-reloads.
+    public List<string> MusicSources { get; set; } = new()
+    {
+        "feishin", "spotify", "foobar", "musicbee", "aimp",
+        "tidal", "deezer", "itunes", "apple music", "winamp", "vlc",
+    };
+
+    /// True when this playback source should drive the pad's music reactions.
+    /// An empty list means "everything is music", which is the pre-existing
+    /// behaviour — so clearing it restores the old face rather than silencing it.
+    public bool IsMusicSource(string sourceId)
+    {
+        if (MusicSources.Count == 0) return true;
+        if (string.IsNullOrWhiteSpace(sourceId)) return false;
+        foreach (string m in MusicSources)
+            if (m.Length > 0 && sourceId.Contains(m, StringComparison.OrdinalIgnoreCase))
+                return true;
+        return false;
+    }
     /// Optional Feishin Remote fallback, OFF by default. Only needed if
     /// Feishin's own "mediaSession" setting is disabled — with it on, Feishin
     /// publishes to Windows media sessions like any other player and this

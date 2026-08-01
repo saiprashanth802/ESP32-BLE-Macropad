@@ -66,3 +66,20 @@ public interface ICurrentTrack
 {
     string CurrentTitle { get; }
 }
+
+/// One reading of the system's master output volume.
+/// Level is 0-100, or -1 when no endpoint could be read (no audio device,
+/// or the default endpoint is mid-switch).
+public readonly record struct VolumeInfo(int Level, bool Muted)
+{
+    public static readonly VolumeInfo Unknown = new(-1, false);
+    public bool IsKnown => Level >= 0;
+}
+
+/// A platform's master-volume reader, polled by VolumePusher. Windows uses
+/// Core Audio (IAudioEndpointVolume); a Linux implementation would use
+/// PulseAudio/PipeWire. Must never throw — return Unknown instead.
+public interface IVolumeSource
+{
+    VolumeInfo Read();
+}

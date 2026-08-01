@@ -9,9 +9,10 @@ public static class Protocol
     public static readonly Guid CmdChar = Guid.Parse("6d616372-6f70-6164-0000-000000000003");
 
     // device → host
-    public const byte EvHello  = 0x01;
-    public const byte EvKey    = 0x02;
-    public const byte EvPreset = 0x03;
+    public const byte EvHello   = 0x01;
+    public const byte EvKey     = 0x02;
+    public const byte EvPreset  = 0x03;
+    public const byte EvActions = 0x04;   // [page][totalPages][count] + count × entry
 
     // host → device
     public const byte CmdLabel  = 0x81;
@@ -24,6 +25,25 @@ public static class Protocol
     public const byte CmdText   = 0x88;
     public const byte CmdEyes   = 0x89;
     public const byte CmdMedia  = 0x8A;
+    public const byte CmdVolume  = 0x8B;
+    public const byte CmdActions = 0x8C;
+
+    /// Ask the pad for one page of its builtin action library.
+    /// The list is deliberately not duplicated in C# — it lives in the
+    /// firmware's ACTION_LIB and would drift the moment an action is added.
+    public static byte[] GetActions(int page) => new byte[] { CmdActions, 1, (byte)page };
+
+    /// True system volume for the encoder puck's readout. BLE HID volume is
+    /// relative — the pad sends "up"/"down" and is never told the level — so
+    /// this push is the only way the pad or puck can know the real number.
+    /// Level 0-100, or VolumeUnknown when no endpoint could be read.
+    public const byte VolumeUnknown = 0xFF;
+
+    public static byte[] SetVolume(int level, bool muted)
+    {
+        byte lvl = level < 0 ? VolumeUnknown : (byte)Math.Clamp(level, 0, 100);
+        return new byte[] { CmdVolume, 2, lvl, (byte)(muted ? 0x01 : 0x00) };
+    }
 
     // firmware KAType values
     public const byte KaBuiltin = 0, KaKey = 1, KaConsumer = 2, KaText = 4, KaHost = 5;
@@ -90,15 +110,18 @@ public static class Protocol
     /// Now-playing: [flags][pos lo][hi][dur lo][hi][title ≤20], flags bit0 =
     /// playing, bit1 = favorited. Seconds clamp to uint16 (18 h) — plenty for
     /// music, and podcasts just cap.
+    /// isMusic gates the pad's music-reactive face (the idle bob, the
+    /// new-track reaction). The strip still draws for video and audiobooks —
+    /// they just don't make the pad vibe along.
     public static byte[] SetMedia(bool playing, int posS, int durS, string title,
-                                  bool favorite = false)
+                                  bool favorite = false, bool isMusic = true)
     {
         ushort pos = (ushort)Math.Clamp(posS, 0, ushort.MaxValue);
         ushort dur = (ushort)Math.Clamp(durS, 0, ushort.MaxValue);
         byte[] txt = System.Text.Encoding.ASCII.GetBytes(Sanitize(title, 20));
         byte[] b = new byte[7 + txt.Length];
         b[0] = CmdMedia; b[1] = (byte)(5 + txt.Length);
-        b[2] = (byte)((playing ? 1 : 0) | (favorite ? 2 : 0));
+        b[2] = (byte)((playing ? 1 : 0) | (favorite ? 2 : 0) | (isMusic ? 4 : 0));
         b[3] = (byte)(pos & 0xFF); b[4] = (byte)(pos >> 8);
         b[5] = (byte)(dur & 0xFF); b[6] = (byte)(dur >> 8);
         txt.CopyTo(b, 7);

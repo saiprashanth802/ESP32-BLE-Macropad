@@ -15,6 +15,7 @@ static class Program
         ulong addr = Convert.ToUInt64(store.Config.DeviceAddress.Replace(":", ""), 16);
         using var ble = new BleLink(addr);
         using var deck = new DeckController(ble, store, new ActionEngine());
+        deck.AttachActions(new PadActions(ble));
 
         // One Feishin link, two consumers: now-playing fallback + favorite control
         FeishinSource? feishin = store.Config.FeishinUrl.Length > 0
@@ -23,8 +24,17 @@ static class Program
             : null;
         deck.AttachFeishin(feishin);
 
-        using var media = new MediaPusher(ble, new SmtcMediaSource(), feishin) { Enabled = store.Config.NowPlaying };
+        using var media = new MediaPusher(ble, new SmtcMediaSource(), feishin,
+                                          src => store.Config.IsMusicSource(src))
+                          { Enabled = store.Config.NowPlaying };
         deck.AttachMedia(media);
+
+        // Real system volume for the encoder puck's readout. Harmless when no
+        // puck exists — the pad just stores the level and never relays it.
+        using var volSource = new CoreAudioVolumeSource();
+        using var volume = new VolumePusher(ble, volSource);
+        ble.LinkChanged += up => { if (up) volume.Invalidate(); };
+
         using var tray = new TrayContext(deck, media);
 
         // Hook must live on the message-pump thread.

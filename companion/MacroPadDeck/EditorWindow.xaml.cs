@@ -48,6 +48,7 @@ public partial class EditorWindow : Window
     bool _loading;                       // suppress change-handlers during UI fill
     readonly Button[] _keyBtns = new Button[12];
     readonly DeckController _deck;
+    List<PadAction> _padActions = new();
 
     EditorWindow(DeckController deck)
     {
@@ -57,6 +58,10 @@ public partial class EditorWindow : Window
         for (int p = 0; p < 8; p++) ProfPreset.Items.Add(p.ToString());
         foreach (var (name, _) in Protocol.HidKeys) BindKeyCombo.Items.Add(name);
         foreach (var (name, _) in Protocol.MediaKeys) BindMedia.Items.Add(name);
+
+        // The builtin list comes off the pad, so it can only be filled once the
+        // link is up. Fire and forget — the picker fills in when it arrives.
+        _ = LoadPadActions();
 
         // Eye swatches: robotic blue first (the default face), then the pastels
         foreach (string hex in new[] { "#3ABEFF" }.Concat(Palette.Take(5)))
@@ -259,9 +264,47 @@ public partial class EditorWindow : Window
             ModWin.IsChecked   = (b.Mod & 8) != 0;
             BindKeyCombo.SelectedIndex = Array.FindIndex(Protocol.HidKeys, h => h.Name == b.Key);
             BindMedia.SelectedIndex = Array.FindIndex(Protocol.MediaKeys, m => m.Name == b.Media);
+            // Match on id, not label — a renamed action keeps working
+            BindPadAction.SelectedIndex = _padActions.FindIndex(a => a.Id == b.ActionId);
         }
         _loading = false;
         UpdateFieldVisibility();
+    }
+
+    /// Pull the pad's builtin action library and fill the picker. Cached after
+    /// the first success, so reopening the editor doesn't re-fetch.
+    async Task LoadPadActions()
+    {
+        var src = _deck.Actions;
+        if (src is null) { PadActionHint.Text = "Pad action list unavailable."; return; }
+
+        if (!src.HasData)
+        {
+            PadActionHint.Text = "Loading actions from pad…";
+            bool ok = await src.Fetch();
+            if (!ok)
+            {
+                // Almost always means the pad is on firmware without
+                // HCMD_ACTIONS, or the link dropped mid-fetch.
+                PadActionHint.Text = "Couldn't read the action list — is the pad connected "
+                                   + "and on current firmware?";
+                return;
+            }
+        }
+
+        _padActions = src.Items.ToList();
+        BindPadAction.Items.Clear();
+        foreach (var a in _padActions) BindPadAction.Items.Add(a.Label);
+        PadActionHint.Text = $"{_padActions.Count} actions from the pad — runs on the pad itself, "
+                           + "no host involvement.";
+
+        // A key may already be bound to one; re-select now the list exists
+        if (_prof is not null && _keyIdx >= 0 && _keyIdx < _prof.Keys.Count)
+        {
+            _loading = true;
+            BindPadAction.SelectedIndex = _padActions.FindIndex(a => a.Id == _prof.Keys[_keyIdx].ActionId);
+            _loading = false;
+        }
     }
 
     void BindType_Changed(object s, EventArgs e) { if (!_loading) { Bind_Changed(s, e); } UpdateFieldVisibility(); }
@@ -279,6 +322,8 @@ public partial class EditorWindow : Window
               | (ModAlt.IsChecked == true ? 4 : 0) | (ModWin.IsChecked == true ? 8 : 0);
         b.Key = BindKeyCombo.SelectedIndex >= 0 ? Protocol.HidKeys[BindKeyCombo.SelectedIndex].Name : "";
         b.Media = BindMedia.SelectedIndex >= 0 ? Protocol.MediaKeys[BindMedia.SelectedIndex].Name : "";
+        if (BindPadAction.SelectedIndex >= 0 && BindPadAction.SelectedIndex < _padActions.Count)
+            b.ActionId = _padActions[BindPadAction.SelectedIndex].Id;
         RefreshKeyGrid();
     }
 
@@ -309,6 +354,7 @@ public partial class EditorWindow : Window
         BindWindowOp.Visibility = win ? Visibility.Visible : Visibility.Collapsed;
         ShortcutPanel.Visibility = shortcut ? Visibility.Visible : Visibility.Collapsed;
         BindMedia.Visibility = media ? Visibility.Visible : Visibility.Collapsed;
+        PadActionPanel.Visibility = t == "padAction" ? Visibility.Visible : Visibility.Collapsed;
         ArgsLabel.Visibility = run || t == "focusOrLaunch" ? Visibility.Visible : Visibility.Collapsed;
         BindArgs.Visibility = ArgsLabel.Visibility;
         BindHidden.Visibility = run ? Visibility.Visible : Visibility.Collapsed;
@@ -320,12 +366,14 @@ public partial class EditorWindow : Window
     static int TypeToIndex(string t) => t.ToLowerInvariant() switch
     {
         "focusorlaunch" => 1, "open" => 2, "run" => 3, "window" => 4,
-        "shortcut" => 5, "media" => 6, "text" => 7, "favorite" => 8, _ => 0,
+        "shortcut" => 5, "media" => 6, "text" => 7, "favorite" => 8,
+        "padaction" => 9, _ => 0,
     };
     static string IndexToType(int i) => i switch
     {
         1 => "focusOrLaunch", 2 => "open", 3 => "run", 4 => "window",
-        5 => "shortcut", 6 => "media", 7 => "text", 8 => "favorite", _ => "none",
+        5 => "shortcut", 6 => "media", 7 => "text", 8 => "favorite",
+        9 => "padAction", _ => "none",
     };
     static int WindowOpToIndex(string op) => op.ToLowerInvariant() switch
     {

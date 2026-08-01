@@ -237,6 +237,7 @@
           <ComboBoxItem Content="Media key"/>
           <ComboBoxItem Content="Type text snippet"/>
           <ComboBoxItem Content="Favorite current song (Feishin)"/>
+          <ComboBoxItem Content="Pad builtin action"/>
         </ComboBox>
 
         <TextBlock x:Name="TargetLabel" Style="{StaticResource SectionLabel}" Text="TARGET"/>
@@ -269,6 +270,14 @@
         </StackPanel>
 
         <ComboBox x:Name="BindMedia" SelectionChanged="Bind_Changed" Visibility="Collapsed"/>
+
+        <!-- Populated live from the pad's own ACTION_LIB, never a local copy -->
+        <StackPanel x:Name="PadActionPanel" Visibility="Collapsed">
+          <ComboBox x:Name="BindPadAction" SelectionChanged="Bind_Changed"/>
+          <TextBlock x:Name="PadActionHint" Margin="0,4,0,0" TextWrapping="Wrap"
+                     Foreground="{StaticResource Muted}" FontSize="11"
+                     Text="Runs on the pad itself — no host involvement."/>
+        </StackPanel>
 
         <TextBlock x:Name="ArgsLabel" Style="{StaticResource SectionLabel}" Text="ARGUMENTS"/>
         <TextBox x:Name="BindArgs" TextChanged="Bind_Changed"/>

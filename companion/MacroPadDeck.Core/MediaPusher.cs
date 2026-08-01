@@ -24,11 +24,17 @@ public sealed class MediaPusher : IDisposable, ICurrentTrack
 
     // The Feishin link is shared: a now-playing fallback here, and the control
     // channel for favoriting in DeckController. Owned by the front-end.
-    public MediaPusher(IBleLink ble, IMediaSource source, FeishinSource? feishin)
+    // Passed as a delegate rather than a config snapshot so profiles.json
+    // hot-reloads apply here too — it's read on every push.
+    readonly Func<string, bool> _isMusic;
+
+    public MediaPusher(IBleLink ble, IMediaSource source, FeishinSource? feishin,
+                       Func<string, bool>? isMusic = null)
     {
         _ble = ble;
         _source = source;
         _feishin = feishin;
+        _isMusic = isMusic ?? (_ => true);
         _poll = new System.Threading.Timer(async _ => await Tick(), null,
                                            TimeSpan.FromSeconds(2), TimeSpan.FromSeconds(1));
     }
@@ -82,8 +88,11 @@ public sealed class MediaPusher : IDisposable, ICurrentTrack
         _lastSig = sig;
         _lastPush = DateTime.UtcNow;
         _currentTitle = t.Title;
-        bool ok = await _ble.Write(Protocol.SetMedia(t.Playing, t.PosSeconds, t.DurSeconds, t.Title, fav));
-        Log($"push '{t.Title}' {t.PosSeconds}/{t.DurSeconds}s playing={t.Playing} fav={fav} src={t.SourceId} write={ok}");
+        bool music = _isMusic(t.SourceId);
+        bool ok = await _ble.Write(Protocol.SetMedia(t.Playing, t.PosSeconds, t.DurSeconds,
+                                                     t.Title, fav, music));
+        Log($"push '{t.Title}' {t.PosSeconds}/{t.DurSeconds}s playing={t.Playing} fav={fav} "
+          + $"src={t.SourceId} music={music} write={ok}");
     }
 
     /// Feishin Remote fallback. Shares the dedup/heartbeat logic so the pad sees
@@ -106,7 +115,8 @@ public sealed class MediaPusher : IDisposable, ICurrentTrack
         _lastSig = sig;
         _lastPush = DateTime.UtcNow;
         _currentTitle = title;
-        bool w = await _ble.Write(Protocol.SetMedia(playing, pos, dur, title, fav));
+        // Feishin is a music player by definition — no classification needed.
+        bool w = await _ble.Write(Protocol.SetMedia(playing, pos, dur, title, fav, true));
         Log($"feishin push '{title}' {pos}/{dur}s playing={playing} fav={fav} write={w}");
         return true;
     }
