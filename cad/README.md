@@ -35,6 +35,29 @@ slicer's top-surface path, so **keep the 100% infill and 0.12 mm layers if you
 want that look**. The assembled unit is lit by a blue LED strip behind the
 left-hand vent slots.
 
+## Encoder puck (wireless dial)
+
+The standalone ESP-NOW knob — see `docs/PUCK_PROTOCOL.md` for the firmware side
+and `hardware/puck_wiring.md` for the electronics.
+
+```
+cad/stl/puck/
+├── puck_dial.stl               ← the knob itself        50 × 50 × 12 mm
+├── puck_dial_counterpart_1.stl ← housing body           73 × 55 × 17 mm
+└── puck_dial_counterpart_2.stl ← housing lid / plate    73 × 55 ×  7 mm
+```
+
+The two counterpart parts share a 73 × 55 mm footprint and stack to 24 mm; the
+50 mm dial seats into them. Exported together on 2026-07-31 — `puck_dial.stl`
+and this counterpart pair are a **matched set**, so don't mix them with an
+earlier counterpart export.
+
+> ⚠ **Not yet printed or test-fitted.** These are the CAD exports as designed;
+> no tolerance check against the real AS5600 + magnet stack has happened yet.
+> Expect to iterate on the magnet pocket in particular — the AS5600 wants a
+> diametrically magnetised magnet centred on the chip at a **0.5–3 mm** gap, and
+> that gap is the one dimension the sensor is genuinely fussy about.
+
 ## Earlier design (v2/v3, encoder-based)
 
 ```
