@@ -195,6 +195,7 @@ Wire format both ways: `[opcode:1][len:1][payload:len]`.
 | `0x01` | hello  | `[fwMajor][keys][presets][activePreset][faceMode][persona]` — sent on subscribe |
 | `0x02` | key    | `[preset][keyIdx]` — a `host` key was tapped |
 | `0x03` | preset | `[preset]` — active preset changed (either side) |
+| `0x04` | actions | `[page][totalPages][count]` + `count` × `[id lo][id hi][label 9, null-padded]` — one page of `ACTION_LIB`, in reply to `0x8C` |
 
 **Commands (host → device):**
 
@@ -204,6 +205,19 @@ Wire format both ways: `[opcode:1][len:1][payload:len]`.
 | `0x82` | setStatus | `[utf8 ≤23]` | Status-bar line on the main grid; empty clears |
 | `0x83` | setPreset | `[preset]` | Foreground-follow: switch the pad's preset; echoed back as event `0x03` |
 | `0x84` | setFace   | `[mode 0-2][persona 0-3]` | Face mode / personality override (RAM only) |
+| `0x8B` | setVolume | `[level 0-100 \| 0xFF unknown][flags: bit0 muted]` | True system volume, relayed to the encoder puck. BLE HID volume is relative, so this is the only way the pad can know the real level |
+| `0x8C` | getActions | `[page]` | Ask for one page of the builtin action library; answered with event `0x04` |
+
+### Builtin actions over the host link
+
+`setKey` (`0x86`) with `kaType = 0` (`KA_BUILTIN`) **reuses the consumer field as
+the action id** — that is how the companion binds a key to one of the pad's own
+actions.
+
+The id list is not duplicated in the companion. It is pulled from the firmware's
+`ACTION_LIB` with `getActions`, 8 entries per page, because an 86-entry copy in C#
+would drift the moment an action is added to the sketch and the failure mode is a
+key silently bound to the wrong action.
 
 Notes: commands are queued in the firmware and applied by the display-owning
 loop (bursts of 12 `setLabel`s are fine). `setPreset`/`setLabel` deliberately

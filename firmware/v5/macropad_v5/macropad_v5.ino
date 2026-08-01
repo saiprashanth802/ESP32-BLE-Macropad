@@ -44,6 +44,8 @@
 // Network stack FIRST — TFT_eSPI (SMOOTH_FONT) includes <FS.h> and trips its
 // include guard, which would hide the global `FS` alias WebServer.h needs.
 #include <WiFi.h>
+#include <esp_now.h>       // encoder puck link — see docs/PUCK_PROTOCOL.md
+#include <esp_wifi.h>      // esp_wifi_set_channel, to pin the ESP-NOW channel
 #include <FS.h>
 #include <SPIFFS.h>
 #include <WebServer.h>
@@ -178,10 +180,13 @@ struct FaceCfg {
   uint8_t  glanceMinS, glanceMaxS;  // idle glance interval range (seconds)
   uint8_t  pairScalePct; // pairing-mode wide-eye width scale (percent)
   uint8_t  idleS;        // IDLE mode: seconds of no input before face shows
+  uint8_t  mouthOn;      // 0 = eyes only (the original look)
+  uint8_t  mouthW;       // mouth width at rest (px)
+  uint8_t  mouthThick;   // stroke thickness (px)
 };
 // color 0x3DFF = robotic blue (#3ABEFF) — the default face. Set to 0 to
 // follow the active preset's accent instead (app: "match preset").
-FaceCfg faceCfg = { 0x3DFF, 64, 84, 44, 18, 3, 6, 7, 15, 115, 12 };
+FaceCfg faceCfg = { 0x3DFF, 64, 84, 44, 18, 3, 6, 7, 15, 115, 12, 1, 76, 6 };
 
 // ── Personality ─────────────────────────────────
 // One renderable posture. Everything the face can express reduces to these
@@ -194,8 +199,13 @@ struct EyePose {
   uint8_t lidBotPct;    // 0-100 bottom crescent — the happy squint
   uint8_t wPct, hPct;   // eye size scale, 100 = rest (surprised goes ~115)
   int8_t  gx, gy;       // glance bias (px)
+  // ── Mouth ── deliberately appended last: every existing keyframe table
+  // uses aggregate init, so older rows zero-fill these and keep working.
+  uint8_t mouthWPct;    // width scale; 0 means "default" (=100), not "hidden"
+  int8_t  mouthCurve;   // -100 frown … 0 flat … +100 smile
+  uint8_t mouthOpenPct; // 0 = closed line, 100 = fully open (yawn, gasp)
 };
-const EyePose POSE_NEUTRAL = { 100, 0, 0, 0, 100, 100, 0, 0 };
+const EyePose POSE_NEUTRAL = { 100, 0, 0, 0, 100, 100, 0, 0, 100, 0, 0 };
 
 // A keyframe holds a pose from tMs until the next frame's tMs.
 // winkMask: bit0 = left eye closed, bit1 = right eye closed.
@@ -208,17 +218,20 @@ struct Personality {
   char    name[8];
   uint8_t blinkPct, glancePct;              // 100 = faceCfg timings as-is
   uint8_t emotePct;                         // emote amplitude scale
+  uint8_t timePct;                          // emote playback stretch (100 = as written)
   uint8_t saccadePct, dblBlinkPct, yawnPct; // micro-behaviour likelihoods
   uint8_t squintPct;                        // idle thoughtful-squint likelihood
   int8_t  energyBias, valenceBias;          // resting mood offsets (-100..100)
   EyePose rest;                             // posture with nothing happening
 };
 const Personality PERSONAS[] = {
-  // name      blink glance emote sacc dbl yawn sqnt  eBias vBias  rest pose
-  { "CALM",     120,  110,   70,   30,  10,  15,  20,   -10,   10, { 100,  8,   0,  0, 100, 100, 0, 0 } },
-  { "PLAYFUL",   70,   60,  130,  100,  40,  10,  25,    25,   25, { 100,  0,   0,  8, 100, 100, 0, 0 } },
-  { "GRUMPY",   140,  130,   60,   20,   5,   5,  50,   -15,  -30, {  92, 18, -35,  0, 100, 100, 0, 0 } },
-  { "SLEEPY",   170,  150,   50,   15,  10,  60,  30,   -40,    0, {  80, 35,  20,  0, 100,  96, 0, 2 } },
+  // The last three of each rest pose are the mouth: width%, curve, open%.
+  // timePct stretches emote playback per persona, on top of EMOTE_TIME_PCT.
+  // name      blink glance emote time sacc dbl yawn sqnt  eBias vBias  rest pose
+  { "CALM",     120,  110,   70, 105,   30,  10,  15,  20,   -10,   10, { 100,  8,   0,  0, 100, 100, 0, 0, 100,  18, 0 } },
+  { "PLAYFUL",   70,   60,  130,  85,  100,  40,  10,  25,    25,   25, { 100,  0,   0,  8, 100, 100, 0, 0, 106,  46, 0 } },
+  { "GRUMPY",   140,  130,   60, 115,   20,   5,   5,  50,   -15,  -30, {  92, 18, -35,  0, 100, 100, 0, 0,  88, -40, 0 } },
+  { "SLEEPY",   170,  150,   50, 145,   15,  10,  60,  30,   -40,    0, {  80, 35,  20,  0, 100,  96, 0, 2,  84,  -8, 0 } },
 };
 const uint8_t NUM_PERSONAS = sizeof(PERSONAS) / sizeof(PERSONAS[0]);
 uint8_t facePersona = 0;
@@ -294,6 +307,14 @@ const unsigned long FLASH_MS     = 250;
 // ════════════════════════════════════════════════
 //  HID REPORT DESCRIPTOR
 // ════════════════════════════════════════════════
+// Set to 1 to add a mouse report (ID 3), which is what the encoder puck's
+// SCROLL mode needs. It is OFF by default on purpose: adding a report changes
+// the GATT database, and Windows then wedges service discovery with
+// 0x8000FFFF until Bluetooth is toggled off and on — possibly re-pairing all
+// three slots. Volume and zoom modes need no descriptor change at all.
+// See docs/PUCK_PROTOCOL.md.
+#define PUCK_MOUSE_HID 0
+
 static const uint8_t hidReportMap[] = {
   // Keyboard — Report ID 1
   0x05,0x01, 0x09,0x06, 0xA1,0x01,
@@ -315,6 +336,26 @@ static const uint8_t hidReportMap[] = {
   0x75,0x10, 0x95,0x01,
   0x81,0x00,
   0xC0,
+#if PUCK_MOUSE_HID
+  // Mouse — Report ID 3. Buttons are declared but never sent; the puck only
+  // uses the wheel. Declaring them keeps the descriptor a well-formed mouse,
+  // which some hosts require before they will honour wheel events.
+  0x05,0x01, 0x09,0x02, 0xA1,0x01,
+  0x85,0x03,
+  0x09,0x01, 0xA1,0x00,
+  0x05,0x09, 0x19,0x01, 0x29,0x03,
+  0x15,0x00, 0x25,0x01, 0x75,0x01, 0x95,0x03,
+  0x81,0x02,                    // 3 button bits
+  0x75,0x01, 0x95,0x05, 0x81,0x01, // padding
+  0x05,0x01, 0x09,0x30, 0x09,0x31, // X, Y (always 0 from the puck)
+  0x15,0x81, 0x25,0x7F, 0x75,0x08, 0x95,0x02,
+  0x81,0x06,
+  0x09,0x38,                    // wheel
+  0x15,0x81, 0x25,0x7F, 0x75,0x08, 0x95,0x01,
+  0x81,0x06,
+  0xC0,
+  0xC0,
+#endif
 };
 
 #define DEVICE_NAME "ESP32 MacroPad"
@@ -345,6 +386,9 @@ NimBLEServer*         pServer   = nullptr;
 NimBLEHIDDevice*      pHID      = nullptr;
 NimBLECharacteristic* pKbReport = nullptr;  // Report ID 1
 NimBLECharacteristic* pCcReport = nullptr;  // Report ID 2
+#if PUCK_MOUSE_HID
+NimBLECharacteristic* pMsReport = nullptr;  // Report ID 3 — puck scroll only
+#endif
 volatile bool bleConnected = false;
 volatile uint16_t bleConnHandle = 0;
 
@@ -362,7 +406,14 @@ enum : uint8_t {  // device → host
   HEV_HELLO  = 0x01,   // [fwMajor][keys][presets][activePreset][faceMode][persona]
   HEV_KEY    = 0x02,   // [preset][keyIdx] — a KA_HOST key was tapped
   HEV_PRESET = 0x03,   // [preset] — active preset changed (either side)
+  HEV_ACTIONS= 0x04,   // [page][totalPages][count] + count × [id lo][id hi][label 9]
+                       // one page of ACTION_LIB, in reply to HCMD_ACTIONS.
+                       // Lets the companion build its builtin-action picker from
+                       // the firmware's own table instead of a duplicated copy.
 };
+
+// 8 entries × 11 bytes + 3 header = 91, comfortably inside the 185-byte MTU
+#define ACTIONS_PER_PAGE 8
 enum : uint8_t {  // host → device
   HCMD_LABEL  = 0x81,  // [preset][key][utf8 ≤8] — live label override
   HCMD_STATUS = 0x82,  // [utf8 ≤23] — status-bar line; empty clears
@@ -374,7 +425,16 @@ enum : uint8_t {  // host → device
   HCMD_TEXT   = 0x88,  // [preset][key][utf8 ≤23] — text payload for a KA_TEXT key
   HCMD_EYES   = 0x89,  // [rgb565 hi][rgb565 lo][persist] — eye color, 0 = follow preset
   HCMD_MEDIA  = 0x8A,  // [flags][pos lo][hi][dur lo][hi][title ≤20]
-                       // flags: bit0 = playing, bit1 = favorited
+                       // flags: bit0 = playing, bit1 = favorited,
+                       //        bit2 = this source is actual music
+                       // bit2 gates the music-reactive face behaviour: a
+                       // YouTube video or audiobook fills the same strip but
+                       // shouldn't make the pad bob along to it.
+  HCMD_ACTIONS= 0x8C,  // [page] — ask for one page of ACTION_LIB; replies HEV_ACTIONS
+  HCMD_VOLUME = 0x8B,  // [level 0-100 | 0xFF unknown][flags] — relayed to the
+                       // encoder puck. flags: bit0 = muted.
+                       // BLE HID volume is relative, so this is the only path
+                       // by which the pad or puck can know the real level.
 };
 
 NimBLECharacteristic* pEvtChar = nullptr;
@@ -403,6 +463,10 @@ uint8_t  mediaShow = 1;      // Settings → MEDIA, NVS "media"
 // Set by the command handler, consumed by the face so the eyes can react to
 // music without the BLE task ever touching the display.
 volatile bool mediaNewSong = false, mediaJustFaved = false;
+// Set from HCMD_MEDIA flags bit2. The now-playing strip draws for anything,
+// but only real music drives the face — a 3-hour audiobook chapter changing
+// is not an "ooh, new track" moment.
+bool mediaIsMusic = false;
 
 class EvtCB : public NimBLECharacteristicCallbacks {
   void onSubscribe(NimBLECharacteristic* c, NimBLEConnInfo& info,
@@ -620,6 +684,324 @@ void releaseAll() {
   if (pCcReport) { pCcReport->setValue(rel2, 2); pCcReport->notify(); }
 }
 
+#if PUCK_MOUSE_HID
+// Wheel-only mouse report: buttons 0, no X/Y movement.
+void sendWheel(int8_t clicks) {
+  if (!bleConnected || !pMsReport) return;
+  uint8_t report[4] = {0, 0, 0, (uint8_t)clicks};
+  pMsReport->setValue(report, 4);
+  pMsReport->notify();
+  delay(8);
+  uint8_t rel[4] = {};
+  pMsReport->setValue(rel, 4);
+  pMsReport->notify();
+}
+#endif
+
+// ════════════════════════════════════════════════
+//  ENCODER PUCK — ESP-NOW receiver
+//  The puck is a wireless AS5600 knob + OLED. It sends rotation and button
+//  gestures here; this file turns them into BLE HID for the active host.
+//  Protocol and wiring: docs/PUCK_PROTOCOL.md
+//
+//  The recv callback runs on the WiFi task and must never touch the TFT or
+//  call NimBLE — same rule as the host-link GATT mailbox. It only sets
+//  volatile state; puckTick() drains it from the loop, which owns both.
+// ════════════════════════════════════════════════
+
+// ── KEEP IN SYNC with firmware/v5/puck_encoder/puck_encoder.ino ──
+// v2 added the volume byte and moved mode ownership to the pad.
+// v3 added the sensitivity bytes and PK_OTA, so the pad owns dial feel too.
+// v3 is NOT wire-compatible with v2 — the struct grew. Flash both ends.
+#define PUCK_PROTO_VER 3
+
+#define PK_HELLO  0x01   // puck -> pad
+#define PK_INPUT  0x02   // puck -> pad
+#define PK_STATE  0x03   // pad  -> puck
+#define PK_OTA    0x04   // pad  -> puck, drop ESP-NOW and raise the OTA SoftAP
+
+#define PM_VOLUME 0
+#define PM_SCROLL 1
+#define PM_ZOOM   2
+#define PM_COUNT  3
+
+#define BTN_NONE   0
+#define BTN_SHORT  1
+#define BTN_DOUBLE 2
+#define BTN_LONG   3
+
+#define PF_BLE_UP     0x01
+#define PF_SCROLL_OK  0x02
+#define PF_DISABLED   0x04
+#define PF_VOL_KNOWN  0x08   // vol byte is real (companion app is feeding us)
+#define PF_VOL_MUTED  0x10
+
+#define PUCK_VOL_UNKNOWN 0xFF
+
+struct PuckMsg {
+  uint8_t ver;
+  uint8_t type;
+  uint8_t mode;    // puck->pad: ignored. pad->puck: authoritative mode.
+  int8_t  ticks;
+  uint8_t btn;
+  uint8_t flags;
+  uint8_t vol;     // pad->puck: 0-100, or PUCK_VOL_UNKNOWN
+  uint8_t speed;   // v3, pad->puck: detents per revolution, PUCK_SPEED_MIN..MAX
+  uint8_t accel;   // v3, pad->puck: acceleration cap, 1 = off
+};
+
+// Dial feel. Expressed as detents per revolution because that is the number a
+// human can reason about — the AS5600's 4096-count resolution stays the puck's
+// business. Windows moves volume 2% per CONSUMER_VOL_UP, so 50 ticks is a full
+// 0-100% sweep, which makes SPEED 50 "one turn, one sweep".
+#define PUCK_SPEED_MIN   8             // very slow — 8 clicks per full turn
+#define PUCK_SPEED_MAX   128           // very fast — a click every 2.8 degrees
+#define PUCK_SPEED_DEF   50
+#define PUCK_SPEED_STEP  2
+#define PUCK_ACCEL_MIN   1             // 1 = acceleration off
+#define PUCK_ACCEL_MAX   8
+#define PUCK_ACCEL_DEF   4
+// ── end synced block ──
+
+#define PUCK_WIFI_CHANNEL 1
+#define PUCK_TICK_CAP     24   // most detents applied from one packet
+
+bool puckEnabled = false;      // NVS "puck" — off unless the user turns it on
+bool puckRunning = false;      // ESP-NOW actually up
+bool puckPeerKnown = false;
+uint8_t puckMac[6] = {};
+
+// The pad owns the dial mode, so a pad key and the puck's (optional) button
+// can both drive it without two sources of truth fighting. The puck renders
+// whatever arrives in PK_STATE.
+uint8_t puckMode = PM_VOLUME;
+
+// Dial feel, owned here and pushed down in every PK_STATE so the puck can be
+// retuned from Settings without a reflash. NVS keys "pspd" / "pacc".
+uint8_t puckSpeed = PUCK_SPEED_DEF;
+uint8_t puckAccel = PUCK_ACCEL_DEF;
+
+// Host volume, pushed by the companion app (HCMD_VOLUME). Relayed to the puck
+// so its screen can show a real level — BLE HID volume is relative, so this is
+// the only way either device can know the actual number.
+uint8_t hostVolume  = PUCK_VOL_UNKNOWN;
+bool    hostVolMuted = false;
+
+// Callback → loop mailbox
+volatile int16_t  puckPendingTicks = 0;
+volatile uint8_t  puckPendingBtn   = BTN_NONE;
+volatile bool     puckPeerPending  = false;   // src_addr captured, needs registering
+volatile bool     puckReplyDue     = false;
+volatile unsigned long puckLastSeenMs = 0;
+uint8_t puckPendingMac[6] = {};
+
+// This block sits above the UI/state globals it uses. Arduino hoists function
+// prototypes but not variables, so these two are declared, not defined, here.
+void showToast(const char* msg, uint16_t color, unsigned long ms);
+extern unsigned long lastActivityMs;
+
+static uint8_t puckFlags() {
+  uint8_t f = 0;
+  if (bleConnected) f |= PF_BLE_UP;
+#if PUCK_MOUSE_HID
+  f |= PF_SCROLL_OK;
+#endif
+  if (!puckEnabled) f |= PF_DISABLED;
+  if (hostVolume != PUCK_VOL_UNKNOWN) f |= PF_VOL_KNOWN;
+  if (hostVolMuted) f |= PF_VOL_MUTED;
+  return f;
+}
+
+// Advance the dial mode. Driven by a pad key (A_PUCK_MODE) or by the puck's
+// button, which only *requests* a cycle. Skips SCROLL when there is no mouse
+// report, so the dial can never land in a mode that silently does nothing.
+void puckCycleMode() {
+  for (uint8_t i = 0; i < PM_COUNT; i++) {
+    uint8_t cand = (puckMode + 1 + i) % PM_COUNT;
+#if !PUCK_MOUSE_HID
+    if (cand == PM_SCROLL) continue;
+#endif
+    puckMode = cand;
+    return;
+  }
+}
+
+const char* puckModeName(uint8_t m) {
+  return (m == PM_VOLUME) ? "VOLUME" : (m == PM_SCROLL) ? "SCROLL" : "ZOOM";
+}
+
+// Reply so the puck's OLED can show link state. Called from the loop, never
+// from the recv callback — esp_now_send and esp_now_add_peer both take the
+// ESP-NOW internal lock, and taking it from inside the WiFi task's own
+// callback is how you deadlock the stack.
+static void puckReplyState() {
+  if (!puckPeerKnown) return;
+  PuckMsg r;
+  r.ver   = PUCK_PROTO_VER;
+  r.type  = PK_STATE;
+  r.mode  = puckMode;
+  r.ticks = 0;
+  r.btn   = BTN_NONE;
+  r.flags = puckFlags();
+  r.vol   = hostVolume;
+  r.speed = puckSpeed;
+  r.accel = puckAccel;
+  esp_now_send(puckMac, (uint8_t*)&r, sizeof(r));
+}
+
+// Ask the puck to drop ESP-NOW and raise its OTA access point. Fire-and-forget:
+// the puck tears the radio down on receipt, so there is no ack to wait for and
+// no way back except the reboot after flashing. Sent three times because a lost
+// packet here is invisible — the user just sees no AP and no error.
+static void puckSendOta() {
+  if (!puckPeerKnown) return;
+  PuckMsg r;
+  r.ver   = PUCK_PROTO_VER;
+  r.type  = PK_OTA;
+  r.mode  = puckMode;
+  r.ticks = 0;
+  r.btn   = BTN_NONE;
+  r.flags = puckFlags();
+  r.vol   = hostVolume;
+  r.speed = puckSpeed;
+  r.accel = puckAccel;
+  for (int i = 0; i < 3; i++) {
+    esp_now_send(puckMac, (uint8_t*)&r, sizeof(r));
+    delay(30);
+  }
+}
+
+// Runs on the WiFi task. Sets volatile state and nothing else.
+void onPuckRecv(const esp_now_recv_info_t* info, const uint8_t* data, int len) {
+  if (len != (int)sizeof(PuckMsg)) return;
+  const PuckMsg* m = (const PuckMsg*)data;
+  if (m->ver != PUCK_PROTO_VER) return;
+
+  // Learn the puck's address on first contact; the loop registers it as a
+  // peer, so swapping or reflashing the puck needs no change on this side.
+  if (!puckPeerKnown && !puckPeerPending) {
+    memcpy(puckPendingMac, info->src_addr, 6);
+    puckPeerPending = true;
+  }
+
+  puckLastSeenMs = millis();
+  // m->mode is deliberately ignored: the pad is the authority now, so a stale
+  // mode from the puck can never overwrite one the user just set from a key.
+
+  if (m->type == PK_INPUT) {
+    // Accumulate — a burst between two loop passes must not be lost
+    int32_t sum = (int32_t)puckPendingTicks + m->ticks;
+    puckPendingTicks = (int16_t)constrain(sum, -1000, 1000);
+    if (m->btn != BTN_NONE) puckPendingBtn = m->btn;
+  }
+
+  puckReplyDue = true;
+}
+
+// Config Mode owns the radio exclusively — it calls stopPuck() on entry, so
+// there is deliberately no configMode guard here.
+void setupPuck() {
+  if (puckRunning) return;
+  WiFi.mode(WIFI_STA);
+  esp_wifi_set_channel(PUCK_WIFI_CHANNEL, WIFI_SECOND_CHAN_NONE);
+  if (esp_now_init() != ESP_OK) {
+    Serial.println("[PUCK] esp_now_init failed");
+    WiFi.mode(WIFI_OFF);
+    return;
+  }
+  esp_now_register_recv_cb(onPuckRecv);
+  puckRunning = true;
+  Serial.print("[PUCK] listening, this pad's STA MAC: ");
+  Serial.println(WiFi.macAddress());
+}
+
+void stopPuck() {
+  if (!puckRunning) return;
+  esp_now_unregister_recv_cb();
+  esp_now_deinit();
+  WiFi.mode(WIFI_OFF);
+  puckRunning   = false;
+  puckPeerKnown = false;
+  puckPendingTicks = 0;
+  puckPendingBtn   = BTN_NONE;
+  Serial.println("[PUCK] stopped");
+}
+
+// Drained from loop() — owns the display and may call NimBLE.
+void puckTick() {
+  if (!puckRunning) return;
+
+  // Register a newly-seen puck (deferred out of the recv callback)
+  if (puckPeerPending) {
+    puckPeerPending = false;
+    memcpy(puckMac, puckPendingMac, 6);
+    esp_now_peer_info_t peer;
+    memset(&peer, 0, sizeof(peer));
+    memcpy(peer.peer_addr, puckMac, 6);
+    peer.channel = PUCK_WIFI_CHANNEL;
+    peer.encrypt = false;
+    if (esp_now_add_peer(&peer) == ESP_OK) {
+      puckPeerKnown = true;
+      showToast("PUCK LINKED", C_GREEN, 900);
+    }
+  }
+
+  if (puckReplyDue) {
+    puckReplyDue = false;
+    puckReplyState();
+  }
+
+  uint8_t btn = puckPendingBtn;
+  if (btn != BTN_NONE) {
+    puckPendingBtn = BTN_NONE;
+    if (bleConnected) {
+      switch (btn) {
+        case BTN_SHORT:  sendConsumer(CONSUMER_PLAY_PAUSE); break;
+        case BTN_DOUBLE: sendConsumer(CONSUMER_NEXT);       break;
+        case BTN_LONG:   break;   // handled below — works with BLE down too
+      }
+    }
+    // The puck's button only *requests* a cycle; the pad performs it and the
+    // new mode goes back out in the next PK_STATE.
+    // No toast: the mode belongs on the puck's own OLED. Showing it on the
+    // pad too would interrupt whatever screen the user is actually looking at.
+    if (btn == BTN_LONG) {
+      puckCycleMode();
+      puckReplyState();
+    }
+  }
+
+  int16_t ticks = puckPendingTicks;
+  if (ticks == 0) return;
+  puckPendingTicks = 0;
+  if (!bleConnected) return;               // nothing to send them to
+
+  int dir = (ticks > 0) ? 1 : -1;
+  int n   = min((int)abs(ticks), PUCK_TICK_CAP);
+
+  switch (puckMode) {
+    case PM_VOLUME:
+      for (int i = 0; i < n; i++)
+        sendConsumer(dir > 0 ? CONSUMER_VOL_UP : CONSUMER_VOL_DOWN);
+      break;
+
+    case PM_ZOOM:
+      // Plain keyboard — no descriptor change needed for this one
+      for (int i = 0; i < n; i++)
+        sendKey(MOD_LCTRL, dir > 0 ? KEY_EQUAL : KEY_MINUS);
+      break;
+
+    case PM_SCROLL:
+#if PUCK_MOUSE_HID
+      // One report carries the whole burst; the wheel field is signed 8-bit
+      sendWheel((int8_t)constrain(dir * n, -127, 127));
+#endif
+      break;                                // silently ignored when compiled out
+  }
+
+  lastActivityMs = millis();                // puck input counts as activity
+}
+
 // ════════════════════════════════════════════════
 //  ACTION IDS
 // ════════════════════════════════════════════════
@@ -653,6 +1035,7 @@ void releaseAll() {
 #define A_REPLACE    129
 #define A_NEWFILE    130
 #define A_OPENFILE   131
+#define A_PUCK_MODE  132   // cycle the encoder puck's dial mode
 #define A_OS_FIT     140
 #define A_OS_FRONT   141
 #define A_OS_TOP     142
@@ -724,6 +1107,7 @@ const Action ACTION_LIB[] = {
   {"Paste",A_PASTE},{"Cut",A_CUT},{"Sel All",A_SELALL},
   {"CloseWin",A_CLOSE},{"Find",A_FIND},{"Replace",A_REPLACE},
   {"New File",A_NEWFILE},{"OpenFile",A_OPENFILE},
+  {"PuckMode",A_PUCK_MODE},
   {"OS: Fit",A_OS_FIT},{"OS:Front",A_OS_FRONT},{"OS: Top",A_OS_TOP},
   {"OS:Right",A_OS_RIGHT},{"OS: Iso",A_OS_ISO},{"OS: ZFit",A_OS_ZOOM_FIT},
   {"OS:Extrd",A_OS_EXTRUDE},{"OS:Sktch",A_OS_SKETCH},
@@ -812,7 +1196,10 @@ enum Screen {
   SCR_MAIN, SCR_SYSMENU, SCR_PRESET, SCR_SETTINGS,
   SCR_EDIT_BRIGHT, SCR_EDIT_SLEEP, SCR_DEVICES,
   SCR_BUILD_PRESET, SCR_BUILD_KEYS, SCR_BUILD_ACTION,
-  SCR_FACE
+  SCR_FACE,
+  // Puck lives on its own page: the Settings grid is full, and the dial has
+  // enough knobs now (enable / speed / accel / OTA) to deserve one.
+  SCR_PUCK, SCR_EDIT_PSPEED, SCR_EDIT_PACCEL
 };
 Screen currentScreen = SCR_MAIN;
 
@@ -851,6 +1238,16 @@ TFT_eSprite sprEye = TFT_eSprite(&tft);   // 92×110 reusable eye canvas (face)
 #define EYE_SPR_W 92
 #define EYE_SPR_H 110
 
+// Mouth lives in the band between the eye sprites (which end at y=175) and
+// the now-playing strip (y=214). 36px tall keeps it clear of both, so the
+// three never overlap and no sprite can leave trails on another.
+TFT_eSprite sprMouth = TFT_eSprite(&tft);
+#define MOUTH_SPR_W 116           // wide enough to slide with a glance
+#define MOUTH_SPR_H 36
+#define MOUTH_CY    194           // sprite centre — spans y 176..212
+#define MOUTH_CURVE_PX 12         // max corner rise/fall at |curve| = 100
+#define MOUTH_OPEN_PX  18         // max gap at openPct = 100
+
 // Landscape cell grid: 4 cols × 3 rows below the 26px status bar
 static inline int cellX(int i){ return 1 + (i % 4) * 80; }
 static inline int cellY(int i){ return 28 + (i / 4) * 70; }
@@ -878,10 +1275,12 @@ static inline void beginDraw(int screenId) {
 void redraw();
 void drawMain(); void drawSysMenu(); void drawPresetPicker();
 void drawSettings(); void drawEditor(); void drawDevices();
+void drawPuck(); void drawPuckEditor();
 void drawBuildPreset(); void drawBuildKeys(); void drawBuildAction();
 void drawReconnectHUD(const char* keyName);
 void fireAction(int id);
 void faceEnter(); void faceWake(); void faceSleepClose();
+void puckLabelReset(); bool puckLinked();
 void updateFace(unsigned long now); void faceGifTick(unsigned long now);
 void faceSlotGlance(int slot); void faceKeyReact(int i);
 
@@ -909,6 +1308,12 @@ void loadState() {
   // Persona is its own key, so an old "fcfg" blob still loads unchanged
   facePersona = min((uint8_t)(NUM_PERSONAS - 1), (uint8_t)prefs.getUChar("fpers", 0));
   mediaShow   = prefs.getUChar("media", 1) ? 1 : 0;
+  // Off by default: a pad with no puck should never bring up the WiFi stack
+  puckEnabled = prefs.getBool("puck", false);
+  puckSpeed   = constrain((int)prefs.getUChar("pspd", PUCK_SPEED_DEF),
+                          PUCK_SPEED_MIN, PUCK_SPEED_MAX);
+  puckAccel   = constrain((int)prefs.getUChar("pacc", PUCK_ACCEL_DEF),
+                          PUCK_ACCEL_MIN, PUCK_ACCEL_MAX);
   clampFaceCfg();
 }
 
@@ -924,6 +1329,10 @@ void clampFaceCfg() {
   if (faceCfg.glanceMaxS < faceCfg.glanceMinS) faceCfg.glanceMaxS = faceCfg.glanceMinS;
   faceCfg.pairScalePct = constrain(faceCfg.pairScalePct, 100, 130);
   faceCfg.idleS = constrain(faceCfg.idleS, 3, 120);
+  // Keep the mouth inside its sprite — a wider one would be clipped, not scaled
+  faceCfg.mouthW     = constrain(faceCfg.mouthW, 20, MOUTH_SPR_W - 8);
+  faceCfg.mouthThick = constrain(faceCfg.mouthThick, 2, 12);
+  if (faceCfg.mouthOn > 1) faceCfg.mouthOn = 1;
 }
 
 void saveSettings() {
@@ -935,6 +1344,9 @@ void saveSettings() {
   prefs.putUChar("fstyle", faceStyle);
   prefs.putUChar("fpers", facePersona);
   prefs.putUChar("media", mediaShow);
+  prefs.putBool("puck", puckEnabled);
+  prefs.putUChar("pspd", puckSpeed);
+  prefs.putUChar("pacc", puckAccel);
   prefs.putString("fgif", faceGif);
 }
 
@@ -1139,8 +1551,96 @@ void drawSettings() {
   drawCell(7, "PERSONA", PERSONAS[facePersona].name, C_PINK, false);
   drawCellEmpty(8);                        // K9 = FN — taps as SAVE, keep clear
   drawCell(9, "MEDIA", mediaShow ? "ON" : "OFF", C_PINK, false);
-  drawCellEmpty(10);
+  // Shows LINKED once the puck has actually been heard from, so the cell
+  // doubles as the diagnostic for "is the knob talking to me"
+  const char* pv = !puckEnabled ? "OFF"
+                 : (puckRunning && puckPeerKnown && (millis() - puckLastSeenMs < 8000))
+                   ? "LINKED" : "ON";
+  drawCell(10, "PUCK", pv, C_LTBLUE, false);
   drawCell(11, "SAVE", "+ exit", C_WHITE, false);
+}
+
+// True once the puck has actually been heard from recently — the same test the
+// Settings cell uses, and the gate for the mode label on the face screen.
+bool puckLinked() {
+  return puckEnabled && puckRunning && puckPeerKnown &&
+         (millis() - puckLastSeenMs < 8000);
+}
+
+void drawPuck() {
+  beginDraw(SCR_PUCK);
+  drawStatusBar("PUCK", C_LTBLUE);
+  char v[14];
+
+  drawCell(0, "ENABLE", puckEnabled ? "ON" : "OFF",
+           puckEnabled ? C_GREEN : C_DIM, false);
+
+  drawCell(1, "LINK", puckLinked() ? "LINKED" : (puckEnabled ? "WAITING" : "OFF"),
+           puckLinked() ? C_GREEN : C_AMBER, false);
+
+  drawCell(2, "MODE", puckModeName(puckMode), C_PINK, false);
+
+  // Shown as clicks per full turn — the number that actually describes the
+  // feel. Higher = finer steps = more sensitive.
+  snprintf(v, sizeof(v), "%d/turn", puckSpeed);
+  drawCell(4, "SPEED", v, C_CYAN, false);
+
+  if (puckAccel <= 1) snprintf(v, sizeof(v), "OFF");
+  else                snprintf(v, sizeof(v), "%dx max", puckAccel);
+  drawCell(5, "ACCEL", v, C_AMBER, false);
+
+  drawCell(6, "OTA", "flash puck", C_MAGENTA, false);
+
+  drawCellEmpty(8);                        // K9 = FN — taps as BACK, keep clear
+  drawCell(11, "BACK", nullptr, C_WHITE, false);
+}
+
+// Shared slider editor for the two dial numbers, modelled on drawEditor().
+void drawPuckEditor() {
+  bool isSpeed = (currentScreen == SCR_EDIT_PSPEED);
+  beginDraw(currentScreen);
+  drawStatusBar(isSpeed ? "DIAL SPEED" : "DIAL ACCEL", isSpeed ? C_CYAN : C_AMBER);
+
+  char v[14];
+  if (isSpeed)               snprintf(v, sizeof(v), "%d", puckSpeed);
+  else if (puckAccel <= 1)   snprintf(v, sizeof(v), "OFF");
+  else                       snprintf(v, sizeof(v), "%dx", puckAccel);
+
+  tft.fillRect(0, 60, 320, 54, C_BG);
+  tft.setTextSize(4);
+  tft.setTextColor(C_WHITE, C_BG);
+  int w = strlen(v) * 24;
+  tft.setCursor((320 - w) / 2, 64);
+  tft.print(v);
+
+  int maxV = isSpeed ? PUCK_SPEED_MAX : PUCK_ACCEL_MAX;
+  int minV = isSpeed ? PUCK_SPEED_MIN : PUCK_ACCEL_MIN;
+  int curV = isSpeed ? puckSpeed : puckAccel;
+  tft.drawRoundRect(40, 118, 240, 14, 5, C_BORDER);
+  int bw = ((curV - minV) * 236) / (maxV - minV);
+  if (bw > 0) tft.fillRoundRect(42, 120, bw, 10, 4, isSpeed ? C_CYAN : C_AMBER);
+
+  // One line of plain English, because "50/turn" alone doesn't tell you what
+  // it will feel like. Volume is the mode this actually matters in.
+  tft.fillRect(0, 138, 320, 26, C_BG);
+  tft.setTextSize(1);
+  tft.setTextColor(C_DIM, C_BG);
+  char hint[46];
+  if (isSpeed) {
+    int pct = (puckSpeed * 2 > 200) ? 200 : puckSpeed * 2;
+    snprintf(hint, sizeof(hint), "one full turn = %d%% volume", pct);
+  } else if (puckAccel <= 1) {
+    snprintf(hint, sizeof(hint), "steady - a fast spin moves no further");
+  } else {
+    snprintf(hint, sizeof(hint), "a fast spin counts up to %dx per click", puckAccel);
+  }
+  tft.setCursor((320 - (int)strlen(hint) * 6) / 2, 144);
+  tft.print(hint);
+
+  tft.setTextColor(C_DIM, C_BG);
+  tft.setCursor(48, 172);  tft.print("K5 = -");
+  tft.setCursor(232, 172); tft.print("K8 = +");
+  tft.setCursor(120, 196); tft.print("FN / K12 = back");
 }
 
 void drawEditor() {
@@ -1293,6 +1793,9 @@ void redraw() {
     case SCR_BUILD_KEYS:   drawBuildKeys();    break;
     case SCR_BUILD_ACTION: drawBuildAction();  break;
     case SCR_FACE:         faceEnter();        break;
+    case SCR_PUCK:         drawPuck();         break;
+    case SCR_EDIT_PSPEED:
+    case SCR_EDIT_PACCEL:  drawPuckEditor();   break;
   }
 }
 
@@ -1313,6 +1816,41 @@ void hostNotifyKey(uint8_t keyIdx) {
 void hostNotifyPreset() {
   uint8_t ev[3] = { HEV_PRESET, 1, (uint8_t)activePreset };
   hostNotify(ev, sizeof(ev));
+}
+
+// One page of the builtin action library, so the companion's picker is built
+// from this table rather than a duplicated C# copy that would silently drift
+// every time an action is added here.
+// Entry: [id lo][id hi][label 9, null-padded]
+void hostNotifyActions(uint8_t page) {
+  const uint8_t total = (uint8_t)((ACTION_LIB_SIZE + ACTIONS_PER_PAGE - 1) / ACTIONS_PER_PAGE);
+
+  if (page >= total) {                       // out of range — terminate politely
+    uint8_t ev[5] = { HEV_ACTIONS, 3, page, total, 0 };
+    hostNotify(ev, sizeof(ev));
+    return;
+  }
+
+  const int start = (int)page * ACTIONS_PER_PAGE;
+  const int count = min((int)ACTIONS_PER_PAGE, ACTION_LIB_SIZE - start);
+
+  uint8_t ev[5 + ACTIONS_PER_PAGE * 11];
+  ev[0] = HEV_ACTIONS;
+  ev[1] = (uint8_t)(3 + count * 11);
+  ev[2] = page;
+  ev[3] = total;
+  ev[4] = (uint8_t)count;
+
+  uint8_t* w = ev + 5;
+  for (int i = 0; i < count; i++) {
+    const int id = ACTION_LIB[start + i].id;
+    *w++ = (uint8_t)(id & 0xFF);
+    *w++ = (uint8_t)((id >> 8) & 0xFF);
+    memset(w, 0, 9);
+    strncpy((char*)w, ACTION_LIB[start + i].label, 8);
+    w += 9;
+  }
+  hostNotify(ev, 5 + count * 11);
 }
 
 // Drain queued companion commands. Runs every loop pass; the queue is almost
@@ -1419,6 +1957,7 @@ void hostLinkTick() {
         if (n >= 5) {
           mediaPlaying = (p[0] & 0x01) != 0;
           bool fav     = (p[0] & 0x02) != 0;
+          mediaIsMusic = (p[0] & 0x04) != 0;
           mediaPosS = (uint16_t)(p[1] | (p[2] << 8));
           mediaDurS = (uint16_t)(p[3] | (p[4] << 8));
           char t[sizeof(mediaTitle)];
@@ -1432,6 +1971,21 @@ void hostLinkTick() {
           mediaRxMs = millis();
         }
         break;
+
+      case HCMD_ACTIONS:                   // [page]
+        if (n >= 1) hostNotifyActions(p[0]);
+        break;
+
+      case HCMD_VOLUME:                    // [level][flags]
+        if (n >= 1) {
+          uint8_t v = p[0];
+          hostVolume   = (v == PUCK_VOL_UNKNOWN) ? PUCK_VOL_UNKNOWN : min(v, (uint8_t)100);
+          hostVolMuted = (n >= 2) && (p[1] & 0x01);
+          // Push straight down so the dial's readout tracks the Windows slider
+          // even when the change came from somewhere else entirely.
+          if (puckRunning) puckReplyState();
+        }
+        break;
     }
     hostCmdTail = (uint8_t)((hostCmdTail + 1) % HOSTCMD_QMAX);
   }
@@ -1442,6 +1996,51 @@ static void drawHeart(int cx, int cy, uint16_t c) {
   sprBar.fillCircle(cx - 2, cy - 1, 3, c);
   sprBar.fillCircle(cx + 2, cy - 1, 3, c);
   sprBar.fillTriangle(cx - 5, cy, cx + 5, cy, cx, cy + 6, c);
+}
+
+// ── Puck mode label above the face ──────────────
+// The puck has no screen any more (the OLED was dropped for a dial-only build),
+// so the pad is the only place the dial mode can be read. Sits in the strip
+// above the eyes — they start at y=65, and the mouth and now-playing strip
+// already own everything below them.
+//
+// Drawn direct rather than via a sprite: it is a dozen characters, repainted
+// only when the text actually changes, so it costs nothing next to the eyes.
+#define PUCK_LBL_Y 34
+#define PUCK_LBL_H 16
+
+// File scope, not a function static, so faceEnter() can invalidate it — a full
+// face repaint wipes the label, and without this the cache would still believe
+// it was on screen and never redraw it.
+char puckLblShown[16] = "";
+void puckLabelReset() { puckLblShown[0] = '\0'; }
+
+void puckLabelTick(unsigned long now) {
+  char* shown = puckLblShown;
+  char want[16] = "";
+
+  // Only while linked. An unlinked puck is the Settings screen's problem —
+  // putting "NO PUCK" over the face would nag on every idle screen.
+  if (puckLinked()) snprintf(want, sizeof(want), "%s", puckModeName(puckMode));
+
+  if (strcmp(want, shown) == 0) return;
+  strncpy(shown, want, sizeof(puckLblShown) - 1);
+  shown[sizeof(puckLblShown) - 1] = '\0';
+
+  tft.fillRect(0, PUCK_LBL_Y, 320, PUCK_LBL_H, C_BG);
+  if (!want[0]) return;
+
+  // Dim by design: this is a status line the eyes sit under, not a headline.
+  tft.setTextSize(1);
+  tft.setTextColor(C_DIM, C_BG);
+  int w = (int)strlen(want) * 6;
+  tft.setCursor((320 - w) / 2, PUCK_LBL_Y + 4);
+  tft.print(want);
+
+  // A short rule either side, so it reads as a label rather than stray text
+  int x0 = (320 - w) / 2;
+  tft.drawFastHLine(x0 - 34, PUCK_LBL_Y + 7, 26, C_SURF2);
+  tft.drawFastHLine(x0 + w + 8, PUCK_LBL_Y + 7, 26, C_SURF2);
 }
 
 // ── Now-playing strip under the face ────────────
@@ -1494,7 +2093,21 @@ void mediaStripTick(unsigned long now) {
 //  FIRE ACTION  (OS-layout aware)
 // ════════════════════════════════════════════════
 void fireAction(int id) {
-  if (id == A_NONE || !bleConnected) return;
+  if (id == A_NONE) return;
+
+  // Puck mode is a pad-local setting, not a HID keystroke — handle it before
+  // the BLE guard so the dial can be re-moded with no host connected.
+  if (id == A_PUCK_MODE) {
+    // The one case worth a toast: with the puck disabled this key would
+    // otherwise do nothing at all and read as broken. The mode itself is
+    // shown on the puck's OLED, not here.
+    if (!puckEnabled) { showToast("PUCK IS OFF", C_AMBER, 900); return; }
+    puckCycleMode();
+    puckReplyState();               // push it down immediately
+    return;
+  }
+
+  if (!bleConnected) return;
   switch (id) {
     // ── Media / Consumer (same on all OS) ──────
     case A_PLAY:      sendConsumer(CONSUMER_PLAY_PAUSE); break;
@@ -1819,11 +2432,66 @@ void onKeyTap(int i) {
       else if (i == 6) { faceStyle = (faceStyle + 1) % 2; drawSettings(); }
       else if (i == 7) { facePersona = (facePersona + 1) % NUM_PERSONAS; drawSettings(); }
       else if (i == 9) { mediaShow = !mediaShow; drawSettings(); }
+      else if (i == 10) { currentScreen = SCR_PUCK; drawPuck(); }
       else if (i == 11 || i == KEY_FN) {
         saveSettings();
         currentScreen = SCR_MAIN; drawMain();
         showToast("SAVED", C_GREEN, 800);
       }
+      break;
+
+    case SCR_PUCK:
+      if (i == 0) {
+        // Applies immediately — the WiFi stack comes up or goes away now, so
+        // LINKED can appear without saving and rebooting first
+        puckEnabled = !puckEnabled;
+        if (puckEnabled) setupPuck(); else stopPuck();
+        drawPuck();
+      }
+      else if (i == 1) { drawPuck(); }            // refresh the link readout
+      else if (i == 2) { puckCycleMode(); puckReplyState(); drawPuck(); }
+      else if (i == 4) { currentScreen = SCR_EDIT_PSPEED; drawPuckEditor(); }
+      else if (i == 5) { currentScreen = SCR_EDIT_PACCEL; drawPuckEditor(); }
+      else if (i == 6) {
+        // One-way door: the puck drops ESP-NOW to raise its AP and only comes
+        // back on reboot, so refuse when there's nothing listening rather than
+        // leave the user waiting for an AP that will never appear.
+        if (!puckLinked()) { showToast("PUCK NOT LINKED", C_AMBER, 1200); }
+        else {
+          saveSettings();
+          puckSendOta();
+          showToast("PUCK OTA", C_MAGENTA, 1500);
+          currentScreen = SCR_PUCK; drawPuck();
+        }
+      }
+      else if (i == 11 || i == KEY_FN) {
+        saveSettings();
+        currentScreen = SCR_SETTINGS; drawSettings();
+      }
+      break;
+
+    case SCR_EDIT_PSPEED:
+      if      (i == 4) puckSpeed = max(PUCK_SPEED_MIN, puckSpeed - PUCK_SPEED_STEP);
+      else if (i == 7) puckSpeed = min(PUCK_SPEED_MAX, puckSpeed + PUCK_SPEED_STEP);
+      else if (i == 11 || i == KEY_FN) {
+        saveSettings();
+        currentScreen = SCR_PUCK; drawPuck(); break;
+      }
+      else break;
+      puckReplyState();          // push live so the dial can be felt while tuning
+      drawPuckEditor();
+      break;
+
+    case SCR_EDIT_PACCEL:
+      if      (i == 4) puckAccel = max(PUCK_ACCEL_MIN, puckAccel - 1);
+      else if (i == 7) puckAccel = min(PUCK_ACCEL_MAX, puckAccel + 1);
+      else if (i == 11 || i == KEY_FN) {
+        saveSettings();
+        currentScreen = SCR_PUCK; drawPuck(); break;
+      }
+      else break;
+      puckReplyState();
+      drawPuckEditor();
       break;
 
     case SCR_EDIT_BRIGHT:
@@ -1930,6 +2598,9 @@ unsigned long faceFrameMs = 0;
 float lidTop = 0, lidTopT = 0;          // 0..1 top lid coverage
 float lidAngle = 0, lidAngleT = 0;      // -1..1 (+ sad / - angry)
 float lidBot = 0, lidBotT = 0;          // 0..1 happy crescent
+float mouthWid = 1,  mouthWidT = 1;     // width scale, 1 = faceCfg.mouthW
+float mouthCrv = 0,  mouthCrvT = 0;     // -1 frown .. +1 smile
+float mouthOpn = 0,  mouthOpnT = 0;     // 0 closed line .. 1 fully open
 float eyeScaleW = 1, eyeScaleWT = 1;    // size multipliers on top of faceCfg
 float eyeScaleH = 1, eyeScaleHT = 1;
 uint8_t eyeWinkMask = 0;                // bit0 left eye shut, bit1 right
@@ -1945,6 +2616,20 @@ uint8_t  moodKeyCount = 0;        // presses since the last 5s mood sample
 float    typeRateEma = 0;
 
 // Emote player — one transient animation at a time, always time-boxed
+// Global emote playback stretch. 100 = keyframe tables exactly as written;
+// higher = slower and longer. One knob rather than rewriting every table, so
+// the tMs columns stay readable as relative beats.
+#define EMOTE_TIME_PCT 165
+
+// Global stretch × the persona's own. Clamped so a bad persona edit can't
+// stall an emote forever — they are time-boxed for a reason.
+static inline uint16_t emoteTimePct(const Personality& P) {
+  uint32_t v = ((uint32_t)EMOTE_TIME_PCT * (P.timePct ? P.timePct : 100)) / 100UL;
+  if (v < 50)  v = 50;
+  if (v > 400) v = 400;
+  return (uint16_t)v;
+}
+
 const Emote*  emoteCur = nullptr;
 unsigned long emoteStart = 0;
 int8_t        emoteGx = 0, emoteGy = 0;   // direction supplied by the trigger
@@ -2017,12 +2702,51 @@ void drawEyeAt(int cx, int cy, float open, float wScale, bool isLeft) {
   sprEye.pushSprite(cx - EYE_SPR_W / 2, cy - EYE_SPR_H / 2);
 }
 
+// Mouth: a parabolic band. Corners rise for a smile, fall for a frown, and
+// the band thickens to open. Drawn column by column because a parabola gives
+// a far softer read than any combination of TFT_eSPI's arc primitives, and
+// at 76px wide that is 76 fillRects — trivial next to the eye sprites.
+void drawMouthAt(int cx, int cy) {
+  sprMouth.fillSprite(C_BG);
+
+  int w = (int)(faceCfg.mouthW * mouthWid);
+  w = constrain(w, 8, MOUTH_SPR_W - 4);
+  int th    = max(2, (int)faceCfg.mouthThick);
+  int curve = (int)(mouthCrv * MOUTH_CURVE_PX);
+  int openH = (int)(mouthOpn * MOUTH_OPEN_PX);
+
+  // Follow the glance so the face travels as one piece. Damped: a mouth moves
+  // less than the eyes, and the vertical band is only 36px so full follow
+  // would clip a wide-open mouth. This is also what makes the music bob read
+  // as the whole head nodding rather than the eyes sliding off the mouth.
+  int mgx = (int)(eyeGlanceX * 0.50f);
+  int mgy = (int)(eyeGlanceY * 0.30f);
+
+  int x0   = constrain((MOUTH_SPR_W - w) / 2 + mgx, 0, MOUTH_SPR_W - w);
+  int ymid = MOUTH_SPR_H / 2 + mgy;
+  uint16_t col = faceEyeColor();
+
+  for (int i = 0; i < w; i++) {
+    // t runs -1..1 across the mouth; t² is 0 at the centre and 1 at the
+    // corners, so the centre stays put and only the corners travel.
+    float t  = (w > 1) ? ((float)i / (w - 1)) * 2.0f - 1.0f : 0.0f;
+    int   dy = (int)(-curve * t * t);
+    int   h  = th + openH;
+    int   y  = ymid + dy - h / 2;
+    y = constrain(y, 0, MOUTH_SPR_H - h);
+    sprMouth.fillRect(x0 + i, y, 1, h, col);
+  }
+
+  sprMouth.pushSprite(cx - MOUTH_SPR_W / 2, cy - MOUTH_SPR_H / 2);
+}
+
 void drawFaceFrame(float open, float wScale) {
   // Eye *positions* stay fixed while scale changes: the two 92px sprites sit
   // shoulder to shoulder, so moving them would overlap and leave trails.
   int half = faceCfg.gap / 2 + faceCfg.eyeW / 2;
   drawEyeAt(160 - half, 120, open, wScale, true);
   drawEyeAt(160 + half, 120, open, wScale, false);
+  if (faceCfg.mouthOn) drawMouthAt(160, MOUTH_CY);
 }
 
 // Push a pose into the eased targets. Emotes, personas and the mood engine
@@ -2037,6 +2761,12 @@ void applyPose(const EyePose& p, float amp, bool withGlance = false) {
   lidBotT   = (p.lidBotPct / 100.0f) * amp;
   eyeScaleWT = 1.0f + ((p.wPct / 100.0f) - 1.0f) * amp;
   eyeScaleHT = 1.0f + ((p.hPct / 100.0f) - 1.0f) * amp;
+  // mouthWPct 0 means "unset" rather than "zero width", so old keyframe
+  // tables that predate the mouth still render a normal one.
+  uint8_t mw = p.mouthWPct ? p.mouthWPct : 100;
+  mouthWidT = 1.0f + ((mw / 100.0f) - 1.0f) * amp;
+  mouthCrvT = (p.mouthCurve / 100.0f) * amp;
+  mouthOpnT = (p.mouthOpenPct / 100.0f) * amp;
   if (withGlance) {
     eyeGlanceTX = p.gx * amp;
     eyeGlanceTY = p.gy * amp;
@@ -2047,48 +2777,53 @@ void applyPose(const EyePose& p, float amp, bool withGlance = false) {
 // Stepped keyframes: the frame loop's easing does the interpolation, so a
 // four-row table is enough to read as a fluid animation.
 //                          open lidT angle lidB   w    h  gx gy
+// The trailing three numbers are the mouth: width%, curve (− frown / + smile),
+// open%. They ease a little slower than the lids, so a keyframe that opens the
+// mouth and widens the eyes together still reads as one gesture.
+//                          open lidT angle lidB   w    h  gx gy  mW  mCrv mOpn
 const EmoteKey EK_BOOT[] = {
-  {   0, {   4, 90,   0,  0, 100, 100, 0, 0 }, 0 },
-  { 380, {  55, 30,   0,  0, 100, 100, 0, 0 }, 0 },
-  { 700, {  15, 70,   0,  0, 100, 100, 0, 0 }, 0 },
-  { 950, { 100,  0,   0,  0, 106, 106, 0,-2 }, 0 },
+  {   0, {   4, 90,   0,  0, 100, 100, 0, 0,  60,   0,  0 }, 0 },
+  { 380, {  55, 30,   0,  0, 100, 100, 0, 0,  80,  10,  0 }, 0 },
+  { 700, {  15, 70,   0,  0, 100, 100, 0, 0,  70,   0,  0 }, 0 },
+  { 950, { 100,  0,   0,  0, 106, 106, 0,-2, 106,  55, 15 }, 0 },
 };
 const EmoteKey EK_HAPPY[] = {
-  {   0, { 100,  0,   0, 25, 106, 106, 0,-6 }, 0 },
-  { 220, {  70,  0,   0, 55, 100, 100, 0, 2 }, 0 },
-  { 430, { 100,  0,   0, 25, 106, 106, 0,-5 }, 0 },
-  { 650, {  85,  0,   0, 45, 100, 100, 0, 0 }, 0 },
+  {   0, { 100,  0,   0, 25, 106, 106, 0,-6, 108,  70, 20 }, 0 },
+  { 220, {  70,  0,   0, 55, 100, 100, 0, 2, 112,  95, 34 }, 0 },
+  { 430, { 100,  0,   0, 25, 106, 106, 0,-5, 108,  75, 18 }, 0 },
+  { 650, {  85,  0,   0, 45, 100, 100, 0, 0, 105,  80,  8 }, 0 },
 };
 const EmoteKey EK_SAD[] = {
-  {   0, {  70, 20,  70,  0, 100,  96,-8, 4 }, 0 },
-  { 450, {  62, 28,  80,  0, 100,  94, 8, 5 }, 0 },
-  { 950, {  66, 24,  75,  0, 100,  95,-6, 5 }, 0 },
+  {   0, {  70, 20,  70,  0, 100,  96,-8, 4,  84, -70,  0 }, 0 },
+  { 450, {  62, 28,  80,  0, 100,  94, 8, 5,  80, -85,  0 }, 0 },
+  { 950, {  66, 24,  75,  0, 100,  95,-6, 5,  82, -78,  0 }, 0 },
 };
 const EmoteKey EK_WINK[] = {
-  {   0, { 100,  0,   0, 30, 100, 100, 0, 0 }, 2 },   // right eye shut
-  { 260, { 100,  0,   0, 20, 100, 100, 0, 0 }, 0 },
+  {   0, { 100,  0,   0, 30, 100, 100, 0, 0, 104,  85, 10 }, 2 },   // right eye shut
+  { 260, { 100,  0,   0, 20, 100, 100, 0, 0, 100,  55,  0 }, 0 },
 };
 const EmoteKey EK_EXCITED[] = {
-  {   0, { 100,  0, -10,  0, 108, 108,-4,-4 }, 0 },
-  { 160, { 100,  0,   0, 15, 108, 108, 4,-4 }, 0 },
-  { 320, { 100,  0, -10,  0, 108, 108,-4,-4 }, 0 },
-  { 480, { 100,  0,   0, 20, 104, 104, 0,-2 }, 0 },
+  {   0, { 100,  0, -10,  0, 108, 108,-4,-4, 100,  60, 45 }, 0 },
+  { 160, { 100,  0,   0, 15, 108, 108, 4,-4, 110,  85, 60 }, 0 },
+  { 320, { 100,  0, -10,  0, 108, 108,-4,-4, 100,  60, 45 }, 0 },
+  { 480, { 100,  0,   0, 20, 104, 104, 0,-2, 106,  75, 20 }, 0 },
 };
 const EmoteKey EK_GLANCE[] = {
-  {   0, {  62,  0,   0, 10, 100, 100, 0, 0 }, 0 },   // gx/gy from the trigger
-  { 190, { 100,  0,   0,  0, 100, 100, 0, 0 }, 0 },
+  {   0, {  62,  0,   0, 10, 100, 100, 0, 0,   0,   0,  0 }, 0 },   // gx/gy from the trigger
+  { 190, { 100,  0,   0,  0, 100, 100, 0, 0,   0,   0,  0 }, 0 },
 };
+// The mouth earns its keep here: a yawn without one never really read as a yawn.
 const EmoteKey EK_YAWN[] = {
-  {   0, {  90,  5,   0,  0, 100, 106, 0, 0 }, 0 },
-  { 260, { 100,  0,   0,  0, 104, 114, 0,-3 }, 0 },
-  { 620, {   6, 80,   0,  0,  96, 100, 0, 3 }, 0 },
-  { 980, {  85, 12,  15,  0, 100, 100, 0, 1 }, 0 },
+  {   0, {  90,  5,   0,  0, 100, 106, 0, 0,  90,   0, 20 }, 0 },
+  { 260, { 100,  0,   0,  0, 104, 114, 0,-3,  84, -20, 75 }, 0 },
+  { 620, {   6, 80,   0,  0,  96, 100, 0, 3,  78, -30,100 }, 0 },
+  { 980, {  85, 12,  15,  0, 100, 100, 0, 1,  92,   5, 15 }, 0 },
 };
 const EmoteKey EK_SQUINT[] = {              // thoughtful squint — narrows, holds
-  {   0, {  62, 22,   0, 26, 103,  96, 0, 0 }, 0 },
-  { 480, {  48, 32,   0, 36, 105,  92, 2, 1 }, 0 },
-  {1050, {  56, 26,   0, 30, 104,  94,-2, 0 }, 0 },
-  {1500, {  85,  8,   0, 10, 100, 100, 0, 0 }, 0 },
+  {   0, {  62, 22,   0, 26, 103,  96, 0, 0,  70, -15,  0 }, 0 },
+  { 480, {  48, 32,   0, 36, 105,  92, 2, 1,  62, -25,  0 }, 0 },
+  {1050, {  56, 26,   0, 30, 104,  94,-2, 0,  66, -18,  0 }, 0 },
+  {1500, {  85,  8,   0, 10, 100, 100, 0, 0,  96,  15,  0 }, 0 },
 };
 #define EM_DEF(tbl, dur) { tbl, sizeof(tbl)/sizeof(EmoteKey), dur }
 const Emote EM_BOOT    = EM_DEF(EK_BOOT,    1400);
@@ -2101,10 +2836,10 @@ const Emote EM_YAWN    = EM_DEF(EK_YAWN,    1300);
 const Emote EM_SQUINT  = EM_DEF(EK_SQUINT,  1900);
 // Loved a track: a big warm squint with the bottom crescent right up.
 const EmoteKey EK_LOVE[] = {
-  {   0, { 100,  0,   0, 20, 110, 110, 0,-4 }, 0 },
-  { 200, {  55,  0,   0, 62, 104, 100, 0, 3 }, 0 },
-  { 620, {  62,  0,   0, 55, 106, 102, 0, 2 }, 0 },
-  { 980, {  95,  0,   0, 22, 100, 100, 0, 0 }, 0 },
+  {   0, { 100,  0,   0, 20, 110, 110, 0,-4, 110,  70, 25 }, 0 },
+  { 200, {  55,  0,   0, 62, 104, 100, 0, 3, 118, 100, 40 }, 0 },
+  { 620, {  62,  0,   0, 55, 106, 102, 0, 2, 116,  95, 30 }, 0 },
+  { 980, {  95,  0,   0, 22, 100, 100, 0, 0, 106,  70,  8 }, 0 },
 };
 const Emote EM_LOVE = EM_DEF(EK_LOVE, 1300);
 
@@ -2139,10 +2874,16 @@ void faceSlotGlance(int slot) {           // called from switchToSlot
 void faceEnter() {
   const Personality& P = PERSONAS[facePersona];
   beginDraw(SCR_FACE);
+  puckLabelReset();                       // beginDraw may have wiped the label
   eyeOpen = 0.0f; eyeOpenTarget = 1.0f;   // eyes open on arrival
   eyeGlanceX = eyeGlanceY = eyeGlanceTX = eyeGlanceTY = 0;
   lidTop = lidTopT = lidAngle = lidAngleT = lidBot = lidBotT = 0;
   eyeScaleW = eyeScaleWT = eyeScaleH = eyeScaleHT = 1.0f;
+  // Mouth starts at the persona's resting curve rather than flat, so arriving
+  // on the face doesn't show a neutral line snapping into a smile.
+  mouthWid = mouthWidT = 1.0f;
+  mouthCrv = mouthCrvT = P.rest.mouthCurve / 100.0f;
+  mouthOpn = mouthOpnT = 0.0f;
   eyeWinkMask = 0;
   faceBlinking = false; faceDblBlink = false;
   unsigned long now = millis();
@@ -2270,13 +3011,17 @@ void updateFace(unsigned long now) {
   // always happens on the loop task.
   if (mediaJustFaved) { mediaJustFaved = false; mediaNewSong = false;
                         faceEmote(&EM_LOVE); }
+  // Only real music gets the "ooh, new track" reaction. A video or audiobook
+  // changing chapter would otherwise fire this every few minutes.
   if (mediaNewSong)   { mediaNewSong = false;
-                        if (mediaShow) faceEmote(&EM_EXCITED); }
+                        if (mediaShow && mediaIsMusic) faceEmote(&EM_EXCITED); }
 
   // Gentle bob while a track plays — the pad quietly vibing. Applied after
   // the branches (which rewrite the glance targets every frame) but before
-  // emotes, so any emote still wins outright.
-  if (mediaShow && mediaPlaying && !emoteCur && (now - mediaRxMs < 30000UL)) {
+  // emotes, so any emote still wins outright. Music only: bobbing along to a
+  // YouTube video reads as broken rather than charming.
+  if (mediaShow && mediaIsMusic && mediaPlaying && !emoteCur
+      && (now - mediaRxMs < 30000UL)) {
     float ph = (float)(now % 2400) / 2400.0f * 6.2832f;
     eyeGlanceTY += sinf(ph) * 2.0f;
     eyeGlanceTX += sinf(ph * 0.5f) * 1.2f;
@@ -2290,7 +3035,16 @@ void updateFace(unsigned long now) {
   } else if (emotePending && now >= emotePendingUntil) emotePending = nullptr;
 
   if (emoteCur) {
-    unsigned long t = now - emoteStart;
+    // Play the timeline back scaled. Dividing elapsed time by the scale
+    // stretches keyframe spacing *and* duration together — extending only
+    // durMs would just hold the last pose longer instead of slowing the
+    // animation. SLEEPY drags, PLAYFUL is brisk, via the persona's timePct.
+    // GLANCE is exempt: it fires on every keypress, so stretching it would
+    // make the face feel laggy under fast typing. Expressive emotes stretch;
+    // per-key reactions stay snappy.
+    unsigned long raw = now - emoteStart;
+    uint16_t      tp  = (emoteCur == &EM_GLANCE) ? 100 : emoteTimePct(P);
+    unsigned long t   = (raw * 100UL) / tp;
     if (t >= emoteCur->durMs) emoteCur = nullptr;   // always time-boxed
     else {
       const EmoteKey* k = &emoteCur->keys[0];
@@ -2343,6 +3097,11 @@ void updateFace(unsigned long now) {
   lidBot     += (lidBotT   - lidBot)   * 0.30f;
   eyeScaleW  += (eyeScaleWT - eyeScaleW) * 0.30f;
   eyeScaleH  += (eyeScaleHT - eyeScaleH) * 0.30f;
+  // Mouth eases a touch slower than the lids — a mouth that snaps reads as
+  // twitchy, while trailing the eyes slightly looks like one connected face.
+  mouthWid   += (mouthWidT - mouthWid) * 0.26f;
+  mouthCrv   += (mouthCrvT - mouthCrv) * 0.26f;
+  mouthOpn   += (mouthOpnT - mouthOpn) * 0.26f;
   drawFaceFrame(eyeOpen, wScale);
 }
 
@@ -2487,6 +3246,11 @@ void maybeEnterSleep() {
   ledcAttach(TFT_BL, 5000, 8);
   ledcWrite(TFT_BL, backlightBrightness);
   delay(50);
+
+  // Light sleep powers the WiFi radio down, so ESP-NOW was deaf the whole
+  // time and its peer table can't be trusted. Cycle it; the puck is
+  // re-learned from the first packet after this.
+  if (puckEnabled) { stopPuck(); setupPuck(); }
 
   // Light sleep dropped any BLE connection; if the stack didn't get an
   // onDisconnect (we weren't connected), restart advertising ourselves
@@ -2644,6 +3408,9 @@ void handleGetConfig() {
   e["glanceMinS"] = faceCfg.glanceMinS; e["glanceMaxS"] = faceCfg.glanceMaxS;
   e["pairScalePct"] = faceCfg.pairScalePct;
   e["idleS"] = faceCfg.idleS;
+  e["mouthOn"] = faceCfg.mouthOn;
+  e["mouthW"] = faceCfg.mouthW;
+  e["mouthThick"] = faceCfg.mouthThick;
   JsonArray pr = doc["presets"].to<JsonArray>();
   for (int p = 0; p < NUM_PRESETS; p++) {
     JsonObject po = pr.add<JsonObject>();
@@ -2698,6 +3465,9 @@ void handlePostConfig() {
       if (e["glanceMaxS"].is<int>())   faceCfg.glanceMaxS = e["glanceMaxS"];
       if (e["pairScalePct"].is<int>()) faceCfg.pairScalePct = e["pairScalePct"];
       if (e["idleS"].is<int>())        faceCfg.idleS = e["idleS"];
+      if (e["mouthOn"].is<int>())      faceCfg.mouthOn = e["mouthOn"];
+      if (e["mouthW"].is<int>())       faceCfg.mouthW = e["mouthW"];
+      if (e["mouthThick"].is<int>())   faceCfg.mouthThick = e["mouthThick"];
       saveFaceCfg();                   // clamps + persists
     }
   }
@@ -2958,6 +3728,9 @@ void handleRoot() { server.send_P(200, "text/html", CONFIG_HTML); }
 
 void enterConfigMode() {
   releaseAll();
+  // ESP-NOW holds the station interface; softAP() won't come up cleanly
+  // while it is running, so drop it before touching WiFi.mode below.
+  stopPuck();
   // Tear BLE all the way down — frees the radio + controller RAM for WiFi,
   // which the WROOM-32 needs (the two stacks don't coexist reliably)
   NimBLEDevice::stopAdvertising();
@@ -3038,6 +3811,7 @@ void setup() {
   sprBar.setColorDepth(16);  sprBar.createSprite(320, 26);
   sprCell.setColorDepth(16); sprCell.createSprite(CELL_W, CELL_H);
   sprEye.setColorDepth(16);  sprEye.createSprite(EYE_SPR_W, EYE_SPR_H);
+  sprMouth.setColorDepth(16); sprMouth.createSprite(MOUTH_SPR_W, MOUTH_SPR_H);
   gifDec.begin(GIF_PALETTE_RGB565_BE);
 
   // ── NimBLE init ──────────────────────────────
@@ -3063,6 +3837,9 @@ void setup() {
 
   pKbReport = pHID->getInputReport(1);
   pCcReport = pHID->getInputReport(2);
+#if PUCK_MOUSE_HID
+  pMsReport = pHID->getInputReport(3);
+#endif
 
   pHID->startServices();
 
@@ -3101,6 +3878,10 @@ void setup() {
   tft.setCursor(60, 145); tft.print("Hold FN (K9) 1s = system menu");
   delay(900);
 
+  // Brought up last, after BLE is settled — this is the one place the two
+  // radios start sharing the antenna. Off unless the user enabled it.
+  if (puckEnabled) setupPuck();
+
   lastActivityMs = millis();
   drawMain();
 }
@@ -3125,6 +3906,9 @@ void loop() {
 
   // Companion-app link: hello + queued commands (loop owns the TFT)
   hostLinkTick();
+
+  // Encoder puck: drain the ESP-NOW mailbox (loop owns the TFT + NimBLE)
+  puckTick();
 
   // BLE events from callback context → UI feedback (loop owns the TFT)
   if (pendingBleEvent != EVT_NONE) {
@@ -3280,6 +4064,7 @@ void loop() {
     if (faceStyle == 1) faceGifTick(now);
     else {
       updateFace(now);
+      puckLabelTick(now);       // dial mode above the eyes, while the puck is up
       mediaStripTick(now);      // now-playing title + timeline under the eyes
     }
   }
