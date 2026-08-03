@@ -185,6 +185,15 @@ bar and elapsed/total time, streamed from the host by the companion app.*
 - Settings → FACE (OFF/IDLE/ALWAYS) and STYLE (EYES/GIF); first press always just wakes, never types
 - Custom partition table: dual 1.5 MB OTA slots + 896 KB SPIFFS for animations
 
+### Rewrite Menu — local LLM text tools, driven from the pad
+- Select text anywhere, press a key on the pad, pick a style — the pad rewrites it in place
+- Styles: formalise, casualise, shorten, clarify, fix spelling/grammar, summarise, expand rough notes into an email, or treat the selection as a prompt and answer it
+- Runs against a local **[Ollama](https://ollama.com)** instance, so **nothing leaves the machine** unless a style is deliberately pointed at a hosted model
+- Prompts, temperature, reasoning and per-style model live in a **hot-reloaded `styles.json`** — tune them without a rebuild
+- Pad shows the style picker, then ACCEPT / REGEN / CANCEL; the side-by-side preview on screen is editable before you accept
+- Built entirely on the existing host-link opcodes — **no firmware changes required**
+- Full guide: [`docs/REWRITE_MENU.md`](docs/REWRITE_MENU.md)
+
 ### Config Mode — wireless setup + OTA firmware update
 - **Settings → CONFIG (WiFi/OTA)** suspends BLE and raises a WiFi hotspot (`MacroPad-Setup` / `macropad123`, `http://192.168.4.1`)
 - Built-in web UI + JSON API to remap keys, edit presets, and change settings — no re-flash needed
@@ -198,7 +207,7 @@ bar and elapsed/total time, streamed from the host by the companion app.*
 - ST7789 240×320 IPS display, landscape mount, glass flush-mounted (30.6×40.8mm active area)
 - 12× MX compatible mechanical switches, plate mount, 4×3 landscape matrix, 19.05mm pitch
 - 12× 1N4148 diodes for n-key rollover (cathode → row line — see `hardware/pin_reference_v5.md`)
-- Wireless encoder puck: AS5600 + 50mm bearing-mounted dial on ESP12-E, ESP-NOW (separate device, firmware TBD)
+- Wireless encoder puck: AS5600 + 50mm bearing-mounted dial, ESP-NOW (separate device — **built and working**; see [`hardware/puck_wiring.md`](hardware/puck_wiring.md) and [`docs/PUCK_PROTOCOL.md`](docs/PUCK_PROTOCOL.md))
 - CKCS charge+boost module + 18650 cell
 - Custom copper-tape ridge substrate PCB
 

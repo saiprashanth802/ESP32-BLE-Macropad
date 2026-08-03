@@ -40,7 +40,7 @@ device for ~1.5 s. Either way the device reboots back into keyboard mode.
 
 ### `GET /api/info`
 ```json
-{ "device":"ESP32 MacroPad", "fw":"v5-multihost", "api":2,
+{ "device":"ESP32 MacroPad", "fw":"v5-multihost", "api":3,
   "keys":12, "presets":8, "slots":3, "macroMax":6, "heap":123456 }
 ```
 
@@ -160,6 +160,15 @@ never typed. In `"always"` mode the face *is* the main screen — keys type
 straight from it with normal tap/hold behaviour, the grid never flashes, and
 holding FN opens the SYSTEM menu.
 
+> **Face mode and face screen are different things.** `faceMode` decides whether
+> the pad *returns* to the face; `currentScreen` decides what is drawn right now.
+> Setting mode `0` over the host link therefore also forces the pad off the face
+> screen — without that, a host that turned the face off in order to show the key
+> grid would draw its labels behind the eyes, and in `"always"` mode nothing would
+> move off the face until a wasted key press woke it. `setPreset`, `setColor` and
+> `setStatus` all guard their redraw on the grid being visible, so they are silent
+> no-ops while the face is up.
+
 GIF notes: hardware cannot decode MP4/H.264; convert to GIF first
 (`ffmpeg -i in.mp4 -vf "fps=12,scale=320:-1" out.gif`). Playback is centered,
 looped, ~10–25 fps depending on GIF complexity. While `style` is `"gif"` the
@@ -204,7 +213,7 @@ Wire format both ways: `[opcode:1][len:1][payload:len]`.
 | `0x81` | setLabel  | `[preset][key][utf8 ≤8]` | Live label override (RAM only; persists only if the user saves on-device) |
 | `0x82` | setStatus | `[utf8 ≤23]` | Status-bar line on the main grid; empty clears |
 | `0x83` | setPreset | `[preset]` | Foreground-follow: switch the pad's preset; echoed back as event `0x03` |
-| `0x84` | setFace   | `[mode 0-2][persona 0-3]` | Face mode / personality override (RAM only) |
+| `0x84` | setFace   | `[mode 0-2][persona 0-3]` | Face mode / personality override (RAM only). **Mode 0 also leaves the face screen immediately** — see below |
 | `0x8B` | setVolume | `[level 0-100 \| 0xFF unknown][flags: bit0 muted]` | True system volume, relayed to the encoder puck. BLE HID volume is relative, so this is the only way the pad can know the real level |
 | `0x8C` | getActions | `[page]` | Ask for one page of the builtin action library; answered with event `0x04` |
 
@@ -224,6 +233,15 @@ loop (bursts of 12 `setLabel`s are fine). `setPreset`/`setLabel` deliberately
 do **not** write NVS — the companion pushes state every session, and flash
 wear matters. Old alternative for scripts without BLE access: bind a
 distinctive `key` chord and use a global-hotkey listener.
+
+### Building on the host link
+
+The **rewrite menu** ([`REWRITE_MENU.md`](REWRITE_MENU.md)) is worth reading as a
+worked example: it turns a preset into a transient menu using nothing but the
+opcodes above — `setKey` without `commit` to claim the keys in RAM, `setLabel` to
+switch the menu between stages, `setFace` 0 to make the grid visible, and `0x02`
+key events to drive the state machine. No firmware changes were needed to build
+it beyond the `setFace` behaviour documented above.
 
 ## Build options for OTA `.bin`
 
