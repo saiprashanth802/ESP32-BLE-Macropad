@@ -58,6 +58,11 @@ them with an earlier counterpart export.
 > centred on the chip, **0.5–3 mm**). A radial or axially magnetised magnet will
 > not work at any gap.
 
+| | |
+|---|---|
+| ![Printed puck beside the pad](../docs/images/puck-with-pad.jpg) | ![Printed puck in hand](../docs/images/puck-in-hand.jpg) |
+| The printed puck beside the v5 | Dial seated in the two-part housing |
+
 The dial is sealed in the housing with no reachable reset button, by design — the
 firmware reboots on a fast spin gesture instead. See
 [`hardware/puck_wiring.md`](../hardware/puck_wiring.md).

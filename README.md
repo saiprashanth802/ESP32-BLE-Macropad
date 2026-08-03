@@ -203,6 +203,21 @@ bar and elapsed/total time, streamed from the host by the companion app.*
 - WiFi and BLE never run at once (WROOM-32 coexistence); entering/leaving Config Mode reboots cleanly
 - Full contract: [`docs/CONFIG_API.md`](docs/CONFIG_API.md)
 
+### Wireless Encoder Puck — a dial that isn't attached to anything
+
+| | |
+|---|---|
+| ![Puck beside the pad](docs/images/puck-with-pad.jpg) | ![Puck in hand](docs/images/puck-in-hand.jpg) |
+| The puck beside the v5 — a separate battery-powered device, no cable between them | 50 mm dial in the two-part printed housing |
+
+- **Separate device**, talks to the pad over **ESP-NOW** — no cable, no second BLE connection to manage
+- **AS5600 magnetic angle sensor** — 12-bit, contactless, nothing mechanical to wear out. The magnet is diametrically magnetised and sits in a pocket in the dial
+- **The pad owns the dial mode** (VOLUME / ZOOM). The puck renders whatever it's told and never self-changes, so a pad key and the puck can't disagree
+- **Volume is pushed, never estimated.** BLE HID volume is relative — the pad sends up/down and is never told the level — so the companion reading Windows Core Audio is the only way either device knows a real number
+- **Deep sleep when unlinked**, waking on rotation. The AS5600 has no motion interrupt, so waking is timer-poll-and-look with a movement threshold, which stops a knock or thermal drift waking it
+- **Sealed housing with no reset button** — spinning the dial a few turns while unlinked reboots it. Gated strictly on being unlinked, since spinning hard is completely ordinary during normal volume use
+- Wiring: [`hardware/puck_wiring.md`](hardware/puck_wiring.md) · Protocol: [`docs/PUCK_PROTOCOL.md`](docs/PUCK_PROTOCOL.md) · Print files: [`cad/stl/puck/`](cad/stl/puck)
+
 ### Hardware Spec
 - NodeMCU ESP32-S V1.1 (WROOM-32) dev board
 - ST7789 240×320 IPS display, landscape mount, glass flush-mounted (30.6×40.8mm active area)
