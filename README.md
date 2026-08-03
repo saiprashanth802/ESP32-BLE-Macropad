@@ -23,6 +23,7 @@ git checkout v4.1     # or v5.0 — see Releases for downloadable zips
 | v4 | `v4.1` | ✅ Stable | NimBLE stack, ghost connection fix, BUILD MODE |
 | v4 + Media Remote | — | 🔬 Testing | Wireless AS5600 scroll wheel via ESP-NOW |
 | v5 | `v5.0` | ✅ Built & Running | 12-key MX matrix, ST7789 240×320, multi-host BLE, robot face, Windows companion app |
+| v5.1 | `v5.1` | ✅ Current | Local-LLM rewrite menu driven from the pad, wireless encoder puck complete |
 
 ---
 
