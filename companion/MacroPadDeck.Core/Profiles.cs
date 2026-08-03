@@ -7,7 +7,9 @@ namespace MacroPadDeck;
 public sealed class KeyBinding
 {
     /// none | focusOrLaunch | open | run | window | shortcut | media | text
-    ///      | favorite | padAction
+    ///      | favorite | padAction | write
+    /// "write" opens the local-model rewrite menu (see WriteFlow): it captures
+    /// the current selection and switches the pad to the style preset.
     /// App actions (focusOrLaunch/open/run/window) make the pad key type
     /// "host"; shortcut/media/text rewrite the pad key itself over BLE.
     /// padAction fires one of the pad's own builtin actions (ACTION_LIB) and

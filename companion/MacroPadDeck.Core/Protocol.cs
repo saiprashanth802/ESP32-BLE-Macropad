@@ -69,6 +69,16 @@ public static class Protocol
 
     public static byte[] SetPreset(int preset) => new byte[] { CmdPreset, 1, (byte)preset };
 
+    /// Face mode 0=off, 1=idle (screensaver), 2=always; persona 0-3.
+    ///
+    /// Mode 0 is what makes the key grid stay visible: in mode 2 the firmware
+    /// drops back to the face FACE_ALWAYS_MS (2 s) after any activity, and in
+    /// mode 1 after the configured idle timeout — either way a pushed label is
+    /// on screen only briefly. RAM only; the firmware persists faceMode on its
+    /// own settings save, not on this command.
+    public static byte[] SetFace(int mode, int persona) =>
+        new byte[] { CmdFace, 2, (byte)Math.Clamp(mode, 0, 2), (byte)Math.Clamp(persona, 0, 3) };
+
     /// "#RRGGBB" → RGB565 accent + eye color for one preset. Null on bad input.
     public static byte[]? SetColor(int preset, string hex)
     {

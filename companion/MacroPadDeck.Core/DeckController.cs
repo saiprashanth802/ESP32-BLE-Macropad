@@ -18,6 +18,11 @@ public sealed class DeckController : IDisposable
     /// never drifts from the firmware's ACTION_LIB.
     public PadActions? Actions { get; private set; }
     public void AttachActions(PadActions a) => Actions = a;
+
+    /// Local-model rewrite menu. Optional — null when the Windows front-end
+    /// hasn't wired one up (the Linux front-end currently doesn't).
+    WriteFlow? _write;
+    public void AttachWrite(WriteFlow w) => _write = w;
     int _activePreset = -1;               // pad's preset as we last knew it
     DateTime _manualUntil = DateTime.MinValue;
     string _lastExe = "";
@@ -53,6 +58,10 @@ public sealed class DeckController : IDisposable
         {
             case Protocol.EvHello when p.Length >= 4:
                 _activePreset = p[3];
+                // [fwMajor][keys][presets][activePreset][faceMode][persona] —
+                // the face fields let the rewrite menu put back exactly what
+                // was there rather than guessing a default.
+                if (p.Length >= 6) _write?.NoteFace(p[4], p[5]);
                 StatusChanged?.Invoke($"Pad online (fw v{p[0]}, preset {p[3]})");
                 _ = Push(async () =>
                 {
@@ -62,16 +71,29 @@ public sealed class DeckController : IDisposable
                     await PushColors();
                     await PushEyes(_store.Config.EyeColor, persist: false);
                     await PushKeys(_store.Config, commit: false);
+                    // After PushKeys, which would otherwise write the write
+                    // preset's profile bindings over the menu.
+                    if (_write is not null)
+                    {
+                        await _write.PushMenuKeys();
+                        await _write.HealFace();   // undo a face left off by an interrupted session
+                    }
                     await PushLabels(_activePreset);
                 });
                 break;
 
             case Protocol.EvKey when p.Length >= 2:
             {
+                // The rewrite menu owns every key on its own preset, and every
+                // key anywhere while it is open.
+                if (_write?.TryHandleKey(p[0], p[1]) == true) break;
+
                 var binding = _store.ForPreset(p[0])?.Keys.ElementAtOrDefault(p[1]);
                 if (binding is null) break;
                 if (binding.Type.Equals("favorite", StringComparison.OrdinalIgnoreCase))
                     _ = Favorite();                          // needs the Feishin socket
+                else if (binding.Type.Equals("write", StringComparison.OrdinalIgnoreCase))
+                    _write?.Begin(_activePreset);            // remembers where to return
                 else
                     ThreadPool.QueueUserWorkItem(_ => _actions.Execute(binding));
                 break;
@@ -81,8 +103,11 @@ public sealed class DeckController : IDisposable
                 if (p[0] != _activePreset)
                 {
                     // The user (or our own echo) switched — user switches stick.
+                    // The rewrite menu's own switches are not user intent, so
+                    // they must not arm the sticky override.
                     _activePreset = p[0];
-                    _manualUntil = DateTime.UtcNow.AddSeconds(_store.Config.StickySeconds);
+                    if (_write?.IsActive != true)
+                        _manualUntil = DateTime.UtcNow.AddSeconds(_store.Config.StickySeconds);
                     _ = PushLabels(_activePreset);
                 }
                 break;
@@ -93,6 +118,10 @@ public sealed class DeckController : IDisposable
     public void OnForegroundExe(string exe)
     {
         _lastExe = exe;
+        // The rewrite preview takes focus, which is a foreground change — without
+        // this the menu would switch presets out from under itself the instant it
+        // opened its own window.
+        if (_write?.IsActive == true) return;
         if (!_ble.IsUp || DateTime.UtcNow < _manualUntil) return;
 
         var prof = _store.ForExe(exe);
@@ -110,6 +139,11 @@ public sealed class DeckController : IDisposable
 
     async Task PushLabels(int preset)
     {
+        // The write preset's labels come from styles.json, not profiles.json —
+        // a profile reload here would overwrite the style menu with the
+        // underlying (unused) bindings.
+        if (_write?.OwnsPreset(preset) == true) { await _write.RefreshLabels(); return; }
+
         var prof = _store.ForPreset(preset);
         if (prof is null) return;
         for (int k = 0; k < prof.Keys.Count && k < 12; k++)
@@ -153,7 +187,7 @@ public sealed class DeckController : IDisposable
                 var b = prof.Keys[k];
                 byte[]? cmd = b.Type.ToLowerInvariant() switch
                 {
-                    "focusorlaunch" or "open" or "run" or "window" or "favorite" =>
+                    "focusorlaunch" or "open" or "run" or "window" or "favorite" or "write" =>
                         Protocol.SetKey(prof.Preset, k, Protocol.KaHost, 0, 0, 0, b.Label),
                     "shortcut" =>
                         Protocol.SetKey(prof.Preset, k, Protocol.KaKey, (byte)b.Mod,

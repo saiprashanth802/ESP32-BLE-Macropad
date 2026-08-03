@@ -17,6 +17,15 @@ static class Program
         using var deck = new DeckController(ble, store, new ActionEngine());
         deck.AttachActions(new PadActions(ble));
 
+        // Local-model rewrite menu. Both the capture control's handle and the
+        // preview's dispatcher must be created on this (STA, pumped) thread.
+        using var styles = new StyleStore();
+        using var llm = new LlmClient(() => styles.Config);
+        using var capture = new WindowsTextCapture();
+        using var write = new WriteFlow(ble, styles, llm, capture, new RewritePreviewWindow());
+        write.Status += deck.RaiseStatus;
+        deck.AttachWrite(write);
+
         // One Feishin link, two consumers: now-playing fallback + favorite control
         FeishinSource? feishin = store.Config.FeishinUrl.Length > 0
             ? new FeishinSource(store.Config.FeishinUrl, store.Config.FeishinUser,
@@ -35,7 +44,7 @@ static class Program
         using var volume = new VolumePusher(ble, volSource);
         ble.LinkChanged += up => { if (up) volume.Invalidate(); };
 
-        using var tray = new TrayContext(deck, media);
+        using var tray = new TrayContext(deck, media, llm, styles);
 
         // Hook must live on the message-pump thread.
         using var fg = new ForegroundWatcher();
@@ -53,7 +62,7 @@ sealed class TrayContext : ApplicationContext
 
     readonly NotifyIcon _icon;
 
-    public TrayContext(DeckController deck, MediaPusher media)
+    public TrayContext(DeckController deck, MediaPusher media, LlmClient llm, StyleStore styles)
     {
         var menu = new ContextMenuStrip();
 
@@ -63,6 +72,22 @@ sealed class TrayContext : ApplicationContext
         menu.Items.Add("Open editor", null, (_, _) => EditorWindow.Open(deck));
         menu.Items.Add("Edit profiles.json", null, (_, _) =>
             Process.Start(new ProcessStartInfo(ProfileStore.FilePath) { UseShellExecute = true }));
+        menu.Items.Add("Edit styles.json", null, (_, _) =>
+            Process.Start(new ProcessStartInfo(StyleStore.FilePath) { UseShellExecute = true }));
+
+        // Loading is automatic on first use; unloading is manual so the VRAM
+        // comes back on demand (before a game, say) rather than on a timer.
+        menu.Items.Add("Load write model", null, async (_, _) =>
+        {
+            string m = styles.Config.Model;
+            deck.RaiseStatus($"Loading {m}…");
+            deck.RaiseStatus(await llm.Load(m) ? $"{m} loaded" : $"Could not load {m}");
+        });
+        menu.Items.Add("Unload write model", null, async (_, _) =>
+        {
+            string m = styles.Config.Model;
+            deck.RaiseStatus(await llm.Unload(m) ? $"{m} unloaded" : $"Could not unload {m}");
+        });
 
         menu.Items.Add("Update firmware…", null, async (_, _) =>
             await FirmwareUpdater.Run(s => deck.RaiseStatus(s)));

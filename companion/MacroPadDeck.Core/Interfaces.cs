@@ -83,3 +83,31 @@ public interface IVolumeSource
 {
     VolumeInfo Read();
 }
+
+/// Reads the selected text out of whatever app is focused and writes a
+/// replacement back into it, for the pad-driven rewrite flow.
+///
+/// Implemented over the clipboard rather than UI Automation: TextPattern
+/// coverage is inconsistent (Electron apps and browser contenteditable —
+/// i.e. Gmail — largely don't expose it), whereas Ctrl+C/Ctrl+V works
+/// everywhere text can be selected.
+///
+/// Capture snapshots the foreground window so the paste can be aimed back at
+/// it: the preview window takes focus in between, and without restoring it
+/// the replacement lands in the wrong app.
+public interface ITextCapture
+{
+    /// Selection from the focused app, or null if nothing could be read.
+    /// Also records the target window for the matching Replace call.
+    Task<string?> Capture();
+
+    /// Refocus the captured window and paste over its selection.
+    Task<bool> Replace(string text);
+
+    /// Leave text on the clipboard without pasting — used for a generated
+    /// email subject, which belongs in a different field than the body.
+    Task<bool> ToClipboard(string text);
+
+    /// Drop the captured target without pasting.
+    void Abandon();
+}
