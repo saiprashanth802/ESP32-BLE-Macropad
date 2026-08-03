@@ -1,15 +1,17 @@
-# Encoder Puck + Face Work — Session Handoff
+# Encoder Puck — Handoff
 
-**Date:** 2026-08-01 · **Branch:** `linux-companion` · **Everything below is uncommitted.**
+**Date:** 2026-08-03 · **Branch:** `linux-companion` · **Head `8ce6627`, pushed, tree clean.**
+
+Supersedes the 2026-08-01 handoff, which described the ESP-12 as the active puck,
+the C3 as dead, and the AS5600 as never wired. All three are now wrong.
 
 ---
 
 ## Status in one line
 
-All software is written, builds clean, and the ESP-NOW + volume + mode chain is
-**verified on real hardware**. The only blocker is physical: the puck's
-hand-built power board won't boot the ESP-12, though the ESP-12 itself is proven
-good.
+**The puck is finished.** Printed, assembled, and working on hardware — dial,
+magnet, sleep cycle, spin-to-reboot and OTA all verified. What remains is a
+better power board and one cosmetic check.
 
 ---
 
@@ -17,275 +19,284 @@ good.
 
 | Thing | Identity | State |
 |---|---|---|
-| MacroPad v5 | STA MAC `84:1F:E8:2B:33:48` · BLE `…:4A` · AP `…:49` | Working, flashed with everything below |
-| ESP32-C3 puck (original) | MAC `88:56:A6:2B:ED:7C` | **DEAD** — see below |
-| ESP-12E puck (current) | MAC `E8:68:E7:81:9B:07` | Module proven good, circuit not booting |
-| Programmer | Silicon Labs CP2102, **COM15** | Working, DTR/RTS auto-reset works |
-| OLED | SSD1306 **128×32** (0.91"), addr `0x3C` | Was wired to the dead C3; not yet on the ESP-12 |
-| AS5600 | addr `0x36` | **Never wired at any point** |
+| MacroPad v5 | STA `84:1F:E8:2B:33:48` · BLE `…:4A` · AP `…:49` | Working, current firmware |
+| **ESP32-C3 puck** | MAC `88:56:A6:2B:ED:7C`, COM8 | **Active**, in the printed body |
+| ESP-12E puck | MAC `E8:68:E7:81:9B:07`, COM15 | Spare. Protocol-synced, no OTA support |
+| AS5600 | addr `0x36` | **Wired and working** |
+| OLED | SSD1306 128×32 | **Dropped from the design** (`PUCK_OLED 0`) |
 
-### The dead C3
+### The C3 is not dead
 
-While desoldering nearby, a decoupling cap came off. The board then read a hard
-short (0 Ω) 3V3→GND with 5 V clean, and the LDO heated rapidly on power-up —
-i.e. the regulator was alive and sourcing into a downstream short, most likely a
-cracked MLCC. Cleaning the cap pads didn't clear it. Written off as not worth
-component-level repair on a ~$2 board. **Don't suggest reviving it.**
+It was written off on 2026-07-31 after a lost decoupling cap left an apparent
+0 Ω short on 3V3. That verdict was wrong, or the fault cleared: it enumerated,
+flashed, and has been the working puck ever since. Ignore any older note saying
+otherwise — including the ESP-12 power-board blocker, which is moot.
 
 ---
 
-## Verified working on hardware
+## Verified on hardware
 
-- **Bidirectional ESP-NOW**, ESP8266 ↔ ESP32, protocol v2
-- Pad `Settings → PUCK` reads `LINKED`
-- Puck serial reported `[PAD] mode=VOLUME ble=1 scroll=0 off=0 vol=38%`
-- **Volume path end to end**: Windows Core Audio → companion → GATT `0x8B` →
-  pad → `PK_STATE` → puck. Confirmed tracking (27% on the slider showed as 27%
-  on the puck).
-- **Action enumeration**: companion logged `actions: fetched 86 builtin actions`
-- **`PuckMode` key** bound and cycling `VOLUME ↔ ZOOM` on the puck (SCROLL
-  correctly skipped, since `PUCK_MOUSE_HID` is 0)
+- **Protocol v3 both directions** — mode switching, and the full volume path
+  (Core Audio → companion → GATT → pad → ESP-NOW → puck) tracking in 2% steps
+- **Rotation** — the AS5600 drives the whole chain; `PUCK_DIR_INVERT 0` is correct
+- **Light sleep genuinely enters** — the C3 fully detaches from USB when no
+  monitor is attached, which is the tell
+- **Wake on movement** — the pad reads `LINKED` after a turn
+- **Spin-to-reboot** and the **sleep cycle** behave on the real device
+- **The puck OTA round trip** (2026-08-03), after four separate bugs — below
+- **The printed enclosure** — the `(3)` STL set fits: the dial spins freely with
+  no wobble, both counterpart halves mate, and the stack matches 24 mm. **The
+  AS5600 magnet pocket worked first time**, despite being flagged throughout as
+  the fussy dimension
 
 ## Not yet verified
 
-- The AS5600 — never wired, so **no actual knob rotation has ever been tested**
-- The OLED on the ESP-12 (it worked on the C3 at `0x3C`)
-- The mouth + emote timing on the pad's screen (flashed but not eyeballed)
-- Music-vs-video face gating (flashed, needs the companion restarted)
+- **The face-screen mode label** on the pad — flashed, never eyeballed
+- **Any battery figure.** Every runtime number here is modelled, not measured.
+  A meter in series with the cell is the only way to settle it, and it cannot be
+  done over USB: an attached host suppresses CPU sleep by design
 
 ---
 
-## ACTIVE BLOCKER — puck circuit won't boot
+## Protocol v3
 
-Power chain: **LiPo → BMS (5 V 2 A) → AMS1117-3.3 → ESP-12.**
+`docs/PUCK_PROTOCOL.md` is the source of truth. 9-byte struct, duplicated in
+three sketches (Arduino folders cannot share a header), all marked `KEEP IN SYNC`.
+**Not wire-compatible with v2** — the length check drops short packets before the
+version check runs, so a mismatch is total silence with no error at either end.
 
-### Ruled out
+The pad owns everything stateful: mode, and dial feel. The puck holds no
+persistent copy — it boots on compiled defaults and adopts the pad's values on
+the first `PK_STATE`.
 
-| Checked | Result |
+**Sensitivity** rides as *detents per revolution*, not a raw threshold. Windows
+moves volume 2% per `CONSUMER_VOL_UP`, so **50 ticks is the entire range** — which
+makes the default of 50/turn "one turn, one sweep", and is the sanity check for
+any retuning. `Settings → PUCK` has its own screen with live-pushing SPEED and
+ACCEL sliders.
+
+---
+
+## Sleep architecture
+
+Two states in `puck_encoder.ino`:
+
+- **ACTIVE** — radio up, 10 ms encoder polling, 40 ms send coalescing
+- **DOZE** — WiFi driver stopped, CPU light-sleeping in 50 ms slices, waking to
+  poll the AS5600 over I2C. One full detent promotes back to ACTIVE
+
+An unassociated STA cannot use WiFi modem sleep (no AP beacon to sync against),
+so stopping the driver outright is the only way to put the radio down.
+
+The AS5600 drops to **LPM2** while dozing (6.5 mA → 1.8 mA). Its 20 ms internal
+polling is still faster than our 50 ms wake, so nothing is lost. `CONF` is
+read-modify-written — that register also holds hysteresis and filtering.
+
+`sleepGraceMs` is 30 s after a power-on reset so a serial monitor can attach, and
+**0 after a software reset** — a watchdog reboot that then sat awake 30 s would
+burn ~1 mAh each time.
+
+### Recovery layers
+
+| Trigger | Response |
 |---|---|
-| VCC at module | 3.3 V |
-| `EN` / CH_PD | 3.3 V (10 k pullup fitted) |
-| `GPIO15` | 0 V (10 k pulldown fitted) |
-| `GPIO0` | was 2 V — **fault found**, bridged to 3V3, now 3.0 V |
-| `RST` | wired, high |
-| 220 µF output cap | fitted |
-| BMS rating | 2 A @ 5 V, same module family already runs the macropad fine |
-| **ESP-12 module itself** | **Boots fine in the programmer socket → module is GOOD** |
+| 5 min unlinked | `rebuildEspNow()` — full deinit/stop/start/init/re-peer |
+| 30 min unlinked | `ESP.restart()` |
+| 1 h unlinked | Deep sleep; spin ~10 s to wake |
+| **Spin 2–3 turns while unlinked** | **Immediate reboot** |
+| OTA with no upload for 5 min | Restart back into normal ESP-NOW |
 
-### The remaining suspicion
+**Spin-to-reboot exists because the puck is sealed in a printed body with no
+reachable reset** — a hard spin *is* the reset button. Gated strictly on being
+unlinked (30 s quiet), because spinning hard is completely ordinary during normal
+volume use; that gate is the only thing making it safe.
 
-Everything above was measured **unloaded**. A supply reading a perfect 3.3 V at
-meter currents can collapse entirely at 70 mA — true of a cold solder joint, a
-marginal regulator, or a BMS cutting out, and none of it shows on an idle meter.
-
-**The next test, not yet done:** put a **47 Ω** (≈70 mA) or **33 Ω** (≈100 mA)
-½ W resistor across the 3V3 rail and watch the voltage.
-
-- Holds 3.3 V → supply is fine, fault is the joints at the ESP-12 (reflow `VCC`
-  and `GND` with fresh solder + flux; castellated pads read fine while being
-  unable to pass current)
-- Sags, or the BMS drops out → fault is upstream
-
-**Also untried:** feed the AMS1117 from a plain USB 5 V source instead of the
-BMS. That removes the BMS's under-load behaviour — invisible to a meter — from
-the picture in one step.
-
-### Note on the BMS
-
-Power-bank style modules **auto-shut-down below a minimum load** (typically
-40–70 mA), independent of their current rating. An ESP-12 idles around 70–80 mA,
-right on that line. If it turns out to be this: a 100 Ω bleeder across the 5 V
-keeps draw above the threshold, at the cost of ~50 mA of battery life. The
-better long-term fix is dropping the 5 V boost entirely and using a buck-boost
-straight to 3.3 V — the AMS1117 can't run from a LiPo directly (needs ~1.1 V of
-dropout).
+Deep sleep wakes on a 3 s timer and needs `WAKE_MOVES_NEEDED` (3) consecutive
+samples of ≥200 counts (~18°) before booting for real, so a knock or thermal
+drift cannot wake it. **The AS5600 has no movement interrupt** — it is a plain
+I2C angle sensor — which is why waking on rotation must be timer-poll-and-look.
 
 ---
 
-## Architecture built this session
+## Power
 
-### Puck protocol v2 — `docs/PUCK_PROTOCOL.md` is the source of truth
+**Current wiring is a stopgap:** the cell feeds the SuperMini's `5V` pin and its
+onboard ME6211-class LDO makes 3V3. The CKCS boost module does charging only.
 
-7-byte struct both directions, duplicated in three sketches (Arduino folders
-can't share a header), all marked `KEEP IN SYNC`:
+That change exists because the original chain — LiPo → 5 V boost → AMS1117 — had
+two faults:
 
-- `firmware/v5/macropad_v5/macropad_v5.ino` — pad / receiver
-- `firmware/v5/puck_encoder/puck_encoder.ino` — ESP32-C3 puck
-- `firmware/v5/puck_encoder_8266/puck_encoder_8266.ino` — ESP-12 puck (current)
+1. **~57% efficiency.** Boost at ~85%, then a linear regulator at 3.3/5 = 66%.
+   Nearly half the pack became heat.
+2. **Minimum-load shutdown.** Power-bank boost modules cut output below ~40–70 mA.
+   A dozing puck draws single-digit mA, so the module decided nothing was plugged
+   in and shut down. **There is no firmware recovery** — with the output off the
+   C3 has no power at all, so it cannot pulse the module's button pad or signal
+   anything. The interim workaround was a keepalive load pulse (10 s, then 5 s);
+   the rewire removed the need and `DOZE_HELLO_MS` is back to 60 s.
 
-**v2 is not wire-compatible with v1.** Both ends must match.
+⚠ **Two hazards of the direct tap.** Do not leave USB connected with the battery
+on the `5V` pin — it ties to VBUS with no isolation on most SuperMini boards; fit
+a Schottky (BAT54/1N5819) in the battery lead or unplug the cell to flash. And
+confirm the LiPo has its own protection PCB, since tapping B+ may bypass whatever
+the CKCS board provided. The C3's brownout detector (~2.98 V) is a crude backstop,
+not protection.
 
-**The pad owns the dial mode.** The puck renders whatever `PK_STATE` says and
-never self-changes; its (unwired) button only *requests* a cycle. One source of
-truth, so a pad key and the puck button can't disagree.
+### Planned board
 
-**Volume is pushed, never estimated.** BLE HID volume is relative — the pad
-sends up/down usages and is never told the level — so the companion reading
-Windows Core Audio is the only way either device knows a real number. Tick-based
-estimation was explicitly rejected: it desyncs the moment volume changes
-anywhere else, and a confidently wrong number is worse than none.
+One small PCB: **TP4056 (+DW01A/FS8205A protection) + SL7333 or AP2112K 3V3**,
+removing the power-bank module entirely.
 
-### New host-link opcodes
+- `Rprog` 4 kΩ → 300 mA charge (0.5C on a 600 mAh cell)
+- **1000 µF low-ESR** on the LDO output — the C3's TX peaks exceed a 250–300 mA
+  LDO's rating and the cap rides them out
+- **Verify the SOT-23-3 pinout against the vendor datasheet.** Three-pin LDO
+  pinouts are not consistent between manufacturers
+- **Run the AS5600's VCC from a GPIO.** It draws 6.5 mA, which the C3 sources
+  easily, and it is what stops deep sleep being worthwhile today
 
-| Op | Name | Purpose |
+TX power is capped at 11 dBm (`PUCK_TX_POWER_QDBM 44`) to keep peaks under the
+LDO rating. **It resets on every `esp_wifi_start()`**, so it is re-applied in
+`setupEspNow()`, `radioOn()` and `rebuildEspNow()`.
+
+### Runtime model
+
+Calibrated against the one real measurement — the original always-on build died
+in 3 h on 600 mAh, which the model reproduces at ~200 mA.
+
+| Configuration | Idle | Runtime |
 |---|---|---|
-| `0x8B` | setVolume | True system volume, relayed to the puck |
-| `0x8C` | getActions | Request a page of the pad's builtin action library |
-| `0x04` | (event) actions | 8 entries per page, `[id][label 9]`, 11 pages for 86 actions |
+| Always-on radio | ~200 mA | 3 h (measured) |
+| + sleep firmware | ~39 mA | ~15 h |
+| + BMS LEDs killed | ~15 mA | ~37 h |
+| + battery-direct (current wiring) | ~2 mA | days |
 
-`HCMD_MEDIA` flags gained **bit 2 = "this source is real music"** — no new
-opcode, no length change.
+⚠ **Deep sleep is barely a power win as wired.** C3 deep sleep is ~5 µA, but the
+AS5600 still draws ~1.5 mA in LPM3 — the sensor dominates and the CPU being off
+hardly registers. Its value today is behavioural. GPIO-powering the AS5600 is
+what would turn it into a real saving.
 
-### Companion additions
+---
 
-- `CoreAudioVolumeSource` — hand-rolled `IAudioEndpointVolume` interop, no new
-  NuGet dependency
-- `VolumePusher` — 150 ms poll, **writes only on change**, so a steady volume
-  produces zero BLE traffic and zero log lines. Empty `volume:` lines in
-  `deck.log` are correct, not a fault.
-- `PadActions` — walks the action pages and caches. **The list is fetched from
-  firmware, never duplicated in C#** — an 86-entry copy would drift silently and
-  the failure mode is a key bound to the wrong action.
-- Editor gained a **"Pad builtin action"** type. Bindings store the **id**, not
-  the label, so renaming an action in firmware doesn't break existing keys.
-- `DeckConfig.MusicSources` — allowlist, substring, case-insensitive, hot-reloads.
-  Defaults cover feishin/spotify/foobar/etc. **Browsers deliberately excluded**:
-  a browser session can't distinguish a song from a three-hour video. Empty list
-  restores "everything is music".
+## Gotchas that will recur
 
-### Face — mouth added
+**A dozing C3 cannot be auto-flashed.** Light sleep powers down USB Serial/JTAG.
+Windows keeps the cached descriptor so the port still *appears* and reports
+Status OK, but opening it fails with *"A device attached to the system is not
+functioning"* and esptool's DTR/RTS reset never lands. **Recovery: unplug, hold
+BOOT, plug in, release.** A reset alone is often not enough — the physical
+disconnect is what clears the stale device node. Set `PUCK_SLEEP 0` for bench
+work if this gets tiresome.
 
-Three fields appended to `EyePose` (`mouthWPct`, `mouthCurve`, `mouthOpenPct`).
-**Appended last on purpose** — every keyframe table uses aggregate init, so old
-rows zero-fill and keep working. `mouthWPct == 0` means *default*, not *hidden*.
+**`RTC_DATA_ATTR` does not survive a software reset** — only deep sleep. The
+bootloader reinitialises `.rtc.data` from flash. Use `RTC_NOINIT_ATTR`, and only
+trust it when the reset reason is `ESP_RST_SW` or `ESP_RST_DEEPSLEEP`; it is
+garbage after a power cycle.
 
-Because it lives in `EyePose`, the mouth inherits persona amplitude scaling,
-mood blending and the emote easing automatically — no parallel system.
+**Never mix raw `esp_wifi_*` with the Arduino `WiFi` wrapper.** The doze cycle
+uses `esp_wifi_stop()`/`esp_wifi_start()`; `WiFi.softAP()` goes through
+`WiFiGeneric`, which tracks its own idea of whether the driver is started.
+Changing that behind its back makes `softAP()` **silently no-op** — ESP-NOW tears
+down but no AP appears. OTA reboots into AP mode via an RTC flag so the stack is
+cold and coherent.
 
-- Rendered as a **parabolic band**, column by column; softer than TFT_eSPI's arc
-  primitives and trivially cheap next to the eye sprites
-- Sprite 116×36 at y=194 — fits between the eye sprites (end y=175) and the
-  now-playing strip (y=214) so nothing overlaps or leaves trails
-- **Follows the glance** at 50% horizontal / 30% vertical, so the face moves as
-  one piece (and the music bob reads as the head nodding)
-- Eases at 0.26 vs the lids' 0.30 — trailing slightly reads as connected
+**`RADIO_LISTEN_MS` must outlast the pad's turnaround.** At 80 ms the pad's reply
+routinely arrived after the radio was already down, silently dropping *every*
+`PK_STATE` — mode, speed, accel and the OTA request with it. Now 400 ms with an
+early exit the moment a reply lands. **If pad→puck settings ever appear to be
+ignored, check this first.**
 
-**Emote timing:** `EMOTE_TIME_PCT` = **165**, applied by dividing elapsed time,
-which stretches keyframe spacing *and* duration together. (Extending `durMs`
-alone would only hold the last pose longer.) Personas gained a `timePct`:
-Playful 85, Calm 105, Grumpy 115, Sleepy 145.
+**`PUCK_OTA_PEND_MS` must outlast the puck's keepalive.** A dozing puck is quiet
+by design, so "the puck went silent, therefore it acted on the request" is a
+false inference — it dropped the latch ~10 s after the keypress, long before the
+puck woke. Expiry is time-based only.
 
-**`EM_GLANCE` is exempt from the stretch** — it fires on every keypress, and
-slowing it makes the face feel laggy while typing.
+**The puck cannot wake a sleeping pad.** `esp_light_sleep_start()` powers down
+WiFi on the pad too; packets during its sleep are lost.
 
-**No mode toast on the pad** — the dial mode belongs on the puck's OLED. The one
-exception kept: pressing `PuckMode` with the puck disabled toasts `PUCK IS OFF`,
-because otherwise that key silently does nothing and reads as broken.
+**Pad STA MAC ≠ BLE address.** The puck targets `84:1F:E8:2B:33:48`, not the
+`…:4A` the companion uses. Wrong one fails completely silently.
+
+**Debug vs Release trap.** A running MacroPadDeck locks its Debug exe, so
+`dotnet build` fails MSB3027 and only `-c Release` succeeds; relaunching Debug
+then runs stale code and new features look missing.
+
+### The OTA saga — four attempts, four different causes
+
+All fixed, recorded because each presented identically ("no `Puck-Setup` AP"):
+
+1. `RADIO_LISTEN_MS` 80 ms — pad→puck replies dropped wholesale
+2. `WiFi.softAP()` silently no-opping from wrapper state desync
+3. `RTC_DATA_ATTR` not surviving a software reset, which combined with the pad
+   re-asserting its latch produced an **infinite reboot loop**
+4. The pad clearing its latch ~10 s in, before a dozing puck could hear it
+
+**Pull the puck's serial log first next time.** It identified causes 2, 3 and 4
+within seconds each; re-triggering blind cost a round. The `[PAD]` diagnostic now
+prints `ota=` so "did the flag arrive" is a glance, not a round trip.
 
 ---
 
 ## Build & flash
 
 ```bash
+arduino-cli compile --fqbn "esp32:esp32:esp32c3:CDCOnBoot=cdc" --libraries C:/Users/gsaip/Documents/Arduino/libraries --output-dir build_puck_c3 firmware/v5/puck_encoder
+```
+
+```bash
+arduino-cli upload -p COM8 --fqbn "esp32:esp32:esp32c3:CDCOnBoot=cdc" --input-dir build_puck_c3 firmware/v5/puck_encoder
+```
+
+```bash
 arduino-cli compile --fqbn "esp32:esp32:esp32:FlashFreq=40,UploadSpeed=115200,PartitionScheme=min_spiffs" --libraries C:/Users/gsaip/Documents/Arduino/libraries --output-dir build firmware/v5/macropad_v5
 ```
 
-```bash
-arduino-cli compile --fqbn esp8266:esp8266:nodemcuv2 --libraries C:/Users/gsaip/Documents/Arduino/libraries --output-dir build_puck8266 firmware/v5/puck_encoder_8266
-```
-
-```bash
-arduino-cli upload -p COM15 --fqbn esp8266:esp8266:nodemcuv2 --input-dir build_puck8266 firmware/v5/puck_encoder_8266
-```
-
-Pad OTA: `Settings → CONFIG` on the pad, join `MacroPad-Setup` / `macropad123`,
-then POST to `192.168.4.1`. **The AP vanishing is the success signal.**
+Pad OTA: `Settings → CONFIG`, join `MacroPad-Setup` / `macropad123`, then
 
 ```bash
 curl -s -F "f=@build/macropad_v5.ino.bin;filename=firmware.bin" http://192.168.4.1/api/update
 ```
 
-> A Windows WLAN profile named `MacroPad-Setup` was added this session to
-> automate the OTA join. Harmless; delete if unwanted.
+Puck OTA: `Settings → PUCK → OTA` on the pad, join `Puck-Setup` / `puck12345`,
+then POST the puck binary to `192.168.4.1/api/update`. A dozing puck can take up
+to `DOZE_HELLO_MS` to notice. **The AP disappearing is the success signal**, for
+both devices.
+
+**Always flash the C3 with `CDCOnBoot=cdc`** — the core defaults to routing
+`Serial` to UART0, and the board then runs perfectly while printing nothing.
+
+⚠ Joining `MacroPad-Setup` disconnects Windows from the real network, and it does
+**not** auto-reconnect after the pad reboots. Restore with
+`netsh wlan connect name="AirFiber-SvnePP"`.
+
+Sizes: puck 79% flash / 11% RAM · pad 69% / 28%.
 
 ---
 
-## Gotchas learned (these will recur)
+## CAD
 
-**ESP32-C3 serial is silent by default.** The core defaults to `cdc_on_boot=0`,
-routing `Serial` to UART0 on GPIO20/21 instead of native USB. The board uploads
-and runs perfectly while printing nothing. **Always flash the C3 with
-`CDCOnBoot=cdc` in the FQBN.** Cost a dead-end debug pass.
+`cad/stl/puck/` — revision `(3)`, pushed 2026-08-03, printed and fitted.
 
-**Debug vs Release trap.** A running MacroPadDeck locks
-`bin\Debug\…\MacroPadDeck.exe`, so `dotnet build` fails MSB3027 and only
-`-c Release` succeeds. The user then relaunches **Debug**, which is stale, and
-new features appear missing. Always check `Get-Process MacroPadDeck | Select
-Path` and compare DLL timestamps before believing something is broken. Fix: fully
-Exit the tray, build Debug, relaunch.
+| File | Size | Role |
+|---|---|---|
+| `puck_dial.stl` | 50 × 50 × 12 mm | the knob |
+| `puck_dial_counterpart_1.stl` | 73 × 55 × 17 mm | housing body |
+| `puck_dial_counterpart_2.stl` | 73 × 55 × 7 mm | housing lid |
 
-**Adafruit_SSD1306 `begin()` doesn't detect the panel.** It only fails on a
-malloc error, so a missing OLED looks like a healthy one. Both puck sketches
-probe the bus themselves and print a real I2C scan at boot.
-
-**SSD1306 size is a build-time constant.** The controller can't report its own
-panel size, so `OLED_H` mismatched to the hardware renders cropped with no error.
-0.91" = 32, 0.96" = 64.
-
-**Pad STA MAC ≠ BLE address.** The puck must target `84:1F:E8:2B:33:48`, not the
-`…:4A` the companion uses. Wrong one fails completely silently.
-
-**ESP8266 ESP-NOW needs `esp_now_set_self_role(ESP_NOW_ROLE_COMBO)`** — no ESP32
-equivalent, and the link fails silently without it. Full API divergence table is
-in `PUCK_PROTOCOL.md`.
-
-**`WiFi.macAddress()` returns all zeros** until the driver is started — print it
-*after* `WiFi.mode(WIFI_STA)`, not before.
-
-**C3 pins are SDA=5 SCL=6 BTN=4**, deliberately not the Arduino-default 8/9:
-GPIO2/8/9 are strapping pins and GPIO8 drives the SuperMini's onboard LED.
-ESP-12 pins are **SDA=4 SCL=5 BTN=13** (GPIO 0/2/15 strapping, unusable).
-
-**The puck can't wake a sleeping pad.** `esp_light_sleep_start()` powers down
-WiFi; packets during sleep are lost and wake is GPIO-only. Press a pad key first,
-or set SLEEP to OFF. Not fixable while keeping light sleep. The pad cycles
-ESP-NOW on wake rather than trusting post-power-cycle radio state.
-
-**`sizeof(FaceCfg)` changed** with the mouth fields, so the NVS size guard
-rejects old `fcfg` blobs and compiled defaults load. Invisible in practice (eye
-colour was already the default), but any config-UI tuning resets.
-
----
-
-## Design decisions — don't re-litigate
-
-- **Puck is dial + screen only, no button.** User wants it simple and compact.
-  Button code remains in the sketch and is harmless unwired (GPIO reads HIGH).
-- **Mode is driven from a pad key** (`PuckMode`, action id 132), not the puck.
-- **USB-only flashing for the puck, no OTA.** The C3's default partition table
-  already has dual OTA slots, but ESP-NOW (unassociated STA pinned to ch1)
-  conflicts with every OTA transport. If ever wanted, the design is the pad's: a
-  button gesture that stops ESP-NOW and raises a SoftAP.
-- **Events are pad-only via BLE HID** — the v4 model. Deliberately not routed
-  through the companion.
-- **Scroll mode is behind `#define PUCK_MOUSE_HID 0`.** Volume (consumer) and
-  zoom (Ctrl +/-, keyboard) need no HID descriptor change; scroll needs a
-  Report ID 3, and adding it wedges Windows GATT discovery until a Bluetooth
-  off/on toggle. Both flag states compile.
+The counterparts share a footprint and stack to 24 mm with the dial seating into
+them. Binary STL headers are all-zero, so no CAD metadata travels with the files —
+**check export timestamps rather than trusting a folder suffix** when a new
+revision arrives.
 
 ---
 
 ## Next steps
 
-1. **Load-test the 3V3 rail** (47 Ω / 33 Ω) — the one diagnostic not yet run
-2. Or feed the AMS1117 from USB 5 V to eliminate the BMS
-3. If the supply holds, reflow `VCC`/`GND` at the ESP-12
-4. Wire the OLED to the ESP-12 — `SDA=GPIO4`, `SCL=GPIO5` (**not** the C3's 5/6)
-5. Wire the AS5600 — same two lines, plus `DIR`→GND. Diametric magnet, centred
-   on the chip, 0.5–3 mm gap
-6. Restart the companion to pick up the music-vs-video gating
-7. Eyeball the mouth on the pad, especially whether it looks cramped against the
-   now-playing strip (`MOUTH_CY` / `MOUTH_SPR_H` are the knobs)
-8. Consider the offered **GPIO2 heartbeat blink** — on a headless board with no
-   serial, it turns "is it alive?" into a glance
-9. Commit — nothing from this session is committed
+1. **Measure the battery** with a meter in series. Every number above is modelled.
+2. **Build the power board** — TP4056 + LDO, and put the AS5600 on a GPIO so deep
+   sleep is worth having.
+3. **Eyeball the face-screen mode label** — the last unexercised feature.
+4. Optional: **high-res scrolling**. Answered but not built — needs the HID
+   Resolution Multiplier (usage `0x48`) in a logical collection plus a Feature
+   report, since the plain wheel field's unit *is* one detent. Costs a Bluetooth
+   off/on per host to clear the GATT wedge from adding Report ID 3.

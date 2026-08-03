@@ -48,15 +48,19 @@ cad/stl/puck/
 ```
 
 The two counterpart parts share a 73 × 55 mm footprint and stack to 24 mm; the
-50 mm dial seats into them. Exported together on 2026-07-31 — `puck_dial.stl`
-and this counterpart pair are a **matched set**, so don't mix them with an
-earlier counterpart export.
+50 mm dial seats into them. The three files are a **matched set** — don't mix
+them with an earlier counterpart export.
 
-> ⚠ **Not yet printed or test-fitted.** These are the CAD exports as designed;
-> no tolerance check against the real AS5600 + magnet stack has happened yet.
-> Expect to iterate on the magnet pocket in particular — the AS5600 wants a
-> diametrically magnetised magnet centred on the chip at a **0.5–3 mm** gap, and
-> that gap is the one dimension the sensor is genuinely fussy about.
+> ✅ **Printed and test-fitted (2026-08-03).** The dial spins freely with no
+> wobble, both counterpart halves mate, and the **AS5600 magnet pocket worked
+> first time** — no tolerance iteration was needed, despite the gap being the one
+> dimension the sensor is genuinely fussy about (diametrically magnetised magnet,
+> centred on the chip, **0.5–3 mm**). A radial or axially magnetised magnet will
+> not work at any gap.
+
+The dial is sealed in the housing with no reachable reset button, by design — the
+firmware reboots on a fast spin gesture instead. See
+[`hardware/puck_wiring.md`](../hardware/puck_wiring.md).
 
 ## Earlier design (v2/v3, encoder-based)
 
