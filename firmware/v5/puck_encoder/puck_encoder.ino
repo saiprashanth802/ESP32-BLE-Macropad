@@ -39,6 +39,7 @@
 #include <WiFi.h>
 #include <esp_now.h>
 #include <esp_wifi.h>
+#include <esp_sleep.h>
 #include <WebServer.h>
 #include <Update.h>
 
@@ -81,6 +82,24 @@ static uint8_t PAD_MAC[6] = { 0x84, 0x1F, 0xE8, 0x2B, 0x33, 0x48 };
 
 #define PUCK_WIFI_CHANNEL 1
 
+// WiFi TX power, in quarter-dBm (esp_wifi_set_max_tx_power's unit). 44 = 11 dBm
+// against a 20 dBm default. The puck sits a metre or two from the pad, so the
+// extra 9 dB buys nothing but current: full power peaks around 335 mA, which
+// overruns a 250-300 mA LDO and shows up as random brownout resets during
+// transmission — a fault that reads like a firmware bug and wastes a day.
+// Raise it if the link ever gets unreliable at range.
+#define PUCK_TX_POWER_QDBM 44
+
+// Which way the knob counts. Depends purely on how the magnet ends up facing
+// once the dial is assembled, so it is a build-time property of the physical
+// puck, not a preference. 1 = reverse the sense of rotation.
+//
+// The AS5600 also has a hardware DIR pin for this (tie to GND or VCC), but the
+// SuperMini wiring leaves it grounded, so flipping it in firmware avoids
+// touching the board.
+// Verified on the assembled dial 2026-08-02: 0 is the correct sense.
+#define PUCK_DIR_INVERT 0
+
 // ════════════════════════════════════════════════════════════════════
 //  WIRE PROTOCOL — KEEP IN SYNC with macropad_v5.ino and PUCK_PROTOCOL.md
 // ════════════════════════════════════════════════════════════════════
@@ -109,6 +128,10 @@ static uint8_t PAD_MAC[6] = { 0x84, 0x1F, 0xE8, 0x2B, 0x33, 0x48 };
 #define PF_DISABLED   0x04   // pad has the puck switched off in Settings
 #define PF_VOL_KNOWN  0x08   // vol byte is real (companion app is feeding it)
 #define PF_VOL_MUTED  0x10
+// A dozing puck has its radio off and will miss a one-shot PK_OTA entirely, so
+// the pad also latches the request into every PK_STATE. The puck picks it up on
+// the next keepalive burst — worst case DOZE_HELLO_MS away.
+#define PF_OTA_PEND   0x20
 
 #define PUCK_VOL_UNKNOWN 0xFF
 
@@ -187,6 +210,128 @@ const unsigned long DOUBLE_GAP_MS     = 280;
 const unsigned long DEBOUNCE_MS       = 40;
 const unsigned long OLED_DIM_MS       = 20000; // blank the screen after this idle
 
+// ── Power / sleep ────────────────────────────────────────────────────
+// The radio is by far the biggest load: an unassociated STA sits at ~80-100 mA
+// continuously, against ~1 mA for a dozing CPU. Since the OLED was dropped the
+// puck has nothing to render, so it no longer needs to be listening all the
+// time — it only needs the pad's reply to the packets it sends. That makes it
+// safe to keep the radio off until the knob actually moves.
+//
+// DOZE: radio stopped, CPU in light sleep, waking every SLEEP_POLL_MS to read
+//       the encoder over I2C. Movement past one detent promotes to ACTIVE.
+// ACTIVE: radio up, the original 10 ms / 40 ms polling and coalescing.
+//
+// Unassociated STA cannot use WiFi modem sleep (no AP beacon to sync against),
+// so stopping the driver outright is the only way to put the radio down.
+#define PUCK_SLEEP 1
+
+const unsigned long SLEEP_AFTER_MS   = 4000;   // idle before dropping to DOZE
+const unsigned long SLEEP_POLL_MS    = 50;     // light-sleep slice while dozing
+// Upper bound on how long to hold the radio up waiting for the pad's reply.
+// The wait exits as soon as a PK_STATE actually lands, so the usual cost is a
+// few tens of ms — this is only the ceiling for when the pad is slow. It has to
+// be generous: the pad answers from its main loop, and a full TFT redraw there
+// can take well over 100 ms. At 80 ms the reply was routinely missed, which
+// silently dropped mode, speed, accel and the OTA request.
+const unsigned long RADIO_LISTEN_MS  = 400;
+
+// ── Link recovery ────────────────────────────────────────────────────
+// The puck must never need a power cycle to come back. If the pad is rebooted,
+// or was off long enough for its own sleep to drop ESP-NOW, the puck can end up
+// talking into a void — and a wedged WiFi driver looks identical to a pad that
+// is simply switched off. So escalate: rebuild the radio stack first, and if
+// that still yields nothing, restart outright. A puck with no UI can reboot
+// itself whenever it likes; nobody sees it.
+const unsigned long LINK_REBUILD_MS = 300000UL;   // 5 min silent -> rebuild ESP-NOW
+const unsigned long LINK_DEAD_MS    = 1800000UL;  // 30 min silent -> self-restart
+const unsigned long LINK_SLEEP_MS   = 3600000UL;  // 1 hour silent -> deep sleep
+
+// ── Deep sleep / spin-to-wake ────────────────────────────────────────
+// After an hour with no pad there is nothing worth staying up for: the pad is
+// off, and keepalives are just burning the cell. Deep sleep, and require a
+// deliberate gesture to come back.
+//
+// The AS5600 cannot raise an interrupt on movement — it is a plain I2C angle
+// sensor with no "something moved" output — so waking on rotation means waking
+// on a timer and looking. Each wake reads the angle, compares it with the one
+// stored in RTC memory, and counts it as movement if it shifted meaningfully.
+// WAKE_MOVES_NEEDED consecutive moving samples means a human is spinning it,
+// not a knock or a temperature drift, and only then does the puck boot for real.
+const uint64_t DEEP_POLL_US        = 3000000ULL;  // look every 3 s
+const int      WAKE_MOVE_THRESHOLD = 200;         // counts (~18 deg) = real movement
+const uint32_t WAKE_MOVES_NEEDED   = 3;           // consecutive samples before waking
+
+// ── Spin to reboot ───────────────────────────────────────────────────
+// The puck is sealed inside a printed enclosure — there is no reset button to
+// reach without taking it apart. So while it is NOT linked, a hard spin becomes
+// the reset button: enough detents inside a short window and it restarts into a
+// clean link attempt, radio and all.
+//
+// Gated strictly on being unlinked, so a fast volume sweep during normal use
+// can never trigger it. That gate is the whole reason this is safe: spinning
+// hard is completely ordinary when the dial is working.
+const uint16_t      RELINK_SPIN_TICKS     = 120;    // ~2-3 turns at 50/turn
+const unsigned long RELINK_SPIN_WINDOW_MS = 6000;   // ...within this long
+const unsigned long RELINK_UNLINKED_MS    = 30000;  // "not linked" means this quiet
+
+// OTA is otherwise a one-way door: ESP-NOW is gone and only a flash or a power
+// cycle brings the puck back. If nobody uploads, come back on our own.
+const unsigned long OTA_IDLE_TIMEOUT_MS = 300000UL;   // 5 min
+
+// ── Doze keepalive ───────────────────────────────────────────────────
+// Its only job now is feeding the pad's link indicator — the pad must not
+// decide the puck is gone while it is merely asleep, so PUCK_LINK_TIMEOUT_MS
+// on the pad has to stay comfortably longer than this.
+//
+// History worth keeping, because the symptom is baffling if you meet it cold:
+// the puck was originally powered LiPo -> 5 V power-bank boost -> AMS1117, and
+// those boost modules cut their output when they see too little load for too
+// long (typically under 40-70 mA). A dozing puck draws single-digit mA, so the
+// module decided nothing was plugged in and shut down, killing the puck. There
+// is NO firmware recovery from that — with the output off the C3 has no power
+// at all, so it cannot pulse the module's button pad or signal anything.
+//
+// The workaround was to make this keepalive double as a load pulse: hold the
+// radio up (~100 mA) long enough and often enough to keep resetting the
+// module's low-load timer. It cost real runtime and was only ever a bridge.
+//
+// Fixed properly in hardware instead: the C3 is now fed straight from the cell
+// into the SuperMini's own low-dropout regulator, so the boost module is out of
+// the discharge path and does charging only. No minimum load to satisfy, and
+// the ~43% conversion loss of boost-plus-LDO went with it. BMS_PULSE_MS is kept
+// short for that reason — restore it to ~250 ms only if a min-load supply ever
+// comes back.
+const unsigned long DOZE_HELLO_MS    = 60000;  // 5000 -> 60000 after the rewire
+const unsigned long BMS_PULSE_MS     = RADIO_LISTEN_MS;
+
+// A serial monitor holds the native USB CDC link open, and light sleep powers
+// down the USB Serial/JTAG peripheral — the port stays enumerated but stops
+// responding, so opening it fails with "device is not functioning". Skip
+// sleeping while a host has the port open. On battery there is no host, so the
+// real device sleeps normally; this only affects bench debugging.
+#define PUCK_SLEEP_SKIP_ON_USB 1
+
+// ...but that check alone is not enough. Straight after a flash or power-up
+// nothing has opened the port yet, so `Serial` is false, the puck dozes at
+// SLEEP_AFTER_MS and takes USB down before anyone can attach — leaving a board
+// you cannot open a monitor on at all. This grace period keeps it awake long
+// enough to connect; after that the skip-on-USB check takes over.
+// Set to 0 on a software restart — see setup(). A watchdog reboot that then sat
+// awake for 30 s would burn ~1 mAh of radio each time, which on a pad that is
+// simply switched off overnight adds up to more than the doze ever saved.
+// Only a real power-on or button reset means a human is present to attach.
+unsigned long sleepGraceMs = 30000;
+
+// AS5600 power modes (CONF register 0x08, bits 1:0). The sensor is always-on
+// and, once the radio is down, becomes the largest single draw on the 3V3 rail.
+// LPM2 polls internally every 20 ms, which is still quicker than our own
+// SLEEP_POLL_MS, so dozing in LPM2 costs no responsiveness.
+#define AS_PM_NOM   0x00   // 6.5 mA — continuous
+#define AS_PM_LPM1  0x01   // 3.4 mA — 5 ms internal polling
+#define AS_PM_LPM2  0x02   // 1.8 mA — 20 ms
+#define AS_PM_LPM3  0x03   // 1.5 mA — 100 ms, too slow to catch a fast turn
+#define REG_CONF_LO 0x08
+
 // ── State ────────────────────────────────────────────────────────────
 int16_t  lastAngle    = 0;
 int32_t  accumulator  = 0;
@@ -219,6 +364,28 @@ volatile unsigned long lastPadMs = 0;
 // inside the WiFi task's own callback is a deadlock, same as esp_now_send.
 volatile bool    otaRequested = false;
 
+// Set while returning from an OTA session. The pad latches its OTA request for
+// a while, so without this the puck comes back, immediately hears the same
+// request, and reboots again — an endless loop that only ends when the pad's
+// latch expires. Declared here because onRecv() below reads it, and Arduino
+// hoists function prototypes but not variables.
+unsigned long otaIgnoreUntilMs = 0;
+
+// RTC_NOINIT, not RTC_DATA. RTC_DATA_ATTR only survives *deep sleep* — the
+// bootloader reinitialises .rtc.data from flash on an ordinary software reset,
+// so a flag stored there is already back to zero by the time setup() looks at
+// it. .rtc.noinit is left alone, which is the lifetime we actually want:
+// survives both a software reset and deep sleep, garbage after a power cycle
+// (handled in setup).
+RTC_NOINIT_ATTR uint32_t otaBootFlag;
+RTC_NOINIT_ATTR uint32_t otaCooldownFlag;
+#define OTA_BOOT_MAGIC 0xC3040A5Au
+
+RTC_NOINIT_ATTR uint32_t deepSleepFlag;
+RTC_NOINIT_ATTR int32_t  deepLastAngle;
+RTC_NOINIT_ATTR uint32_t deepMoveCount;
+#define DEEP_SLEEP_MAGIC 0xD3EF5117u
+
 // How long the volume bar stays up after the last detent before the screen
 // reverts to showing the mode name.
 const unsigned long BAR_HOLD_MS = 1500;
@@ -240,6 +407,40 @@ uint16_t readAngle() {
     return v;
   }
   return lastAngle;
+}
+
+// Read-modify-write: CONF's low byte also holds hysteresis, output stage, PWM
+// frequency and the slow filter. Clobbering it with a bare write would silently
+// change the filtering along with the power mode.
+void as5600SetPower(uint8_t pm) {
+  Wire.beginTransmission(AS5600_ADDR);
+  Wire.write(REG_CONF_LO);
+  if (Wire.endTransmission(false) != 0) return;
+  Wire.requestFrom((uint8_t)AS5600_ADDR, (uint8_t)1);
+  if (!Wire.available()) return;
+  uint8_t v = Wire.read();
+  uint8_t want = (uint8_t)((v & ~0x03) | (pm & 0x03));
+  if (want == v) return;                     // already there — skip the write
+  Wire.beginTransmission(AS5600_ADDR);
+  Wire.write(REG_CONF_LO);
+  Wire.write(want);
+  Wire.endTransmission();
+}
+
+// Wrapped, direction-corrected delta since the last call. Both the active loop
+// and the doze poll go through here, so they cannot disagree about sign — they
+// share one accumulator across the sleep boundary, and a mismatch there would
+// show up as the dial jumping backwards on the first detent after waking.
+int16_t readDelta() {
+  int16_t angle = (int16_t)readAngle();
+  int16_t d = angle - lastAngle;
+  if (d >  2048) d -= 4096;              // 12-bit wraparound
+  if (d < -2048) d += 4096;
+  lastAngle = angle;
+#if PUCK_DIR_INVERT
+  d = (int16_t)-d;
+#endif
+  return d;
 }
 
 bool magnetOK() {
@@ -287,6 +488,8 @@ void onRecv(const esp_now_recv_info_t* info, const uint8_t* data, int len) {
   if (m->type != PK_STATE) return;
   padFlags  = m->flags;
   padVolume = m->vol;
+  // Latched request — but not while cooling down from a session we just left.
+  if ((m->flags & PF_OTA_PEND) && millis() >= otaIgnoreUntilMs) otaRequested = true;
   // The pad owns the mode — a key on the pad (or our own button, which only
   // asks the pad to cycle) is the single source of truth.
   if (m->mode < PM_COUNT) mode = m->mode;
@@ -317,6 +520,7 @@ void setupEspNow() {
   WiFi.mode(WIFI_STA);
   WiFi.disconnect();
   esp_wifi_set_channel(PUCK_WIFI_CHANNEL, WIFI_SECOND_CHAN_NONE);
+  esp_wifi_set_max_tx_power(PUCK_TX_POWER_QDBM);
 
   if (esp_now_init() != ESP_OK) {
     Serial.println("[NOW] init failed");
@@ -337,6 +541,118 @@ void setupEspNow() {
   Serial.println("[NOW] ready");
 }
 
+// ── Radio power ──────────────────────────────────────────────────────
+// esp_wifi_stop() takes the RF down without tearing down ESP-NOW's registration.
+// The peer table does not reliably survive a stop/start though, so re-add on the
+// way up — esp_now_add_peer on an existing peer returns an error we can ignore,
+// and the check keeps the log clean.
+bool radioUp = true;
+
+void radioOn() {
+  if (radioUp) return;
+  if (esp_wifi_start() != ESP_OK) { Serial.println("[NOW] wifi start failed"); return; }
+  esp_wifi_set_channel(PUCK_WIFI_CHANNEL, WIFI_SECOND_CHAN_NONE);
+  esp_wifi_set_max_tx_power(PUCK_TX_POWER_QDBM);   // reset by every wifi start
+  if (!esp_now_is_peer_exist(PAD_MAC)) {
+    esp_now_peer_info_t peer;
+    memset(&peer, 0, sizeof(peer));
+    memcpy(peer.peer_addr, PAD_MAC, 6);
+    peer.channel = PUCK_WIFI_CHANNEL;
+    peer.encrypt = false;
+    esp_now_add_peer(&peer);
+  }
+  radioUp   = true;
+  peerReady = true;
+}
+
+void radioOff() {
+  if (!radioUp) return;
+  esp_wifi_stop();
+  radioUp   = false;
+  peerReady = false;      // sendMsg() is a no-op with the radio down
+}
+
+// Full teardown and rebuild. radioOn() only restarts the driver; if ESP-NOW
+// itself has wedged — callback lost, peer table gone, interface confused — that
+// is not enough, and the symptom is a puck that transmits into nothing forever.
+void rebuildEspNow() {
+  Serial.println("[NOW] rebuilding — no pad contact");
+  esp_now_deinit();
+  esp_wifi_stop();
+  delay(50);
+  esp_wifi_start();
+  esp_wifi_set_channel(PUCK_WIFI_CHANNEL, WIFI_SECOND_CHAN_NONE);
+  esp_wifi_set_max_tx_power(PUCK_TX_POWER_QDBM);
+
+  if (esp_now_init() != ESP_OK) { Serial.println("[NOW] re-init failed"); return; }
+  esp_now_register_recv_cb(onRecv);
+
+  esp_now_peer_info_t peer;
+  memset(&peer, 0, sizeof(peer));
+  memcpy(peer.peer_addr, PAD_MAC, 6);
+  peer.channel = PUCK_WIFI_CHANNEL;
+  peer.encrypt = false;
+  esp_now_add_peer(&peer);
+
+  radioUp   = true;
+  peerReady = true;
+  sendMsg(PK_HELLO, 0, BTN_NONE);
+}
+
+// Escalating recovery, run from both the active loop and the doze poll.
+// Deliberately only arms once the puck has heard from the pad at least once —
+// on a bench puck with no pad in the room, restarting every 30 minutes forever
+// would be pointless noise.
+// Park until somebody spins the dial. Radio down, AS5600 into its deepest low
+// power mode, CPU off but for a 3 s tick.
+void enterDeepSleep() {
+  Serial.println("[SYS] no pad for an hour — deep sleep, spin the dial to wake");
+  delay(30);
+  radioOff();
+  as5600SetPower(AS_PM_LPM3);
+  deepSleepFlag = DEEP_SLEEP_MAGIC;
+  deepLastAngle = (int32_t)readAngle();
+  deepMoveCount = 0;
+  esp_sleep_enable_timer_wakeup(DEEP_POLL_US);
+  esp_deep_sleep_start();
+}
+
+// Counts detents while the link is down; a big enough burst restarts the puck.
+void relinkSpinCheck(unsigned long now, int magnitude) {
+  static unsigned long winStart = 0;
+  static uint16_t      spun     = 0;
+
+  const bool unlinked = !padSeen || (now - lastPadMs > RELINK_UNLINKED_MS);
+  if (!unlinked) { spun = 0; return; }          // linked: never arm
+
+  if (now - winStart > RELINK_SPIN_WINDOW_MS) { winStart = now; spun = 0; }
+  spun += (uint16_t)magnitude;
+
+  if (spun >= RELINK_SPIN_TICKS) {
+    Serial.println("[SYS] spin-to-reboot (unlinked) — restarting");
+    delay(20);
+    ESP.restart();
+  }
+}
+
+void linkWatchdog(unsigned long now) {
+  static unsigned long lastRebuildMs = 0;
+  if (!padSeen) return;
+  const unsigned long silent = now - lastPadMs;
+
+  if (silent >= LINK_SLEEP_MS) enterDeepSleep();   // does not return
+
+  if (silent >= LINK_DEAD_MS) {
+    Serial.println("[NOW] link dead — restarting");
+    delay(20);
+    ESP.restart();
+  }
+  if (silent >= LINK_REBUILD_MS && (now - lastRebuildMs) >= LINK_REBUILD_MS) {
+    lastRebuildMs = now;
+    rebuildEspNow();
+  }
+}
+
 // ── OTA ──────────────────────────────────────────────────────────────
 // Triggered from the pad (Settings -> PUCK -> OTA), which sends PK_OTA. The
 // puck has no button and no screen, so the pad is the only sane trigger.
@@ -351,6 +667,7 @@ void setupEspNow() {
 
 WebServer otaServer(80);
 bool otaMode = false;
+unsigned long otaTouchMs = 0;   // last sign of life from an uploader
 
 static const char OTA_PAGE[] PROGMEM = R"HTML(<!doctype html><meta charset=utf-8>
 <meta name=viewport content="width=device-width,initial-scale=1">
@@ -382,6 +699,7 @@ void handleOtaDone() {
 
 void handleOtaUpload() {
   HTTPUpload& up = otaServer.upload();
+  otaTouchMs = millis();               // keep the idle timeout off our back
   if (up.status == UPLOAD_FILE_START) {
     Serial.printf("[OTA] start %s\n", up.filename.c_str());
     if (!Update.begin(UPDATE_SIZE_UNKNOWN)) Update.printError(Serial);
@@ -393,13 +711,28 @@ void handleOtaUpload() {
   }
 }
 
-void enterOtaMode() {
-  Serial.println("[OTA] entering — ESP-NOW going down");
-  esp_now_deinit();
-  peerReady = false;
-  WiFi.disconnect(true);
-  delay(100);
 
+
+// Requesting OTA reboots rather than switching mode in place.
+//
+// The doze cycle drives the radio with raw esp_wifi_stop()/esp_wifi_start(),
+// but WiFi.softAP() goes through the Arduino WiFiGeneric wrapper, which keeps
+// its own view of whether the driver is started. Changing that state behind the
+// wrapper's back desyncs it, and softAP() then silently does nothing — ESP-NOW
+// tears down, the pad loses the puck, and no access point ever appears. Which
+// is precisely the symptom this fixes.
+//
+// Rebooting sidesteps the whole problem: the AP comes up from a cold, coherent
+// stack on the next boot, with no wrapper state to disagree with.
+void enterOtaMode() {
+  Serial.println("[OTA] requested — rebooting into AP mode");
+  otaBootFlag = OTA_BOOT_MAGIC;
+  delay(30);
+  ESP.restart();
+}
+
+// Runs from setup() on an OTA boot, before any of the ESP-NOW path.
+void startOtaAp() {
   WiFi.mode(WIFI_AP);
   WiFi.softAP(OTA_AP_SSID, OTA_AP_PASS);
   delay(200);
@@ -408,10 +741,36 @@ void enterOtaMode() {
   otaServer.on("/api/update", HTTP_POST, handleOtaDone, handleOtaUpload);
   otaServer.begin();
 
-  otaMode = true;
+  otaMode    = true;
+  otaTouchMs = millis();
   Serial.printf("[OTA] AP \"%s\" pass \"%s\" -> http://%s/\n",
                 OTA_AP_SSID, OTA_AP_PASS, WiFi.softAPIP().toString().c_str());
   Serial.println("[OTA] the AP disappearing is the success signal");
+}
+
+// One deep-sleep tick. Called from setup() after Wire is up, on a timer wake.
+// Either returns (movement confirmed — carry on booting and try to link) or
+// goes straight back to sleep without ever bringing the radio up.
+void handleDeepWake() {
+  int32_t angle = (int32_t)readAngle();
+  int32_t d = angle - deepLastAngle;
+  if (d >  2048) d -= 4096;                 // wraparound, same as readDelta()
+  if (d < -2048) d += 4096;
+  deepLastAngle = angle;
+
+  if (abs((int)d) >= WAKE_MOVE_THRESHOLD) deepMoveCount++;
+  else                                    deepMoveCount = 0;   // must be consecutive
+
+  if (deepMoveCount >= WAKE_MOVES_NEEDED) {
+    deepSleepFlag = 0;
+    deepMoveCount = 0;
+    as5600SetPower(AS_PM_NOM);
+    Serial.println("[SYS] spin detected — waking up to re-link");
+    return;                                  // fall through into a normal boot
+  }
+
+  esp_sleep_enable_timer_wakeup(DEEP_POLL_US);
+  esp_deep_sleep_start();
 }
 
 // ── OLED ─────────────────────────────────────────────────────────────
@@ -576,10 +935,48 @@ void setup() {
   delay(200);
   Serial.println("\n=== MacroPad Encoder Puck ===");
 
+  // A self-restart (link watchdog, OTA timeout) has no human waiting on it, so
+  // skip the grace window and let it doze straight away.
+  esp_reset_reason_t rr = esp_reset_reason();
+  if (rr == ESP_RST_SW) sleepGraceMs = 0;
+  Serial.printf("[SYS] reset reason %d, sleep grace %lu ms\n", (int)rr, sleepGraceMs);
+
+  // .rtc.noinit is uninitialised garbage after a power cycle, so only believe it
+  // when we arrived by a route that preserves it — a software reset or a deep
+  // sleep wake. Anything else (power-on, brownout, watchdog) starts clean.
+  if (rr != ESP_RST_SW && rr != ESP_RST_DEEPSLEEP) {
+    otaBootFlag = otaCooldownFlag = 0;
+    deepSleepFlag = deepMoveCount = 0;
+  }
+
+  // OTA boot: bring the access point up on a clean stack and do nothing else.
+  // Cleared first, so a failed OTA boot cannot trap the puck in a reboot loop —
+  // worst case it comes back as a normal puck.
+  if (otaBootFlag == OTA_BOOT_MAGIC) {
+    otaBootFlag     = 0;
+    otaCooldownFlag = OTA_BOOT_MAGIC;   // ...so the next normal boot backs off
+    startOtaAp();
+    return;
+  }
+
+  // Coming back from OTA. Ignore the pad's still-latched request for a while,
+  // otherwise we bounce straight back into AP mode.
+  if (otaCooldownFlag == OTA_BOOT_MAGIC) {
+    otaCooldownFlag  = 0;
+    otaIgnoreUntilMs = 120000;
+    Serial.println("[OTA] back from AP mode — ignoring OTA requests for 120 s");
+  }
+
   pinMode(PIN_BTN, INPUT_PULLUP);
 
   Wire.begin(PIN_SDA, PIN_SCL);
   Wire.setClock(400000);
+
+  // Parked waiting for a spin: check and go straight back down. Deliberately
+  // before the banner and the bus scan — every millisecond awake here is
+  // battery, and this path runs every DEEP_POLL_US around the clock.
+  if (deepSleepFlag == DEEP_SLEEP_MAGIC) handleDeepWake();
+
   Serial.printf("[I2C] SDA=GPIO%d  SCL=GPIO%d   BTN=GPIO%d\n",
                 PIN_SDA, PIN_SCL, PIN_BTN);
   i2cScan();
@@ -633,6 +1030,82 @@ void setup() {
   drawOled();
 }
 
+// ── Doze ─────────────────────────────────────────────────────────────
+#if PUCK_SLEEP
+bool dozing = false;
+
+void enterDoze() {
+  if (dozing) return;
+  // Never leave ticks stranded — they would surface as a jump on the next turn.
+  if (pendingTicks != 0) {
+    sendMsg(PK_INPUT, (int8_t)pendingTicks, BTN_NONE);
+    pendingTicks = 0;
+    delay(10);                       // let it actually go out before the radio dies
+  }
+  radioOff();
+  as5600SetPower(AS_PM_LPM2);
+  dozing = true;
+}
+
+void exitDoze() {
+  if (!dozing) return;
+  dozing = false;
+  as5600SetPower(AS_PM_NOM);
+  radioOn();
+  lastReadMs   = millis();           // don't let the doze gap look like one huge dt
+  lastActivity = millis();
+}
+
+// One radio window: up, send, hold briefly for the pad's reply, back down.
+// The pad answers any packet it receives, so this is also how mode, speed and
+// accel stay in sync without ever idling with the radio on.
+void radioBurst(uint8_t type, int8_t ticks, unsigned long holdMs) {
+  radioOn();
+  const unsigned long wasPadMs = lastPadMs;
+  sendMsg(type, ticks, BTN_NONE);
+  // Wait for the reply, not for the clock. Leaving early on the common case is
+  // what keeps this affordable — holding the full window every beat would cost
+  // more than the doze saves.
+  unsigned long t0 = millis();
+  while (millis() - t0 < holdMs) {
+    if (lastPadMs != wasPadMs) break;      // PK_STATE landed
+    delay(1);
+  }
+  if (otaRequested) return;          // caller handles it; leave the radio up
+  radioOff();
+}
+
+void dozeTick() {
+  esp_sleep_enable_timer_wakeup((uint64_t)SLEEP_POLL_MS * 1000ULL);
+#if PUCK_SLEEP_SKIP_ON_USB
+  if (Serial) delay(SLEEP_POLL_MS);  // host attached — burn the slice awake
+  else        esp_light_sleep_start();
+#else
+  esp_light_sleep_start();
+#endif
+
+  accumulator += readDelta();
+
+  // One full detent of real movement is the wake threshold. Using the same
+  // accumulator as the active path means sensor noise, which never integrates
+  // that far, cannot rattle the puck awake.
+  if (abs(accumulator) >= threshold()) { exitDoze(); return; }
+
+  if (digitalRead(PIN_BTN) == LOW) { exitDoze(); return; }
+
+  // Keepalive + BMS load pulse. Held longer than a plain reply window so the
+  // boost module reliably sees the current and resets its low-load timer.
+  if (millis() - lastHelloMs >= DOZE_HELLO_MS) {
+    lastHelloMs = millis();
+    magnetPresent = magnetOK();
+    radioBurst(PK_HELLO, 0, BMS_PULSE_MS);
+    linkWatchdog(millis());
+    // A rebuild leaves the radio up; we are still dozing, so put it back down.
+    if (radioUp && !otaRequested) radioOff();
+  }
+}
+#endif  // PUCK_SLEEP
+
 // ── Loop ─────────────────────────────────────────────────────────────
 void loop() {
   unsigned long now = millis();
@@ -641,19 +1114,37 @@ void loop() {
   // Once we're in OTA mode the radio belongs to the AP and there is no ESP-NOW
   // left to talk to, so nothing below this point can usefully run. Serving the
   // upload is the whole job until the flash reboots us.
-  if (otaMode) { otaServer.handleClient(); return; }
-  if (otaRequested) { otaRequested = false; enterOtaMode(); return; }
+  if (otaMode) {
+    otaServer.handleClient();
+    // Come back on our own if nobody uploads. otaTouchMs is pushed forward by
+    // every chunk received, so a slow upload can never trip this mid-flash.
+    if (millis() - otaTouchMs >= OTA_IDLE_TIMEOUT_MS) {
+      Serial.println("[OTA] idle timeout — restarting into normal mode");
+      delay(20);
+      ESP.restart();
+    }
+    return;
+  }
+  if (otaRequested) {
+    otaRequested = false;
+#if PUCK_SLEEP
+    dozing = false;
+    radioOn();                       // the AP needs the driver running
+#endif
+    enterOtaMode();
+    return;
+  }
+
+#if PUCK_SLEEP
+  if (dozing) { dozeTick(); return; }
+#endif
 
   // ── Encoder ───────────────────────────────────────────────
   if (now - lastReadMs >= READ_INTERVAL_MS) {
     unsigned long dt = now - lastReadMs;
     lastReadMs = now;
 
-    int16_t angle = (int16_t)readAngle();
-    int16_t delta = angle - lastAngle;
-    if (delta >  2048) delta -= 4096;      // 12-bit wraparound
-    if (delta < -2048) delta += 4096;
-    lastAngle = angle;
+    int16_t delta = readDelta();
 
     if (delta != 0) {
       const int th   = threshold();
@@ -669,6 +1160,7 @@ void loop() {
       if (ticks != 0) {
         pendingTicks = constrain(pendingTicks + ticks * mult, -127, 127);
         lastActivity = now;
+        relinkSpinCheck(now, abs(ticks));
       }
     }
   }
@@ -693,6 +1185,8 @@ void loop() {
     magnetPresent = magnetOK();
   }
 
+  linkWatchdog(now);
+
   // ── OLED refresh ──────────────────────────────────────────
   if (now - lastOledMs >= 100) drawOled();
 
@@ -706,16 +1200,25 @@ void loop() {
     if (padSeen && (padFlags != lastF || mode != lastM || padVolume != lastV)) {
       lastF = padFlags; lastM = mode; lastV = padVolume;
       if (!everSeen) { everSeen = true; Serial.println(F("[NOW] first PK_STATE from pad")); }
-      Serial.printf("[PAD] mode=%s ble=%d scroll=%d off=%d vol=",
+      Serial.printf("[PAD] mode=%s ble=%d scroll=%d off=%d ota=%d vol=",
                     MODE_NAMES[mode < PM_COUNT ? mode : 0],
                     (padFlags & PF_BLE_UP)    ? 1 : 0,
                     (padFlags & PF_SCROLL_OK) ? 1 : 0,
-                    (padFlags & PF_DISABLED)  ? 1 : 0);
+                    (padFlags & PF_DISABLED)  ? 1 : 0,
+                    (padFlags & PF_OTA_PEND)  ? 1 : 0);
       if (padFlags & PF_VOL_KNOWN) Serial.printf("%u%%%s\n", padVolume,
                                                  (padFlags & PF_VOL_MUTED) ? " MUTED" : "");
       else                         Serial.println(F("unknown (companion not running?)"));
     }
   }
+
+#if PUCK_SLEEP
+  // Idle long enough with nothing queued — drop the radio. The delay before
+  // dozing exists so a pause mid-turn doesn't cost a radio restart on the very
+  // next detent; restarting costs ~80 ms and would read as lag.
+  if (pendingTicks == 0 && (now - lastActivity) >= SLEEP_AFTER_MS
+      && now >= sleepGraceMs) enterDoze();
+#endif
 
   delay(1);
 }

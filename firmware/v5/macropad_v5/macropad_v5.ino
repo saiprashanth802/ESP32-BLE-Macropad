@@ -735,6 +735,9 @@ void sendWheel(int8_t clicks) {
 #define PF_DISABLED   0x04
 #define PF_VOL_KNOWN  0x08   // vol byte is real (companion app is feeding us)
 #define PF_VOL_MUTED  0x10
+// A dozing puck has its radio off and will miss a one-shot PK_OTA, so the
+// request is also latched into every PK_STATE until it acts on it or we time out.
+#define PF_OTA_PEND   0x20
 
 #define PUCK_VOL_UNKNOWN 0xFF
 
@@ -800,6 +803,17 @@ uint8_t puckPendingMac[6] = {};
 void showToast(const char* msg, uint16_t color, unsigned long ms);
 extern unsigned long lastActivityMs;
 
+// An OTA request latched until the puck picks it up. A dozing puck only has its
+// radio on for a moment every DOZE_HELLO_MS, so a one-shot PK_OTA almost always
+// arrives while it is deaf; riding along in PK_STATE means the request survives
+// until the next keepalive. Times out so it cannot fire days later by surprise.
+bool          puckOtaPending  = false;
+unsigned long puckOtaAskedMs  = 0;
+// Long enough for a dozing puck to catch it on its next keepalive, short enough
+// that it cannot fire much later by surprise. It is also cleared as soon as the
+// puck goes quiet (see below), which is the normal way it ends.
+#define PUCK_OTA_PEND_MS  90000UL
+
 static uint8_t puckFlags() {
   uint8_t f = 0;
   if (bleConnected) f |= PF_BLE_UP;
@@ -809,7 +823,26 @@ static uint8_t puckFlags() {
   if (!puckEnabled) f |= PF_DISABLED;
   if (hostVolume != PUCK_VOL_UNKNOWN) f |= PF_VOL_KNOWN;
   if (hostVolMuted) f |= PF_VOL_MUTED;
+  if (puckOtaPending) {
+    if (millis() - puckOtaAskedMs > PUCK_OTA_PEND_MS) puckOtaPending = false;
+    else f |= PF_OTA_PEND;
+  }
   return f;
+}
+
+// Expire the OTA latch on time alone. Called from the puck tick so it still
+// runs while the puck is not talking to us.
+//
+// There used to be a "puck has gone quiet, so it must have acted" shortcut
+// here. It was wrong: a dozing puck is quiet by design — it only checks in
+// every DOZE_HELLO_MS — so the latch was dropped ~10 s after the request and
+// well before the puck next woke to hear it. The request then never arrived,
+// and the puck looked like it was ignoring OTA entirely. The window below has
+// to outlast the puck's keepalive, and the loop it was guarding against is
+// already prevented on the puck side by its post-OTA cooldown.
+static void puckOtaExpire() {
+  if (!puckOtaPending) return;
+  if (millis() - puckOtaAskedMs > PUCK_OTA_PEND_MS) puckOtaPending = false;
 }
 
 // Advance the dial mode. Driven by a pad key (A_PUCK_MODE) or by the puck's
@@ -930,6 +963,8 @@ void stopPuck() {
 // Drained from loop() — owns the display and may call NimBLE.
 void puckTick() {
   if (!puckRunning) return;
+
+  puckOtaExpire();
 
   // Register a newly-seen puck (deferred out of the recv callback)
   if (puckPeerPending) {
@@ -1554,17 +1589,23 @@ void drawSettings() {
   // Shows LINKED once the puck has actually been heard from, so the cell
   // doubles as the diagnostic for "is the knob talking to me"
   const char* pv = !puckEnabled ? "OFF"
-                 : (puckRunning && puckPeerKnown && (millis() - puckLastSeenMs < 8000))
-                   ? "LINKED" : "ON";
+                 : puckLinked() ? "LINKED" : "ON";
   drawCell(10, "PUCK", pv, C_LTBLUE, false);
   drawCell(11, "SAVE", "+ exit", C_WHITE, false);
 }
 
 // True once the puck has actually been heard from recently — the same test the
 // Settings cell uses, and the gate for the mode label on the face screen.
+//
+// The window has to outlast the puck's keepalive: a dozing puck keeps its radio
+// off and only checks in every DOZE_HELLO_MS (60 s), so the old 8 s test would
+// have reported a perfectly healthy puck as offline for 52 seconds out of every
+// minute. 90 s gives one missed keepalive of slack before it reads as gone.
+#define PUCK_LINK_TIMEOUT_MS 90000UL
+
 bool puckLinked() {
   return puckEnabled && puckRunning && puckPeerKnown &&
-         (millis() - puckLastSeenMs < 8000);
+         (millis() - puckLastSeenMs < PUCK_LINK_TIMEOUT_MS);
 }
 
 void drawPuck() {
@@ -1899,6 +1940,18 @@ void hostLinkTick() {
         if (n >= 2) {
           if (p[0] <= 2) faceMode = p[0];
           if (p[1] < NUM_PERSONAS) facePersona = p[1];
+          // Mode 0 means "no face", so leave the face screen now. Setting the
+          // mode alone only stops us *returning* to it: in ALWAYS mode the pad
+          // is already sitting on SCR_FACE, and the wake-to-grid path at the
+          // bottom of loop() is gated on faceMode != 2, so nothing moved us
+          // off. A host that turned the face off to show the grid (the
+          // companion's rewrite menu) drew its labels behind the eyes, and it
+          // took a second, wasted key press to reveal them.
+          if (faceMode == 0 && currentScreen == SCR_FACE) {
+            faceGifStop();
+            currentScreen = SCR_MAIN;
+            drawMain();
+          }
         }
         break;
 
@@ -2459,8 +2512,12 @@ void onKeyTap(int i) {
         if (!puckLinked()) { showToast("PUCK NOT LINKED", C_AMBER, 1200); }
         else {
           saveSettings();
+          // Latch first, then try the direct packet: if the puck is dozing it
+          // will be deaf right now and pick the flag up on its next keepalive.
+          puckOtaPending = true;
+          puckOtaAskedMs = millis();
           puckSendOta();
-          showToast("PUCK OTA", C_MAGENTA, 1500);
+          showToast("PUCK OTA ARMED", C_MAGENTA, 1500);
           currentScreen = SCR_PUCK; drawPuck();
         }
       }
