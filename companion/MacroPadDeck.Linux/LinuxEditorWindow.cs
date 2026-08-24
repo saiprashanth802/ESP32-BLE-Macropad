@@ -16,8 +16,15 @@ namespace MacroPadDeck;
 public sealed class LinuxEditorWindow
 {
     static readonly string[] Types =
-        { "none", "focusOrLaunch", "open", "run", "window", "shortcut", "media", "text", "favorite" };
+        { "none", "focusOrLaunch", "open", "run", "window", "shortcut", "media", "text", "favorite",
+          "padAction", "write" };
     static readonly string[] WindowOps = { "left", "right", "maximize", "minimize", "nextMonitor" };
+
+    /// The pad's builtin action library, fetched live over the host link. Shared
+    /// by every KeyRow, and empty until the fetch lands — rows repopulate
+    /// themselves when it does. Static because KeyRow is nested and the editor
+    /// is a singleton; a second window would reuse the same list.
+    static IReadOnlyList<PadAction> _padActions = Array.Empty<PadAction>();
 
     static LinuxEditorWindow? _open;
 
@@ -107,7 +114,40 @@ public sealed class LinuxEditorWindow
 
         _curPreset = PresetAt(0);
         LoadPreset(_curPreset);
+
+        _ = LoadPadActions();
     }
+
+    /// Pull the pad's builtin action list so "padAction" keys can be picked by
+    /// name. Deliberately not awaited by the constructor: the fetch is a dozen
+    /// BLE round trips and the editor must open instantly whether or not the pad
+    /// is in range. Rows show an empty picker until this lands, then refresh.
+    async Task LoadPadActions()
+    {
+        var src = _deck.Actions;
+        if (src is null) { Hint("Pad action list unavailable."); return; }
+
+        if (!src.HasData)
+        {
+            Hint("Loading actions from pad…");
+            if (!await src.Fetch())
+            {
+                Hint("Couldn't read the action list — is the pad connected?");
+                return;
+            }
+        }
+
+        _padActions = src.Items;
+        Application.Invoke((_, _) =>
+        {
+            // Re-run the type handler on every row so any that are already set to
+            // padAction pick up the freshly-arrived options.
+            for (int k = 0; k < 12; k++) _rows[k].RefreshPadActions();
+            _hint.Text = $"{_padActions.Count} actions from the pad — these run on the pad itself.";
+        });
+    }
+
+    void Hint(string s) => Application.Invoke((_, _) => _hint.Text = s);
 
     static DeckConfig LoadCfg()
     {
@@ -217,17 +257,39 @@ public sealed class LinuxEditorWindow
             _label.Text = b.Label;
             _args.Text = b.Args;
             _mods.Text = ModsToText(b.Mod);
+            _pendingActionId = b.ActionId;
 
             string type = b.Type.ToLowerInvariant();
-            _target.Text = type is "shortcut" or "media" or "window" ? "" : b.Target;
+            _target.Text = type is "shortcut" or "media" or "window" or "padaction" or "write" ? "" : b.Target;
             string detailVal = type switch
             {
-                "window"   => b.Target,
-                "shortcut" => b.Key,
-                "media"    => b.Media,
-                _          => "",
+                "window"    => b.Target,
+                "shortcut"  => b.Key,
+                "media"     => b.Media,
+                // Stored as the id, shown as the label — a firmware that renames
+                // an action keeps working, which is the point of storing the id.
+                "padaction" => LabelForAction(b.ActionId),
+                _           => "",
             };
             PopulateDetail(_type.ActiveText ?? "none", detailVal);
+        }
+
+        /// Called when the pad's action list arrives after the window opened.
+        /// Only matters for padAction rows; harmless everywhere else.
+        public void RefreshPadActions()
+        {
+            if (!string.Equals(_type.ActiveText, "padAction", StringComparison.OrdinalIgnoreCase)) return;
+            PopulateDetail("padAction", LabelForAction(_pendingActionId));
+        }
+
+        /// Remembered across a repopulate so a binding loaded before the action
+        /// list arrived doesn't lose its selection when the picker fills in.
+        int _pendingActionId;
+
+        static string LabelForAction(int id)
+        {
+            foreach (var a in _padActions) if (a.Id == id) return a.Label;
+            return "";
         }
 
         public KeyBinding Read()
@@ -248,7 +310,15 @@ public sealed class LinuxEditorWindow
                     kb.Key = _detail.ActiveText ?? ""; kb.Mod = ParseMods(_mods.Text); break;
                 case "media":
                     kb.Media = _detail.ActiveText ?? ""; break;
+                case "padaction":
+                    // Keep the previously-stored id when the list hasn't loaded,
+                    // so saving from a disconnected editor doesn't wipe bindings.
+                    kb.ActionId = _detail.Active >= 0 && _detail.Active < _padActions.Count
+                        ? _padActions[_detail.Active].Id
+                        : _pendingActionId;
+                    break;
                 case "favorite":
+                case "write":
                     break;
                 default:
                     kb.Type = "none"; break;
@@ -264,10 +334,11 @@ public sealed class LinuxEditorWindow
             _detail.RemoveAll();
             string[] opts = type.ToLowerInvariant() switch
             {
-                "window"   => WindowOps,
-                "shortcut" => Protocol.HidKeys.Select(h => h.Name).ToArray(),
-                "media"    => Protocol.MediaKeys.Select(m => m.Name).ToArray(),
-                _          => Array.Empty<string>(),
+                "window"    => WindowOps,
+                "shortcut"  => Protocol.HidKeys.Select(h => h.Name).ToArray(),
+                "media"     => Protocol.MediaKeys.Select(m => m.Name).ToArray(),
+                "padaction" => _padActions.Select(a => a.Label).ToArray(),
+                _           => Array.Empty<string>(),
             };
             foreach (var o in opts) _detail.AppendText(o);
             _detail.Sensitive = opts.Length > 0;
