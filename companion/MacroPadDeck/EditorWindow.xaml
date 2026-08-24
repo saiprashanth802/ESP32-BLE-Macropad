@@ -7,38 +7,52 @@
         UseLayoutRounding="True" TextOptions.TextFormattingMode="Display">
 
   <Window.Resources>
-    <SolidColorBrush x:Key="Ink"     Color="#141413"/>
-    <SolidColorBrush x:Key="Muted"   Color="#87867F"/>
-    <SolidColorBrush x:Key="Surface" Color="#F0EEE5"/>
-    <SolidColorBrush x:Key="Border2" Color="#DAD5C9"/>
-    <SolidColorBrush x:Key="Accent"  Color="#D97757"/>
-    <SolidColorBrush x:Key="AccentD" Color="#C15F3C"/>
+    <!-- Colours are declared before the brushes and both forms derive from them: the
+         hover storyboards animate Color, not Brush, so without this the accent forks
+         into four literal hexes that drift apart on the first tweak. -->
+    <Color x:Key="AccentC">#FFD97757</Color>
+    <Color x:Key="AccentDC">#FFC15F3C</Color>
+    <Color x:Key="SurfaceC">#FFF0EEE5</Color>
+    <Color x:Key="SurfaceC0">#00F0EEE5</Color>
+    <Color x:Key="RowHoverC">#FFE8E4D8</Color>
+    <Color x:Key="RowHoverC0">#00E8E4D8</Color>
 
+    <SolidColorBrush x:Key="Ink"     Color="#141413"/>
+    <!-- Muted was #87867F: 3.15:1 on the #F0EEE5 card, which fails WCAG AA and was
+         being used at 11px. #6B6A63 is 4.67:1 against the same background. -->
+    <SolidColorBrush x:Key="Muted"   Color="#6B6A63"/>
+    <SolidColorBrush x:Key="Surface" Color="{StaticResource SurfaceC}"/>
+    <SolidColorBrush x:Key="Border2" Color="#DAD5C9"/>
+    <SolidColorBrush x:Key="Accent"  Color="{StaticResource AccentC}"/>
+
+    <!-- One grouping device per level. Cards were fill + hairline border + shadow,
+         three devices doing one job, and then bordered tiles nested inside them.
+         Fill + shadow only; the border budget is spent on selection instead. -->
     <Style x:Key="Card" TargetType="Border">
       <Setter Property="Background" Value="{StaticResource Surface}"/>
       <Setter Property="CornerRadius" Value="14"/>
-      <Setter Property="BorderBrush" Value="#E7E3D8"/>
-      <Setter Property="BorderThickness" Value="1"/>
       <Setter Property="Effect">
         <Setter.Value>
-          <DropShadowEffect BlurRadius="14" ShadowDepth="2" Direction="270"
-                            Color="#141413" Opacity="0.07"/>
+          <DropShadowEffect BlurRadius="20" ShadowDepth="2" Direction="270"
+                            Color="#141413" Opacity="0.06"/>
         </Setter.Value>
       </Setter>
     </Style>
 
+    <!-- Type scale is 20 / 15 / 13 / 11 and nothing in between. It was six sizes
+         (10.5 11 11.5 13 15 17) inside a 1.6:1 range, which reads as one grey mass. -->
     <Style TargetType="TextBlock">
       <Setter Property="Foreground" Value="{StaticResource Ink}"/>
     </Style>
     <Style x:Key="MutedText" TargetType="TextBlock">
       <Setter Property="Foreground" Value="{StaticResource Muted}"/>
-      <Setter Property="FontSize" Value="11.5"/>
+      <Setter Property="FontSize" Value="11"/>
     </Style>
     <Style x:Key="SectionLabel" TargetType="TextBlock">
       <Setter Property="Foreground" Value="{StaticResource Muted}"/>
       <Setter Property="FontSize" Value="11"/>
       <Setter Property="FontWeight" Value="SemiBold"/>
-      <Setter Property="Margin" Value="0,10,0,4"/>
+      <Setter Property="Margin" Value="0,16,0,6"/>
     </Style>
 
     <Style TargetType="TextBox">
@@ -70,8 +84,10 @@
       <Setter Property="BorderBrush" Value="{StaticResource Border2}"/>
     </Style>
 
+    <!-- Hover is a 120 ms colour ramp rather than an instant snap. The template Border
+         carries its own SolidColorBrush instance (not the shared StaticResource, which
+         is frozen and would throw when animated). -->
     <Style x:Key="PrimaryBtn" TargetType="Button">
-      <Setter Property="Background" Value="{StaticResource Accent}"/>
       <Setter Property="Foreground" Value="White"/>
       <Setter Property="FontWeight" Value="SemiBold"/>
       <Setter Property="Padding" Value="18,9"/>
@@ -79,34 +95,68 @@
       <Setter Property="Template">
         <Setter.Value>
           <ControlTemplate TargetType="Button">
-            <Border Background="{TemplateBinding Background}" CornerRadius="10" Padding="{TemplateBinding Padding}">
+            <Border x:Name="bd" CornerRadius="10" Padding="{TemplateBinding Padding}">
+              <Border.Background>
+                <SolidColorBrush Color="{StaticResource AccentC}"/>
+              </Border.Background>
               <ContentPresenter HorizontalAlignment="Center" VerticalAlignment="Center"/>
             </Border>
             <ControlTemplate.Triggers>
-              <Trigger Property="IsMouseOver" Value="True">
-                <Setter Property="Background" Value="{StaticResource AccentD}"/>
-              </Trigger>
+              <EventTrigger RoutedEvent="MouseEnter">
+                <BeginStoryboard>
+                  <Storyboard>
+                    <ColorAnimation Storyboard.TargetName="bd" Storyboard.TargetProperty="Background.Color"
+                                    To="{StaticResource AccentDC}" Duration="0:0:0.12"/>
+                  </Storyboard>
+                </BeginStoryboard>
+              </EventTrigger>
+              <EventTrigger RoutedEvent="MouseLeave">
+                <BeginStoryboard>
+                  <Storyboard>
+                    <ColorAnimation Storyboard.TargetName="bd" Storyboard.TargetProperty="Background.Color"
+                                    To="{StaticResource AccentC}" Duration="0:0:0.12"/>
+                  </Storyboard>
+                </BeginStoryboard>
+              </EventTrigger>
             </ControlTemplate.Triggers>
           </ControlTemplate>
         </Setter.Value>
       </Setter>
     </Style>
 
+    <!-- Ghost hover fades alpha on one hue (#00F0EEE5 → #FFF0EEE5) so the ramp never
+         passes through a grey midpoint the way Transparent → Surface would. -->
     <Style x:Key="GhostBtn" TargetType="Button" BasedOn="{StaticResource PrimaryBtn}">
-      <Setter Property="Background" Value="Transparent"/>
       <Setter Property="Foreground" Value="{StaticResource Ink}"/>
       <Setter Property="FontWeight" Value="Normal"/>
       <Setter Property="Template">
         <Setter.Value>
           <ControlTemplate TargetType="Button">
-            <Border Background="{TemplateBinding Background}" CornerRadius="10"
-                    BorderBrush="{StaticResource Border2}" BorderThickness="1" Padding="{TemplateBinding Padding}">
+            <Border x:Name="bd" CornerRadius="10"
+                    BorderBrush="{StaticResource Border2}" BorderThickness="1"
+                    Padding="{TemplateBinding Padding}">
+              <Border.Background>
+                <SolidColorBrush Color="{StaticResource SurfaceC0}"/>
+              </Border.Background>
               <ContentPresenter HorizontalAlignment="Center" VerticalAlignment="Center"/>
             </Border>
             <ControlTemplate.Triggers>
-              <Trigger Property="IsMouseOver" Value="True">
-                <Setter Property="Background" Value="{StaticResource Surface}"/>
-              </Trigger>
+              <EventTrigger RoutedEvent="MouseEnter">
+                <BeginStoryboard>
+                  <Storyboard>
+                    <ColorAnimation Storyboard.TargetName="bd" Storyboard.TargetProperty="Background.Color"
+                                    To="{StaticResource SurfaceC}" Duration="0:0:0.12"/>
+                  </Storyboard>
+                </BeginStoryboard>
+              </EventTrigger>
+              <EventTrigger RoutedEvent="MouseLeave">
+                <BeginStoryboard>
+                  <Storyboard>
+                    <ColorAnimation Storyboard.TargetName="bd" Storyboard.TargetProperty="Background.Color"
+                                    To="{StaticResource SurfaceC0}" Duration="0:0:0.12"/>
+                  </Storyboard>
+                </BeginStoryboard>
+              </EventTrigger>
             </ControlTemplate.Triggers>
           </ControlTemplate>
         </Setter.Value>
@@ -126,11 +176,11 @@
     </Grid.ColumnDefinitions>
 
     <!-- ── Profiles column ─────────────────────── -->
-    <Border Grid.Row="0" Grid.Column="0" Style="{StaticResource Card}" Padding="14" Margin="0,0,12,0">
+    <Border Grid.Row="0" Grid.Column="0" Style="{StaticResource Card}" Padding="16" Margin="0,0,12,0">
       <DockPanel>
         <StackPanel DockPanel.Dock="Top">
-          <TextBlock Text="MacroPad Deck" FontSize="17" FontWeight="Bold"/>
-          <TextBlock x:Name="LinkStatus" Style="{StaticResource MutedText}" Text="● connecting…" Margin="0,3,0,10"/>
+          <TextBlock Text="MacroPad Deck" FontSize="20" FontWeight="SemiBold"/>
+          <TextBlock x:Name="LinkStatus" Style="{StaticResource MutedText}" Text="● connecting…" Margin="0,4,0,12"/>
         </StackPanel>
         <StackPanel DockPanel.Dock="Bottom">
           <TextBlock Style="{StaticResource SectionLabel}" Text="EYE COLOR"/>
@@ -155,17 +205,40 @@
             <Style TargetType="ListBoxItem">
               <Setter Property="Template">
                 <Setter.Value>
+                  <!-- Hover and selection live on separate layers on purpose: a
+                       storyboard on Background.Color outranks any Setter for the same
+                       property, so sharing one Border would leave a hovered row stuck
+                       on the hover colour after it was selected. -->
                   <ControlTemplate TargetType="ListBoxItem">
-                    <Border x:Name="bd" Background="Transparent" CornerRadius="10" Padding="10,8" Margin="0,2">
-                      <ContentPresenter/>
-                    </Border>
+                    <Grid Margin="0,2">
+                      <Border x:Name="sel" CornerRadius="10" Background="Transparent"/>
+                      <Border x:Name="hov" CornerRadius="10">
+                        <Border.Background>
+                          <SolidColorBrush Color="{StaticResource RowHoverC0}"/>
+                        </Border.Background>
+                      </Border>
+                      <ContentPresenter Margin="10,8"/>
+                    </Grid>
                     <ControlTemplate.Triggers>
                       <Trigger Property="IsSelected" Value="True">
-                        <Setter TargetName="bd" Property="Background" Value="White"/>
+                        <Setter TargetName="sel" Property="Background" Value="White"/>
                       </Trigger>
-                      <Trigger Property="IsMouseOver" Value="True">
-                        <Setter TargetName="bd" Property="Background" Value="#E8E4D8"/>
-                      </Trigger>
+                      <EventTrigger RoutedEvent="MouseEnter">
+                        <BeginStoryboard>
+                          <Storyboard>
+                            <ColorAnimation Storyboard.TargetName="hov" Storyboard.TargetProperty="Background.Color"
+                                            To="{StaticResource RowHoverC}" Duration="0:0:0.12"/>
+                          </Storyboard>
+                        </BeginStoryboard>
+                      </EventTrigger>
+                      <EventTrigger RoutedEvent="MouseLeave">
+                        <BeginStoryboard>
+                          <Storyboard>
+                            <ColorAnimation Storyboard.TargetName="hov" Storyboard.TargetProperty="Background.Color"
+                                            To="{StaticResource RowHoverC0}" Duration="0:0:0.12"/>
+                          </Storyboard>
+                        </BeginStoryboard>
+                      </EventTrigger>
                     </ControlTemplate.Triggers>
                   </ControlTemplate>
                 </Setter.Value>
@@ -177,7 +250,7 @@
     </Border>
 
     <!-- ── Key grid ────────────────────────────── -->
-    <Border Grid.Row="0" Grid.Column="1" Style="{StaticResource Card}" Padding="18" Margin="0,0,12,0">
+    <Border Grid.Row="0" Grid.Column="1" Style="{StaticResource Card}" Padding="16" Margin="0,0,12,0">
       <DockPanel>
         <Grid DockPanel.Dock="Top" Margin="0,0,0,12">
           <Grid.ColumnDefinitions>
@@ -221,10 +294,13 @@
     </Border>
 
     <!-- ── Binding editor ──────────────────────── -->
+    <!-- Scrolls because the section rhythm is now 16px above each label; at MinHeight
+         the four labels plus their controls can exceed the card. -->
     <Border Grid.Row="0" Grid.Column="2" Style="{StaticResource Card}" Padding="16">
+      <ScrollViewer VerticalScrollBarVisibility="Auto" HorizontalScrollBarVisibility="Disabled">
       <StackPanel>
-        <TextBlock x:Name="BindTitle" FontSize="15" FontWeight="Bold" Text="Select a key"/>
-        <TextBlock Style="{StaticResource MutedText}" Text="K9 is the pad's FN key — its tap can still carry an action." Margin="0,3,0,0" TextWrapping="Wrap"/>
+        <TextBlock x:Name="BindTitle" FontSize="15" FontWeight="SemiBold" Text="Select a key"/>
+        <TextBlock Style="{StaticResource MutedText}" Text="K9 is the pad's FN key — its tap can still carry an action." Margin="0,4,0,0" TextWrapping="Wrap"/>
 
         <TextBlock Style="{StaticResource SectionLabel}" Text="ACTION"/>
         <ComboBox x:Name="BindType" SelectionChanged="BindType_Changed">
@@ -238,6 +314,10 @@
           <ComboBoxItem Content="Type text snippet"/>
           <ComboBoxItem Content="Favorite current song (Feishin)"/>
           <ComboBoxItem Content="Pad builtin action"/>
+          <!-- Appended, never inserted: these positions are the wire format for
+               TypeToIndex/IndexToType, so renumbering them would silently remap
+               every binding already in profiles.json. -->
+          <ComboBoxItem Content="Rewrite selection (local model)"/>
         </ComboBox>
 
         <TextBlock x:Name="TargetLabel" Style="{StaticResource SectionLabel}" Text="TARGET"/>
@@ -279,6 +359,12 @@
                      Text="Runs on the pad itself — no host involvement."/>
         </StackPanel>
 
+        <!-- "write" takes no target or arguments; the styles, the model and the preset
+             the menu borrows are all configured in styles.json. -->
+        <TextBlock x:Name="WriteHint" Visibility="Collapsed" Margin="0,8,0,0" TextWrapping="Wrap"
+                   Foreground="{StaticResource Muted}" FontSize="11"
+                   Text="Captures the current selection and opens the rewrite menu on the pad, then pastes back over the selection if you accept. Styles, model and the preset it borrows (writePreset) live in styles.json, which hot-reloads — no rebuild needed."/>
+
         <TextBlock x:Name="ArgsLabel" Style="{StaticResource SectionLabel}" Text="ARGUMENTS"/>
         <TextBox x:Name="BindArgs" TextChanged="Bind_Changed"/>
         <CheckBox x:Name="BindHidden" Content="Run hidden (no console window)" Margin="0,8,0,0"
@@ -287,6 +373,7 @@
         <TextBlock Style="{StaticResource SectionLabel}" Text="LABEL ON PAD (≤ 8 chars)"/>
         <TextBox x:Name="BindLabel" MaxLength="8" TextChanged="Bind_Changed"/>
       </StackPanel>
+      </ScrollViewer>
     </Border>
 
     <!-- ── Bottom bar ──────────────────────────── -->

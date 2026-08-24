@@ -91,7 +91,7 @@ public partial class EditorWindow : Window
         for (int k = 0; k < 12; k++)
         {
             int idx = k;
-            var btn = new Button { Margin = new Thickness(5), Cursor = System.Windows.Input.Cursors.Hand };
+            var btn = new Button { Margin = new Thickness(4), Cursor = System.Windows.Input.Cursors.Hand };
             btn.Click += (_, _) => SelectKey(idx);
             _keyBtns[k] = btn;
             KeyGrid.Children.Add(btn);
@@ -102,7 +102,8 @@ public partial class EditorWindow : Window
             LinkStatus.Text = $"● {s}";
             bool up = s.Contains("online") || s.Contains("Connected") ||
                       s.Contains("written") || s.Contains("reloaded");
-            LinkStatus.Foreground = Brush(up ? "#4C9A6B" : "#B0553E");
+            // Darkened from #4C9A6B / #B0553E, which sat near 3:1 on the card at 11px.
+            LinkStatus.Foreground = Brush(up ? "#3D7F57" : "#9E4632");
         });
 
         LoadFromDisk();
@@ -153,7 +154,7 @@ public partial class EditorWindow : Window
             DockPanel.SetDock(dot, Dock.Left);
             var preset = new TextBlock
             {
-                Text = $"P{p.Preset + 1}", Foreground = Brush("#87867F"),
+                Text = $"P{p.Preset + 1}", Foreground = Brush("#6B6A63"),
                 FontSize = 11, VerticalAlignment = VerticalAlignment.Center,
             };
             DockPanel.SetDock(preset, Dock.Right);
@@ -355,6 +356,8 @@ public partial class EditorWindow : Window
         ShortcutPanel.Visibility = shortcut ? Visibility.Visible : Visibility.Collapsed;
         BindMedia.Visibility = media ? Visibility.Visible : Visibility.Collapsed;
         PadActionPanel.Visibility = t == "padAction" ? Visibility.Visible : Visibility.Collapsed;
+        // write takes no parameters at all — only the pad label applies.
+        WriteHint.Visibility = t == "write" ? Visibility.Visible : Visibility.Collapsed;
         ArgsLabel.Visibility = run || t == "focusOrLaunch" ? Visibility.Visible : Visibility.Collapsed;
         BindArgs.Visibility = ArgsLabel.Visibility;
         BindHidden.Visibility = run ? Visibility.Visible : Visibility.Collapsed;
@@ -363,17 +366,18 @@ public partial class EditorWindow : Window
     }
 
     // ── helpers ─────────────────────────────────
+    // Indices are positions in BindType's ComboBoxItem list — append only.
     static int TypeToIndex(string t) => t.ToLowerInvariant() switch
     {
         "focusorlaunch" => 1, "open" => 2, "run" => 3, "window" => 4,
         "shortcut" => 5, "media" => 6, "text" => 7, "favorite" => 8,
-        "padaction" => 9, _ => 0,
+        "padaction" => 9, "write" => 10, _ => 0,
     };
     static string IndexToType(int i) => i switch
     {
         1 => "focusOrLaunch", 2 => "open", 3 => "run", 4 => "window",
         5 => "shortcut", 6 => "media", 7 => "text", 8 => "favorite",
-        9 => "padAction", _ => "none",
+        9 => "padAction", 10 => "write", _ => "none",
     };
     static int WindowOpToIndex(string op) => op.ToLowerInvariant() switch
     {
@@ -395,11 +399,13 @@ public partial class EditorWindow : Window
         VerticalAlignment = VerticalAlignment.Center,
         Children =
         {
-            new TextBlock { Text = title, FontSize = 10.5, Foreground = Brush("#87867F"), HorizontalAlignment = HorizontalAlignment.Center },
+            new TextBlock { Text = title, FontSize = 11, Foreground = Brush("#6B6A63"), HorizontalAlignment = HorizontalAlignment.Center },
             new TextBlock
             {
                 Text = label, FontSize = 13, FontWeight = FontWeights.SemiBold,
-                Foreground = Brush(bound ? "#141413" : "#B9B5A9"),
+                // #B9B5A9 put the unbound label near 2:1 against the tile. #7D7C74 keeps
+                // it a clear tier below ink without being unreadable.
+                Foreground = Brush(bound ? "#141413" : "#7D7C74"),
                 HorizontalAlignment = HorizontalAlignment.Center, Margin = new Thickness(0, 2, 0, 0),
             },
         },
@@ -422,10 +428,16 @@ public partial class EditorWindow : Window
     static ControlTemplate KeyTileTemplate(bool selected, bool bound, string accent)
     {
         var border = new FrameworkElementFactory(typeof(Border));
-        border.SetValue(Border.BackgroundProperty, bound ? Tint(accent) : Brush("#F7F5EE"));
+        border.SetValue(Border.BackgroundProperty, bound ? Tint(accent) : Brush("#F1EFE6"));
         border.SetValue(Border.CornerRadiusProperty, new CornerRadius(12));
-        border.SetValue(Border.BorderThicknessProperty, new Thickness(selected ? 2 : 1));
-        border.SetValue(Border.BorderBrushProperty, Brush(selected ? accent : "#DAD5C9"));
+        // Thickness is constant so selecting never nudges the grid by a pixel, and the
+        // ring is ink rather than the profile colour: selection used to be drawn in the
+        // profile's own hue, so a pale profile (#F7E8A6) was near-invisible against the
+        // tile. Ink is also now the only border in the grid, so "outlined" reads as
+        // "selected" and nothing else.
+        border.SetValue(Border.BorderThicknessProperty, new Thickness(2));
+        border.SetValue(Border.BorderBrushProperty,
+            selected ? Brush("#141413") : (System.Windows.Media.Brush)System.Windows.Media.Brushes.Transparent);
         var content = new FrameworkElementFactory(typeof(ContentPresenter));
         content.SetValue(HorizontalAlignmentProperty, HorizontalAlignment.Center);
         content.SetValue(VerticalAlignmentProperty, VerticalAlignment.Center);
