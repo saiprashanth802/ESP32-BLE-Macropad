@@ -1,0 +1,33 @@
+# Normalize line endings — repo is edited from both Linux and Windows
+* text=auto eol=lf
+
+*.ino   text eol=lf
+*.h     text eol=lf
+*.md    text eol=lf
+*.csv   text eol=lf
+
+# Binary assets — never touch
+*.stl        binary
+*.png        binary
+*.jpg        binary
+*.jpeg       binary
+*.pdf        binary
+*.PDF        binary
+*.zip        binary
+*.gbr        binary
+*.drl        binary
+*.kicad_pcb  -text
+*.kicad_sch  -text
+
+# Companion app + ml lab sources
+*.cs    text eol=lf
+*.xaml  text eol=lf
+*.csproj text eol=lf
+*.sln   text eol=crlf
+*.json  text eol=lf
+*.py    text eol=lf
+*.yaml  text eol=lf
+*.sh    text eol=lf
+*.ico        binary
+*.gbrjob     -text
+*.kicad_pro  -text

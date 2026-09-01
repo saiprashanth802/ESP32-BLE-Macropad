@@ -301,6 +301,8 @@ ESP32-BLE-MacroPad/
 ├── hardware/
 │   ├── pin_reference_v5.md                — complete v5 GPIO table + diode orientation
 │   ├── puck_wiring.md                     — encoder puck wiring
+│   ├── kicad/                             — KiCad project + fab gerbers
+│   ├── datasheets/                        — ESP-12E
 │   └── ESP32_DevKitC_v4.kicad_mod         — custom KiCad footprint
 ├── docs/
 │   ├── CONFIG_API.md                      — host-link opcodes and the JSON config API
