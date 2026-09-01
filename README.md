@@ -193,7 +193,26 @@ bar and elapsed/total time, streamed from the host by the companion app.*
 - Prompts, temperature, reasoning and per-style model live in a **hot-reloaded `styles.json`** — tune them without a rebuild
 - Pad shows the style picker, then ACCEPT / REGEN / CANCEL; the side-by-side preview on screen is editable before you accept
 - Built entirely on the existing host-link opcodes — **no firmware changes required**
-- Full guide: [`docs/REWRITE_MENU.md`](docs/REWRITE_MENU.md)
+- A **fine-tuned FIX model** was trained for this and measured against the general-purpose
+  one across two sizes and four epoch counts. It wins on corrections and speed and loses on
+  restraint, which is the axis that decides — so it did not ship, and the lab is in the repo
+  anyway: [`ml/`](ml) and [`docs/FIX_MODEL_FINETUNE.md`](docs/FIX_MODEL_FINETUNE.md)
+- Full guide: [`docs/REWRITE_MENU.md`](docs/REWRITE_MENU.md) · Linux setup:
+  [`docs/LINUX_REWRITE_SETUP.md`](docs/LINUX_REWRITE_SETUP.md)
+
+### Companion App — Windows and Linux
+
+> The pad works standalone. The companion turns it into a Stream Deck: it launches
+> and focuses apps from a key press, streams now-playing to the pad's screen,
+> switches presets to follow the foreground window, feeds the puck a real volume
+> number, and drives the rewrite menu.
+
+- Two front-ends over one shared **.NET 9** core — `MacroPadDeck.Core` holds the wire
+  protocol, profiles and orchestration; `MacroPadDeck` is WinRT/SMTC/WPF, and
+  `MacroPadDeck.Linux` is BlueZ/MPRIS/X11/GTK3
+- **Install, build and run:** [`companion/README.md`](companion/README.md) — .NET 9 SDK
+  per platform, the dependencies, pairing, the publish command, and what each failure
+  in `deck.log` means
 
 ### Config Mode — wireless setup + OTA firmware update
 - **Settings → CONFIG (WiFi/OTA)** suspends BLE and raises a WiFi hotspot (`MacroPad-Setup` / `macropad123`, `http://192.168.4.1`)
@@ -263,30 +282,34 @@ bar and elapsed/total time, streamed from the host by the companion app.*
 ```
 ESP32-BLE-MacroPad/
 ├── firmware/
-│   ├── v4/
-│   │   └── macropad_v4_nimble_espnow.ino  — v4 + optional ESP-NOW
+│   ├── v4/macropad_v4_nimble_espnow.ino   — v4 + optional ESP-NOW
 │   ├── v5/
-│   │   └── macropad_v5.ino                — v5 in development
-│   ├── media_remote/
-│   │   ├── media_remote.ino               — BLE + ESP-NOW dual mode
-│   │   └── media_remote_dual_mode.ino     — switchable mode version
-│   └── tests/
-│       ├── AS5600_test.ino                — encoder verification
-│       ├── ST7789_UI_test.ino             — display UI test
-│       ├── button_test.ino                — button GPIO test
-│       └── display_test_minimal.ino       — minimal display check
+│   │   ├── macropad_v5/                   — v5 multi-host firmware + partition table
+│   │   ├── puck_encoder/                  — wireless encoder puck (ESP32)
+│   │   ├── puck_encoder_8266/             — puck on ESP-12E
+│   │   └── User_Setup.h                   — TFT_eSPI config for the ST7789
+│   ├── media_remote/                      — BLE + ESP-NOW scroll wheel
+│   └── tests/                             — per-peripheral bring-up sketches
+├── companion/
+│   ├── README.md                          — install / build / run — start here
+│   ├── MacroPadDeck.Core/                 — protocol, profiles, controller (net9.0)
+│   ├── MacroPadDeck/                      — Windows front-end (WinRT/WPF)
+│   └── MacroPadDeck.Linux/                — Linux front-end (BlueZ/MPRIS/GTK3)
+├── ml/                                    — the FIX fine-tune lab: data generator,
+│                                            eval harness, training configs, runbook
+├── cad/stl/                               — print files: v5 case, keycaps, puck
 ├── hardware/
-│   ├── pin_reference_v5.md               — complete v5 GPIO table
-│   └── ESP32_DevKitC_v4.kicad_mod        — custom KiCad footprint
-├── images/
-│   ├── assembled.jpg                      — v3 assembled
-│   ├── internals.jpg                      — v3 internals
-│   ├── cad_body.png                       — v3 enclosure CAD
-│   ├── cad_knob.png                       — v3 encoder knob CAD
-│   └── media_remote/
-│       ├── enclosure_cad.png              — media remote enclosure CAD
-│       ├── scroll_wheel_cad.png           — scroll wheel CAD
-│       └── prototype_assembled.jpeg       — built prototype
+│   ├── pin_reference_v5.md                — complete v5 GPIO table + diode orientation
+│   ├── puck_wiring.md                     — encoder puck wiring
+│   └── ESP32_DevKitC_v4.kicad_mod         — custom KiCad footprint
+├── docs/
+│   ├── CONFIG_API.md                      — host-link opcodes and the JSON config API
+│   ├── REWRITE_MENU.md                    — local-LLM text tools
+│   ├── LINUX_REWRITE_SETUP.md             — ydotool / Wayland one-time setup
+│   ├── FIX_MODEL_FINETUNE.md              — the fine-tune, measured, and why it lost
+│   ├── PUCK_PROTOCOL.md                   — ESP-NOW protocol v3
+│   └── ROADMAP.md · TESTING_LOG.md
+├── scripts/setup-ydotool.sh
 └── README.md
 ```
 
@@ -301,6 +324,16 @@ ESP32-BLE-MacroPad/
 | Preferences | NVS persistent storage |
 | Wire | I2C for AS5600 |
 | esp_now | ESP-NOW for media remote |
+
+Companion app (see [`companion/README.md`](companion/README.md)):
+
+| Requirement | Purpose |
+|---------|---------|
+| .NET 9 SDK | Builds all three companion projects |
+| BlueZ / WinRT | BLE host link to the pad |
+| GTK3 + libayatana-appindicator | Linux tray and editor |
+| MPRIS / SMTC | Now-playing source |
+| Ollama (optional) | Local model behind the rewrite menu |
 
 ---
 

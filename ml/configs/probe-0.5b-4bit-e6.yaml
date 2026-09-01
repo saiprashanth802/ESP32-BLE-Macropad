@@ -1,0 +1,25 @@
+# FIX style, 0.5B. Pipeline-proving run — minutes, not hours.
+# No quantisation and no layer streaming at this size: the model is ~1 GB in
+# bf16, the 4060 has 8 GB, and both features cost setup and quality for nothing.
+base: Qwen/Qwen2.5-0.5B-Instruct
+task: sft
+
+data:
+  train: ./data/fix-train.jsonl
+  format: alpaca
+  val_split: 0.1
+  max_length: 512          # inputs are <450 chars; no reason to pay for 2048
+
+training:
+  epochs: 6                # 3 overfits to the corruption script's habits
+  lr: 1e-4
+  batch_size: auto
+  quantization: 4bit
+  seed: 20260816
+  lora:
+    r: 16
+    alpha: 32
+    dropout: 0.05
+    target_modules: auto
+
+output: ./output/macropad-fix-0.5b-4bit-e6

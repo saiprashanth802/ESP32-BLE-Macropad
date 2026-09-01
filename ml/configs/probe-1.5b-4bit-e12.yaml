@@ -1,0 +1,25 @@
+# FIX style, 1.5B. Same data, same eval, same hyperparameters — the ONLY
+# difference from soup-0.5b.yaml is the base model and the output directory.
+# Keep it that way: if anything else changes, the comparison stops being one.
+base: Qwen/Qwen2.5-1.5B-Instruct
+task: sft
+
+data:
+  train: ./data/fix-train.jsonl
+  format: alpaca
+  val_split: 0.1
+  max_length: 512
+
+training:
+  epochs: 12
+  lr: 1e-4
+  batch_size: auto
+  quantization: 4bit
+  seed: 20260816
+  lora:
+    r: 16
+    alpha: 32
+    dropout: 0.05
+    target_modules: auto
+
+output: ./output/macropad-fix-1.5b-4bit-e12
