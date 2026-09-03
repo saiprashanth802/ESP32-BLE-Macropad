@@ -46,6 +46,7 @@
 #include <WiFi.h>
 #include <esp_now.h>       // encoder puck link — see docs/PUCK_PROTOCOL.md
 #include <esp_wifi.h>      // esp_wifi_set_channel, to pin the ESP-NOW channel
+#include <esp_mac.h>       // esp_read_mac — base for the per-slot BLE addresses
 #include <FS.h>
 #include <SPIFFS.h>
 #include <WebServer.h>
@@ -374,6 +375,57 @@ HostSlot hostSlots[NUM_SLOTS] = {};
 int  activeSlot = 0;
 volatile bool pairingMode = false;
 
+// ── Per-slot BLE identity ────────────────────────────────────
+// Every slot advertises from its OWN static-random address, so each host keeps
+// an INDEPENDENT bond.
+//
+// Why this exists: under the old single-identity scheme all three slots shared
+// one address, and two OSes dual-booting a single machine hand the pad the
+// SAME peer address (the controller MAC is burned into the adapter). So
+// slotForAddress() collapsed them onto one slot, and (a) the second OS was
+// kicked as EVT_WRONG_HOST and could never claim a slot of its own, while
+// (b) each re-pair overwrote the single stored LTK and staled the other OS's
+// key — the endless forget-and-re-pair loop. Distinct advertised addresses
+// make the pad look like three separate keyboards, which is how commercial
+// Easy-Switch keyboards do it.
+#define ADDR_SCHEME_VER 2            // bump = wipe bonds once on next boot
+
+static ble_addr_t slotAddr[NUM_SLOTS];
+static int        ownAddrSlot = -1;  // slot whose address is live in the stack
+
+void buildSlotAddresses() {
+  uint8_t base[6];                   // esp_read_mac yields MSB-first...
+  esp_read_mac(base, ESP_MAC_BT);
+  for (int i = 0; i < NUM_SLOTS; i++) {
+    for (int b = 0; b < 6; b++) slotAddr[i].val[b] = base[5 - b];  // ...NimBLE is LE
+    slotAddr[i].val[0] ^= (uint8_t)(0x10 + i);   // distinct per slot
+    slotAddr[i].val[5] |= 0xC0;                  // static-random: top 2 bits set
+    slotAddr[i].type    = BLE_ADDR_RANDOM;
+  }
+}
+
+// Swap the stack's identity to slot n. ble_hs_id_set_rnd() returns EBUSY while
+// advertising or connected, so this may only be called from
+// startAdvertisingForSlot() — after the link is down and advertising stopped.
+bool applySlotAddress(int n) {
+  if (n < 0 || n >= NUM_SLOTS) return false;
+  if (n == ownAddrSlot) return true;
+  for (int attempt = 0; attempt < 2; attempt++) {
+    if (NimBLEDevice::setOwnAddr(slotAddr[n].val)) {
+      NimBLEDevice::setOwnAddrType(BLE_OWN_ADDR_RANDOM);
+      ownAddrSlot = n;
+      const uint8_t* a = slotAddr[n].val;
+      Serial.printf("[BLE] slot %d identity %02X:%02X:%02X:%02X:%02X:%02X\n",
+                    n + 1, a[5], a[4], a[3], a[2], a[1], a[0]);
+      return true;
+    }
+    delay(150);   // EBUSY — the old link may still be tearing down
+  }
+  Serial.printf("[BLE] own-addr set FAILED for slot %d (still on slot %d)\n",
+                n + 1, ownAddrSlot + 1);
+  return false;
+}
+
 // BLE→loop event mailbox — NimBLE callbacks must never draw on the TFT,
 // the loop task owns the display
 enum BleEvent : uint8_t { EVT_NONE=0, EVT_PAIRED, EVT_WRONG_HOST };
@@ -600,6 +652,10 @@ void startAdvertisingForSlot() {
 
   while (NimBLEDevice::getWhiteListCount() > 0)
     NimBLEDevice::whiteListRemove(NimBLEDevice::getWhiteListAddress(0));
+
+  // Only safe point to change identity: advertising is stopped and any link
+  // is already down (onDisconnect routes here after its 200 ms settle).
+  applySlotAddress(activeSlot);
 
   pAdv->setScanFilter(false, false);   // open — bonded hosts resolve via bond DB
   configureAdvertising();
@@ -1738,8 +1794,15 @@ void drawDevices() {
     tft.setCursor(14, y + 32);
     if (hostSlots[i].bonded) {
       const uint8_t* a = hostSlots[i].addr;
-      tft.printf("%02X:%02X:%02X:%02X:%02X:%02X", a[5], a[4], a[3], a[2], a[1], a[0]);
+      tft.printf("host %02X:%02X:%02X:%02X:%02X:%02X", a[5], a[4], a[3], a[2], a[1], a[0]);
     } else tft.print("empty — hold key to pair");
+    // The address this slot ADVERTISES: what the host sees when pairing, and
+    // what the companion's DeviceAddress must be set to for that slot.
+    { const uint8_t* s = slotAddr[i].val;
+      tft.setTextColor(C_BORDER, C_SURF);
+      tft.setCursor(14, y + 41);
+      tft.printf("pad  %02X:%02X:%02X:%02X:%02X:%02X",
+                 s[5], s[4], s[3], s[2], s[1], s[0]); }
     if (act) {
       tft.setTextColor(col, C_SURF);
       tft.setCursor(230, y + 8);
@@ -3874,6 +3937,22 @@ void setup() {
   // ── NimBLE init ──────────────────────────────
   // Must happen BEFORE ledcAttach — radio init resets LEDC state
   NimBLEDevice::init(DEVICE_NAME);
+  buildSlotAddresses();
+
+  // One-time migration to per-slot addresses. Under the old scheme every host
+  // bonded to the public address, which we no longer advertise — those bonds
+  // are dead on both sides. Wipe them once, so the pad never reports a slot as
+  // "linked" to a host that can never come back.
+  if (prefs.getInt("addrver", 1) < ADDR_SCHEME_VER) {
+    NimBLEDevice::deleteAllBonds();
+    memset(hostSlots, 0, sizeof(hostSlots));
+    activeSlot  = 0;
+    pairingMode = true;
+    prefs.putInt("addrver", ADDR_SCHEME_VER);
+    saveSlots();
+    Serial.println("[BLE] migrated to per-slot addresses — all bonds cleared");
+  }
+
   NimBLEDevice::setPower(ESP_PWR_LVL_P9);
   NimBLEDevice::setMTU(185);   // host-link writes exceed the 23-byte default
 
