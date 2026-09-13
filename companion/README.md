@@ -130,8 +130,10 @@ debug everything:
 tail -f ~/MacroPadDeck/deck.log
 ```
 
-Set `deviceAddress` in `profiles.json` to your pad's address **without colons**
-and restart.
+The pad is found automatically among BlueZ's known devices by its name
+(`ESP32 MacroPad`), whichever Easy-Switch slot — and therefore BLE address — it
+is on. `deviceAddress` in `profiles.json` is optional: leave it empty, or set it
+(no colons) to pin one slot's address as a fallback.
 
 Useful flags:
 

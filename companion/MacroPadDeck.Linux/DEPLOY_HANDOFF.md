@@ -102,7 +102,8 @@ First run writes `~/MacroPadDeck/profiles.json` (starter config) and logs to
 tail -f ~/MacroPadDeck/deck.log
 ```
 
-If `deviceAddress` in the json isn't `841FE82B334A`, fix it (no colons) and restart.
+`deviceAddress` is optional (the pad is auto-discovered by name, any slot); if set,
+it is only a fallback pin. Empty is fine.
 
 ## 3. Verification checklist
 

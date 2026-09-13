@@ -10,9 +10,17 @@ namespace MacroPadDeck;
 /// Disconnects are normal life (sleep, Easy-Switch, out of range) — this class
 /// quietly re-acquires on a timer rather than treating them as errors, exactly
 /// like the Windows side.
+///
+/// The pad gives each Easy-Switch slot its OWN BLE address (so each host keeps
+/// a clean, independent bond), so a hardcoded address breaks the moment the
+/// active slot changes. We therefore DISCOVER the pad among BlueZ's known
+/// devices by name on every acquire; the configured address, if any, is only a
+/// fallback pin. Same rule as the Windows BleLink.
 public sealed class BlueZBleLink : IBleLink
 {
-    readonly string _address;                 // "84:1F:E8:2B:33:4A"
+    // Matches the pad's DEVICE_NAME ("ESP32 MacroPad").
+    const string PadNameFragment = "MacroPad";
+    readonly string? _hint;                   // optional pinned "C4:1F:E8:2B:33:5A"; null = pure auto-discovery
     readonly string _svcUuid, _evtUuid, _cmdUuid;
     readonly System.Threading.Timer _retry;
     readonly SemaphoreSlim _gate = new(1, 1);
@@ -24,6 +32,11 @@ public sealed class BlueZBleLink : IBleLink
     GattCharacteristic? _evt, _cmd;
     volatile bool _up;
     int _writeFails;                                 // consecutive fully-failed writes
+    // Events that arrive between StartNotify and UP. The pad answers the CCCD
+    // subscribe with its hello immediately, and when we adopt a device the OS
+    // already reconnected that lands inside the 400 ms settle — the hello's
+    // layout burst would then be refused by Write() (!_up). Held and replayed.
+    readonly List<(byte, byte[])> _early = new();
 
     public event Action<byte, byte[]>? EventReceived;   // (opcode, payload)
     public event Action<bool>? LinkChanged;             // subscribed / lost
@@ -31,9 +44,9 @@ public sealed class BlueZBleLink : IBleLink
 
     static void Log(string m) => Diag.Log($"ble: {m}");
 
-    public BlueZBleLink(ulong address)
+    public BlueZBleLink(ulong hintAddress = 0)
     {
-        _address = FormatAddress(address);
+        _hint = hintAddress == 0 ? null : FormatAddress(hintAddress);
         // BlueZ wants the full 128-bit UUID as a lowercase string; the protocol
         // Guids stringify to exactly that.
         _svcUuid = Protocol.Service.ToString();
@@ -62,14 +75,14 @@ public sealed class BlueZBleLink : IBleLink
             if (_adapter is null) { Log("no bluetooth adapter"); return; }
             try { await _adapter.SetPoweredAsync(true); } catch { /* already on / no perms */ }
 
-            // GetDeviceAsync resolves a cached/known device by address. If BlueZ
-            // has never seen the pad, kick a short discovery and let the next
-            // tick pick it up.
-            _dev = await _adapter.GetDeviceAsync(_address);
+            _dev = await ResolveDevice();
             if (_dev is null)
             {
+                // Keep discovery running so BlueZ learns the pad's current
+                // slot address (and refreshes RSSI); next tick re-resolves.
                 try { await _adapter.StartDiscoveryAsync(); } catch { }
-                Log($"device {_address} not known yet — scanning");
+                Log(_hint is null ? "no MacroPad known to BlueZ yet — scanning"
+                                  : $"no MacroPad known yet (pin {_hint}) — scanning");
                 return;
             }
 
@@ -99,6 +112,13 @@ public sealed class BlueZBleLink : IBleLink
             Log("UP");
             _up = true;
             LinkChanged?.Invoke(true);
+            (byte, byte[])[] held;
+            lock (_early) { held = _early.ToArray(); _early.Clear(); }
+            foreach (var (op, payload) in held)
+            {
+                Log($"evt op=0x{op:X2} replayed after UP");
+                EventReceived?.Invoke(op, payload);
+            }
         }
         catch (Exception ex)
         {
@@ -108,12 +128,53 @@ public sealed class BlueZBleLink : IBleLink
         finally { _gate.Release(); }
     }
 
+    /// Find the pad among BlueZ's known devices by name. Whichever slot the pad
+    /// is on, its device entry carries the "ESP32 MacroPad" name, so a slot
+    /// switch needs no config edit. Preference, best first:
+    ///   1. a MacroPad that is already connected (the pad's active slot);
+    ///   2. a MacroPad BlueZ currently sees advertising (RSSI set) — the slot
+    ///      that is live right now, paired or not (connecting to an unpaired one
+    ///      is how this companion has always done the bonding on Linux);
+    ///   3. the pinned address from config, if BlueZ knows it;
+    ///   4. any paired MacroPad, as a last guess.
+    /// The host-link service is still verified by the caller, so a
+    /// differently-named device can never be adopted.
+    async Task<Device?> ResolveDevice()
+    {
+        Device? connected = null, seen = null, pinned = null, paired = null;
+        short seenRssi = short.MinValue;
+        foreach (var d in await _adapter!.GetDevicesAsync())
+        {
+            Device1Properties p;
+            try { p = await d.GetAllAsync(); } catch { continue; }
+            string name = p.Name ?? p.Alias ?? "";
+            if (!name.Contains(PadNameFragment, StringComparison.OrdinalIgnoreCase)) continue;
+
+            if (p.Connected) { connected = d; Log($"resolve: connected '{name}' {p.Address}"); break; }
+            if (p.RSSI != 0 && p.RSSI > seenRssi) { seenRssi = p.RSSI; seen = d; }
+            if (_hint is not null && string.Equals(p.Address, _hint, StringComparison.OrdinalIgnoreCase)) pinned = d;
+            if (p.Paired) paired ??= d;
+        }
+        var pick = connected ?? seen ?? pinned ?? paired;
+        if (pick is not null && pick != connected)
+        {
+            string how = pick == seen ? $"advertising {seenRssi} dBm" : pick == pinned ? "pinned" : "paired";
+            Log($"resolve: '{PadNameFragment}' {await pick.GetAddressAsync()} ({how})");
+        }
+        return pick;
+    }
+
     Task OnValue(GattCharacteristic sender, GattCharacteristicValueEventArgs e)
     {
         byte[] b = e.Value;
         if (b.Length >= 2 && b.Length >= 2 + b[1])
         {
             Log($"evt op=0x{b[0]:X2} len={b[1]} [{Convert.ToHexString(b, 2, b[1])}]");
+            if (!_up)
+            {
+                lock (_early) _early.Add((b[0], b[2..(2 + b[1])]));
+                return Task.CompletedTask;
+            }
             EventReceived?.Invoke(b[0], b[2..(2 + b[1])]);
         }
         else
@@ -181,6 +242,7 @@ public sealed class BlueZBleLink : IBleLink
     {
         if (_evt is not null) { try { _evt.Value -= OnValue; } catch { } }
         _evt = null; _cmd = null;
+        lock (_early) _early.Clear();          // a stale hello must not replay on the next link
         if (_dev is not null)
         {
             try { _dev.Disconnected -= OnDisconnected; } catch { }

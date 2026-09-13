@@ -6,7 +6,11 @@ static class LinuxProgram
     {
         ProfileStore.DeckSampleKeys = LinuxDefaults.DeckSampleKeys;
         using var store = new ProfileStore();
-        ulong addr = Convert.ToUInt64(store.Config.DeviceAddress.Replace(":", ""), 16);
+        // deviceAddress is now an optional pin/override. BlueZBleLink auto-discovers
+        // the pad by name, so a slot switch that changes the pad's BLE address no
+        // longer needs a config edit + restart. Empty = pure auto-discovery.
+        string cfgAddr = (store.Config.DeviceAddress ?? "").Replace(":", "").Trim();
+        ulong addr = cfgAddr.Length == 0 ? 0 : Convert.ToUInt64(cfgAddr, 16);
 
         using var ble = new BlueZBleLink(addr);
         using var deck = new DeckController(ble, store, new LinuxActionEngine());

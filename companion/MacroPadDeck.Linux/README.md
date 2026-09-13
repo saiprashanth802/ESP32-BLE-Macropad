@@ -75,9 +75,10 @@ dotnet publish -c Release -r linux-x64 --self-contained true \
 
 Same as Windows: `~/MacroPadDeck/profiles.json`, hot-reloaded on save, log at
 `~/MacroPadDeck/deck.log`. First run writes a starter config (edit the `firefox`/
-`code` sample bindings in the DECK preset to taste). Set `deviceAddress` to the
-pad's BLE address (base MAC **+2**). Edit via the tray's **Open editor**, or
-**Edit profiles.json**, or any text editor.
+`code` sample bindings in the DECK preset to taste). The pad is auto-discovered
+by name (`ESP32 MacroPad`) on every acquire, so each slot's own BLE address needs
+no config; `deviceAddress` is an optional pin/fallback (no colons). Edit via the
+tray's **Open editor**, or **Edit profiles.json**, or any text editor.
 
 Rewrite styles live alongside it in `~/MacroPadDeck/styles.json` (tray → **Edit
 styles.json**), same format and defaults as Windows.
