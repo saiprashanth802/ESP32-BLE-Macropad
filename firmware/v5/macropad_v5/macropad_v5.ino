@@ -398,13 +398,16 @@ volatile bool pairingMode = false;
 // Why this exists: under the old single-identity scheme all three slots shared
 // one address, and two OSes dual-booting a single machine hand the pad the
 // SAME peer address (the controller MAC is burned into the adapter). So
-// slotForAddress() collapsed them onto one slot, and (a) the second OS was
-// kicked as EVT_WRONG_HOST and could never claim a slot of its own, while
-// (b) each re-pair overwrote the single stored LTK and staled the other OS's
-// key — the endless forget-and-re-pair loop. Distinct advertised addresses
-// make the pad look like three separate keyboards, which is how commercial
-// Easy-Switch keyboards do it.
-#define ADDR_SCHEME_VER 2            // bump = wipe bonds once on next boot
+// the pad's peer-address→slot lookup collapsed them onto one slot, and (a)
+// the second OS was kicked as a "wrong host" and could never claim a slot of
+// its own, while (b) each re-pair overwrote the single stored LTK and staled
+// the other OS's key — the endless forget-and-re-pair loop. Distinct
+// advertised addresses make the pad look like three separate keyboards,
+// which is how commercial Easy-Switch keyboards do it — that is the host
+// side of the fix. The pad side (no peer-address slot lookup, and per-slot
+// copies of the bond keys) is the "Per-slot bond keys" block below.
+#define ADDR_SCHEME_VER 3            // bump = wipe bonds once on next boot
+                                     // 2: per-slot addresses  3: per-slot bond keys
 
 static ble_addr_t slotAddr[NUM_SLOTS];
 static int        ownAddrSlot = -1;  // slot whose address is live in the stack
@@ -442,9 +445,113 @@ bool applySlotAddress(int n) {
   return false;
 }
 
+// ── Per-slot bond keys ───────────────────────────────────────
+// NimBLE's bond store is keyed by PEER address only, and a re-pair from the
+// same peer REPLACES the entry. A dual-boot machine is one peer (same adapter
+// MAC under both OSes), so two OSes bonded on two slots would keep
+// overwriting each other's LTK on the pad — the other OS then fails
+// encryption on its next connect and has to forget + re-pair. Per-slot
+// addresses fixed the HOST side of that collision; this fixes the PAD side.
+//
+// Each slot keeps its own copy of the security material NimBLE persisted for
+// its host. On a slot switch the live store entry for that peer is swapped
+// for the slot's copy before advertising, so whichever OS connects finds the
+// key it actually holds.
+struct SlotBond {                    // POD — one NVS blob per slot ("bond0".."bond2")
+  uint8_t  valid;
+  uint8_t  hasPeer;                  // peer_sec present (host distributed keys)
+  struct ble_store_value_sec ours;   // what the host uses to encrypt to us
+  struct ble_store_value_sec peer;   // what we'd use to initiate security
+};
+extern Preferences prefs;            // declared with the other NVS state below
+static SlotBond slotBond[NUM_SLOTS] = {};
+static int      bondLoadedSlot = -1; // slot whose keys are live in NimBLE's store
+volatile int8_t pendingBondSnap = -1;// onAuthenticationComplete → loop: snapshot this slot
+
+static void slotBondKey(char* out, int n) { snprintf(out, 8, "bond%d", n); }
+
+static void slotPeerKey(int n, struct ble_store_key_sec* key) {
+  memset(key, 0, sizeof(*key));
+  memcpy(key->peer_addr.val, hostSlots[n].addr, 6);
+  key->peer_addr.type = hostSlots[n].type;
+}
+
+void loadSlotBonds() {
+  char k[8];
+  for (int i = 0; i < NUM_SLOTS; i++) {
+    slotBondKey(k, i);
+    if (prefs.getBytesLength(k) == sizeof(SlotBond))
+      prefs.getBytes(k, &slotBond[i], sizeof(SlotBond));
+    else
+      memset(&slotBond[i], 0, sizeof(SlotBond));
+  }
+}
+
+// Copy the keys NimBLE just persisted for slot n's host into that slot's own
+// blob. Called from loop() (not the BLE callback): NimBLE persists keys AFTER
+// it raises the enc-change event, so reading them inside
+// onAuthenticationComplete would see the previous pairing's material.
+void snapshotSlotBond(int n) {
+  if (n < 0 || n >= NUM_SLOTS || !hostSlots[n].bonded) return;
+  struct ble_store_key_sec key; slotPeerKey(n, &key);
+  SlotBond sb = {};
+  if (ble_store_read_our_sec(&key, &sb.ours) != 0) {
+    Serial.printf("[BLE] slot %d: no our_sec in store to snapshot\n", n + 1);
+    return;
+  }
+  sb.hasPeer = (ble_store_read_peer_sec(&key, &sb.peer) == 0);
+  sb.valid   = 1;
+  bondLoadedSlot = n;                // the live entry IS this slot's now
+  if (slotBond[n].valid && memcmp(&slotBond[n], &sb, sizeof(SlotBond)) == 0) return;
+  slotBond[n] = sb;
+  char k[8]; slotBondKey(k, n);
+  prefs.putBytes(k, &slotBond[n], sizeof(SlotBond));
+  Serial.printf("[BLE] slot %d bond keys snapshotted (ltk=%d peer=%d)\n",
+                n + 1, sb.ours.ltk_present, sb.hasPeer);
+}
+
+// Make slot n's keys the live ones in NimBLE's store. Safe any time the link
+// is down; startAdvertisingForSlot() is the one caller.
+void restoreSlotBond(int n) {
+  if (n < 0 || n >= NUM_SLOTS) return;
+  if (n == bondLoadedSlot) return;
+  if (!hostSlots[n].bonded || !slotBond[n].valid) {
+    // Nothing to load: leave whatever is live alone. A fresh pairing on this
+    // slot overwrites it; the slot it belonged to keeps its own copy.
+    return;
+  }
+  struct ble_store_key_sec key; slotPeerKey(n, &key);
+  ble_store_delete_our_sec(&key);    // drop the other slot's copy for this peer
+  ble_store_delete_peer_sec(&key);   // (CCCDs are left alone — hosts re-subscribe)
+  int rc = ble_store_write_our_sec(&slotBond[n].ours);
+  if (slotBond[n].hasPeer) ble_store_write_peer_sec(&slotBond[n].peer);
+  bondLoadedSlot = n;
+  Serial.printf("[BLE] slot %d bond keys restored (rc=%d)\n", n + 1, rc);
+}
+
+// Forget slot n's host. Only touch NimBLE's live entry when it is really this
+// slot's: another slot bonded to the SAME peer (the dual-boot case) owns the
+// live entry whenever it is the active slot, and its copy must survive.
+void dropSlotBond(int n) {
+  if (n < 0 || n >= NUM_SLOTS) return;
+  if (hostSlots[n].bonded) {
+    bool sharedPeer = false;
+    for (int i = 0; i < NUM_SLOTS; i++)
+      if (i != n && hostSlots[i].bonded &&
+          memcmp(hostSlots[i].addr, hostSlots[n].addr, 6) == 0) sharedPeer = true;
+    if (!sharedPeer || n == activeSlot)
+      NimBLEDevice::deleteBond(NimBLEAddress(hostSlots[n].addr, hostSlots[n].type));
+    if (n == bondLoadedSlot) bondLoadedSlot = -1;
+  }
+  hostSlots[n].bonded = 0;
+  memset(&slotBond[n], 0, sizeof(SlotBond));
+  char k[8]; slotBondKey(k, n);
+  prefs.remove(k);
+}
+
 // BLE→loop event mailbox — NimBLE callbacks must never draw on the TFT,
 // the loop task owns the display
-enum BleEvent : uint8_t { EVT_NONE=0, EVT_PAIRED, EVT_WRONG_HOST };
+enum BleEvent : uint8_t { EVT_NONE=0, EVT_PAIRED };
 volatile uint8_t pendingBleEvent = EVT_NONE;
 
 // ════════════════════════════════════════════════
@@ -483,14 +590,16 @@ enum : uint8_t {  // device → host
 // 8 entries × 11 bytes + 3 header = 91, comfortably inside the 185-byte MTU
 #define ACTIONS_PER_PAGE 8
 enum : uint8_t {  // host → device
-  HCMD_LABEL  = 0x81,  // [preset][key][utf8 ≤8] — live label override
-  HCMD_STATUS = 0x82,  // [utf8 ≤23] — status-bar line; empty clears
+  HCMD_LABEL  = 0x81,  // [preset][key][ascii ≤8] — live label override
+  HCMD_STATUS = 0x82,  // [ascii ≤23] — status-bar line; empty clears
   HCMD_PRESET = 0x83,  // [preset] — foreground-follow switches the pad
   HCMD_FACE   = 0x84,  // [mode 0-2][persona 0-3]
   HCMD_COLOR  = 0x85,  // [preset][rgb565 hi][rgb565 lo] — preset accent + eye color
   HCMD_KEY    = 0x86,  // [preset][key][kaType][mod][hid][cons lo][cons hi][label…]
   HCMD_COMMIT = 0x87,  // persist presets to NVS (send once after a setKey burst)
-  HCMD_TEXT   = 0x88,  // [preset][key][utf8 ≤23] — text payload for a KA_TEXT key
+  HCMD_TEXT   = 0x88,  // [preset][key][ascii ≤23] — text payload for a KA_TEXT key
+                       // ASCII only: the companion's Sanitize() maps anything
+                       // outside 0x20-0x7E to '?' before it reaches the wire.
   HCMD_EYES   = 0x89,  // [rgb565 hi][rgb565 lo][persist] — eye color, 0 = follow preset
   HCMD_MEDIA  = 0x8A,  // [flags][pos lo][hi][dur lo][hi][title ≤20]
                        // flags: bit0 = playing, bit1 = favorited,
@@ -586,12 +695,6 @@ void faceSlotGlance(int slot);    // fwd
 void enterConfigMode();           // fwd
 void clampFaceCfg();              // fwd
 
-int slotForAddress(const uint8_t addr[6]) {
-  for (int i = 0; i < NUM_SLOTS; i++)
-    if (hostSlots[i].bonded && memcmp(hostSlots[i].addr, addr, 6) == 0) return i;
-  return -1;
-}
-
 class ServerCB : public NimBLEServerCallbacks {
   void onConnect(NimBLEServer* s, NimBLEConnInfo& info) override {
     Serial.printf("[BLE] connect h=%u peer=%s\n",
@@ -616,32 +719,32 @@ class ServerCB : public NimBLEServerCallbacks {
     }
     NimBLEAddress id = info.getIdAddress();
     const uint8_t* idBytes = id.getBase()->val;
-    int knownSlot = slotForAddress(idBytes);
 
+    // Slot ownership is decided by the ADDRESS the host connected to — each
+    // slot advertises its own, so whoever bonded through it is that slot's
+    // host by construction. The peer address must NOT be used to claim
+    // "this host belongs to another slot": a dual-boot machine presents the
+    // same peer address under both OSes, and keying on it locked the whole
+    // machine to whichever slot it bonded first (slots 1/3 dead, only 2 alive).
     if (pairingMode) {
-      if (knownSlot >= 0 && knownSlot != activeSlot) {
-        // A host already bonded to a DIFFERENT slot grabbed the open
-        // advertising — kick it, keep waiting for a genuinely new device
-        pendingBleEvent = EVT_WRONG_HOST;
-        pServer->disconnect(info.getConnHandle());
-        return;
-      }
       memcpy(hostSlots[activeSlot].addr, idBytes, 6);
       hostSlots[activeSlot].type   = id.getBase()->type;
       hostSlots[activeSlot].bonded = 1;
       pairingMode = false;
       saveSlots();
       pendingBleEvent = EVT_PAIRED;
-    } else {
-      // Enforce Easy-Switch in software: only kick a host we POSITIVELY know
-      // belongs to a different slot. A host that resolves to knownSlot == -1
-      // (address didn't map cleanly) is kept — better than wrongly rejecting
-      // the legitimate active host and breaking reconnection.
-      if (knownSlot >= 0 && knownSlot != activeSlot) {
-        pendingBleEvent = EVT_WRONG_HOST;
-        pServer->disconnect(info.getConnHandle());
-      }
+    } else if (!hostSlots[activeSlot].bonded ||
+               memcmp(hostSlots[activeSlot].addr, idBytes, 6) != 0) {
+      // Bonded outside pairing mode (host forgot us and re-paired to this
+      // slot's address, or a stale record) — adopt it as this slot's host.
+      memcpy(hostSlots[activeSlot].addr, idBytes, 6);
+      hostSlots[activeSlot].type   = id.getBase()->type;
+      hostSlots[activeSlot].bonded = 1;
+      saveSlots();
     }
+    // Keys are persisted by NimBLE only after this callback returns — the
+    // loop task takes the per-slot copy (no-op if nothing changed).
+    pendingBondSnap = (int8_t)activeSlot;
   }
   void onDisconnect(NimBLEServer* s, NimBLEConnInfo& info, int reason) override {
     Serial.printf("[BLE] disconnect reason=%d\n", reason);
@@ -694,6 +797,7 @@ void startAdvertisingForSlot() {
   // Only safe point to change identity: advertising is stopped and any link
   // is already down (onDisconnect routes here after its 200 ms settle).
   applySlotAddress(activeSlot);
+  restoreSlotBond(activeSlot);
 
   pAdv->setScanFilter(false, false);   // open — bonded hosts resolve via bond DB
   configureAdvertising();
@@ -706,10 +810,7 @@ void startAdvertisingForSlot() {
 // opens pairing (Pebble Keys long-press behaviour).
 void switchToSlot(int n, bool forcePair) {
   if (n < 0 || n >= NUM_SLOTS) return;
-  if (forcePair && hostSlots[n].bonded) {
-    NimBLEDevice::deleteBond(NimBLEAddress(hostSlots[n].addr, hostSlots[n].type));
-    hostSlots[n].bonded = 0;
-  }
+  if (forcePair && hostSlots[n].bonded) dropSlotBond(n);
   activeSlot  = n;
   pairingMode = forcePair || !hostSlots[n].bonded;
   faceSlotGlance(n);          // face glances toward the new slot if visible soon
@@ -723,8 +824,7 @@ void switchToSlot(int n, bool forcePair) {
 
 void clearSlotBond(int n) {
   if (n < 0 || n >= NUM_SLOTS || !hostSlots[n].bonded) return;
-  NimBLEDevice::deleteBond(NimBLEAddress(hostSlots[n].addr, hostSlots[n].type));
-  hostSlots[n].bonded = 0;
+  dropSlotBond(n);
   saveSlots();
   if (n == activeSlot) {
     pairingMode = true;
@@ -735,7 +835,8 @@ void clearSlotBond(int n) {
 
 void clearAllBonds() {
   NimBLEDevice::deleteAllBonds();
-  for (int i = 0; i < NUM_SLOTS; i++) hostSlots[i].bonded = 0;
+  for (int i = 0; i < NUM_SLOTS; i++) dropSlotBond(i);
+  bondLoadedSlot = -1;
   pairingMode = true;
   saveSlots();
   if (bleConnected) pServer->disconnect(bleConnHandle);
@@ -1433,6 +1534,7 @@ void loadState() {
   activeSlot          = constrain(prefs.getInt("slot", 0), 0, NUM_SLOTS-1);
   if (prefs.getBytesLength("slots") == sizeof(hostSlots))
     prefs.getBytes("slots", hostSlots, sizeof(hostSlots));
+  loadSlotBonds();
   if (prefs.getInt("pver", 0) == PRESETS_VER &&
       prefs.getBytesLength("presets") == sizeof(presets))
     prefs.getBytes("presets", presets, sizeof(presets));
@@ -2019,7 +2121,7 @@ void hostLinkTick() {
     const uint8_t* p = q.data + 2;
     if ((size_t)(2 + n) <= q.len) switch (op) {
 
-      case HCMD_LABEL:                     // [preset][key][utf8 ≤8]
+      case HCMD_LABEL:                     // [preset][key][ascii ≤8]
         if (n >= 2 && p[0] < NUM_PRESETS && p[1] < NUM_KEYS) {
           KeyAction& ka = presets[p[0]].keys[p[1]];
           int L = min((int)n - 2, 8);
@@ -2028,7 +2130,7 @@ void hostLinkTick() {
         }
         break;
 
-      case HCMD_STATUS: {                  // [utf8 ≤23]; empty clears
+      case HCMD_STATUS: {                  // [ascii ≤23]; empty clears
         int L = min((int)n, (int)sizeof(hostStatus) - 1);
         memcpy(hostStatus, p, L); hostStatus[L] = '\0';
         if (currentScreen == SCR_MAIN)
@@ -2095,7 +2197,7 @@ void hostLinkTick() {
         }
         break;
 
-      case HCMD_TEXT:                      // [preset][key][utf8 ≤23]
+      case HCMD_TEXT:                      // [preset][key][ascii ≤23]
         if (n >= 2 && p[0] < NUM_PRESETS && p[1] < NUM_KEYS) {
           KeyAction& ka = presets[p[0]].keys[p[1]];
           int L = min((int)n - 2, 23);
@@ -4574,12 +4676,13 @@ void setup() {
   // "linked" to a host that can never come back.
   if (prefs.getInt("addrver", 1) < ADDR_SCHEME_VER) {
     NimBLEDevice::deleteAllBonds();
+    for (int i = 0; i < NUM_SLOTS; i++) dropSlotBond(i);
     memset(hostSlots, 0, sizeof(hostSlots));
     activeSlot  = 0;
     pairingMode = true;
     prefs.putInt("addrver", ADDR_SCHEME_VER);
     saveSlots();
-    Serial.println("[BLE] migrated to per-slot addresses — all bonds cleared");
+    Serial.println("[BLE] bond scheme migrated — all bonds cleared, re-pair every host");
   }
 
   NimBLEDevice::setPower(ESP_PWR_LVL_P9);
@@ -4684,10 +4787,12 @@ void loop() {
       snprintf(msg, sizeof(msg), "PAIRED SLOT %d", activeSlot + 1);
       redraw();
       showToast(msg, C_GREEN, 1500);
-    } else if (evt == EVT_WRONG_HOST) {
-      redraw();
-      showToast("WRONG DEVICE", C_RED, 1200);
     }
+  }
+  if (pendingBondSnap >= 0) {
+    int n = pendingBondSnap;
+    pendingBondSnap = -1;
+    snapshotSlotBond(n);
   }
 
   // Connection state change → redraw (+ fire buffered wake-key)
