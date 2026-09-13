@@ -19,8 +19,9 @@ public sealed class DeckController : IDisposable
     public PadActions? Actions { get; private set; }
     public void AttachActions(PadActions a) => Actions = a;
 
-    /// Local-model rewrite menu. Optional — null when the Windows front-end
-    /// hasn't wired one up (the Linux front-end currently doesn't).
+    /// Local-model rewrite menu. Optional — null only when a front-end
+    /// chooses not to wire one up. Both front-ends currently do: Windows in its
+    /// Program.cs, Linux in MacroPadDeck.Linux/Program.cs:18-24.
     WriteFlow? _write;
     public void AttachWrite(WriteFlow w) => _write = w;
     int _activePreset = -1;               // pad's preset as we last knew it

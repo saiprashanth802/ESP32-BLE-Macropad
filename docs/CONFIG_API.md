@@ -210,12 +210,26 @@ Wire format both ways: `[opcode:1][len:1][payload:len]`.
 
 | Op | Name | Payload | Effect |
 |----|------|---------|--------|
-| `0x81` | setLabel  | `[preset][key][utf8 ≤8]` | Live label override (RAM only; persists only if the user saves on-device) |
-| `0x82` | setStatus | `[utf8 ≤23]` | Status-bar line on the main grid; empty clears |
+| `0x81` | setLabel  | `[preset][key][ascii ≤8]` | Live label override (RAM only; persists only if the user saves on-device) |
+| `0x82` | setStatus | `[ascii ≤23]` | Status-bar line on the main grid; empty clears |
 | `0x83` | setPreset | `[preset]` | Foreground-follow: switch the pad's preset; echoed back as event `0x03` |
 | `0x84` | setFace   | `[mode 0-2][persona 0-3]` | Face mode / personality override (RAM only). **Mode 0 also leaves the face screen immediately** — see below |
+| `0x85` | setColor  | `[preset][rgb565 hi][rgb565 lo]` | Preset accent colour, which the eyes follow. RAM only — the app re-pushes every session |
+| `0x86` | setKey    | `[preset][key][kaType][mod][hid][cons lo][cons hi][label…]` | Full key reassignment. With `kaType = 0` (`KA_BUILTIN`) the consumer field carries the action id — see below. A `KA_TEXT` key's payload arrives separately via `0x88` |
+| `0x87` | commit    | *(none)* | Persist the presets to NVS. Send **once** after a burst of `setKey`s — one flash write per editor save, not per key |
+| `0x88` | setText   | `[preset][key][ascii ≤23]` | Text payload for a `KA_TEXT` key |
+| `0x89` | setEyes   | `[rgb565 hi][rgb565 lo][persist]` | Eye colour independent of the preset accent; `0` = follow preset. `persist` writes NVS |
+| `0x8A` | setMedia  | `[flags][pos lo][hi][dur lo][hi][ascii title ≤20]` | Now-playing strip. flags: bit0 playing, bit1 favorited, **bit2 = this source is actually music** — bit2 alone gates the music-reactive face, so a YouTube video or audiobook fills the strip without making the pad bob along |
 | `0x8B` | setVolume | `[level 0-100 \| 0xFF unknown][flags: bit0 muted]` | True system volume, relayed to the encoder puck. BLE HID volume is relative, so this is the only way the pad can know the real level |
 | `0x8C` | getActions | `[page]` | Ask for one page of the builtin action library; answered with event `0x04` |
+
+**Text payloads are ASCII, not UTF-8.** Every string field above is passed
+through the companion's `Sanitize()` (`MacroPadDeck.Core/Protocol.cs:183-192`),
+which keeps only printable ASCII `0x20`–`0x7E` and replaces every other character
+— accents, em-dashes, emoji — with `?`. Earlier revisions of this table and of the
+firmware's own comments said "utf8"; that was never true on the wire. The pad's
+font has no glyphs beyond ASCII, so the substitution happens at the edge rather
+than producing tofu on the display.
 
 ### Builtin actions over the host link
 

@@ -9,9 +9,12 @@ The pad is the **input device** and the monitor is the **display**: a rewritten
 paragraph will never fit a 240 px screen, but your hand is already on the pad, so
 picking a style and accepting the result belong there.
 
-Implemented in the Windows companion app — `MacroPadDeck.Core/WriteFlow.cs`,
-`StyleStore.cs`, `LlmClient.cs`, plus `WindowsTextCapture.cs` and
-`RewritePreviewWindow.cs`. No firmware support is required beyond `type: "host"`
+Implemented on **both** front-ends. The platform-independent half lives in
+`MacroPadDeck.Core/WriteFlow.cs`, `StyleStore.cs` and `LlmClient.cs`; the capture
+and preview halves are per-platform — `MacroPadDeck/WindowsTextCapture.cs` +
+`RewritePreviewWindow.cs` on Windows, `MacroPadDeck.Linux/LinuxTextCapture.cs` +
+`GtkRewritePreview.cs` on Linux (see `LINUX_REWRITE_SETUP.md`, and §3.7 of
+`HOMELAB_AND_MACROPAD_THEORY.md` for why the Wayland preview refuses focus). No firmware support is required beyond `type: "host"`
 keys, which already exist.
 
 ---
