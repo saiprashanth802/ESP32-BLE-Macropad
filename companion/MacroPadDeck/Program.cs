@@ -12,8 +12,12 @@ static class Program
 
         ProfileStore.DeckSampleKeys = WindowsDefaults.DeckSampleKeys;
         using var store = new ProfileStore();
-        ulong addr = Convert.ToUInt64(store.Config.DeviceAddress.Replace(":", ""), 16);
-        using var ble = new BleLink(addr);
+        // deviceAddress is now an optional pin/override. BleLink auto-discovers
+        // the paired MacroPad by name, so a slot switch that changes the pad's
+        // BLE address no longer needs a config edit + restart. Empty = pure auto.
+        string cfgAddr = (store.Config.DeviceAddress ?? "").Replace(":", "").Trim();
+        ulong hint = cfgAddr.Length == 0 ? 0 : Convert.ToUInt64(cfgAddr, 16);
+        using var ble = new BleLink(hint);
         using var deck = new DeckController(ble, store, new ActionEngine());
         deck.AttachActions(new PadActions(ble));
 
