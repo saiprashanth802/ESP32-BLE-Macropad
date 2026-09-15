@@ -37,7 +37,10 @@ public sealed class RewritePreviewWindow : IRewritePreview
     static readonly Brush Line   = Hex("#E7E3D8");
     static readonly Brush Accent = Hex("#D97757");
     static readonly Brush Ink    = Hex("#141413");
-    static readonly Brush Muted  = Hex("#87867F");
+    // Kept in step with EditorWindow's Muted — #87867F was 3.15:1 on Card and failed
+    // WCAG AA. NOTE: this palette is a hand-copy of the editor's; the two will drift
+    // again until they share a ResourceDictionary.
+    static readonly Brush Muted  = Hex("#6B6A63");
 
     static SolidColorBrush Hex(string h)
     {
@@ -154,7 +157,7 @@ public sealed class RewritePreviewWindow : IRewritePreview
 
         _styleTag = new TextBlock
         {
-            Foreground = Accent, FontWeight = FontWeights.SemiBold, FontSize = 12,
+            Foreground = Accent, FontWeight = FontWeights.SemiBold, FontSize = 11,
             VerticalAlignment = VerticalAlignment.Center,
         };
 
@@ -188,7 +191,7 @@ public sealed class RewritePreviewWindow : IRewritePreview
             {
                 Children =
                 {
-                    new TextBlock { Text = "SUBJECT (copied to clipboard)", Foreground = Muted, FontSize = 10 },
+                    new TextBlock { Text = "SUBJECT (copied to clipboard)", Foreground = Muted, FontSize = 11 },
                     _subjectText,
                 },
             },
@@ -264,8 +267,8 @@ public sealed class RewritePreviewWindow : IRewritePreview
         var stack = new DockPanel();
         var cap = new TextBlock
         {
-            Text = caption, Foreground = Muted, FontSize = 10,
-            Margin = new Thickness(2, 0, 0, 5),
+            Text = caption, Foreground = Muted, FontSize = 11,
+            Margin = new Thickness(2, 0, 0, 6),
         };
         DockPanel.SetDock(cap, Dock.Top);
         stack.Children.Add(cap);

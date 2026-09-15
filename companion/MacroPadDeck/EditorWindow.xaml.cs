@@ -46,6 +46,8 @@ public partial class EditorWindow : Window
     Profile? _prof;
     int _keyIdx = -1;
     bool _loading;                       // suppress change-handlers during UI fill
+    int _recMod;                         // shortcut recorder: Ctrl1 Shift2 Alt4 Win8
+    string _recKey = "";                 // ...and a Protocol.HidKeys name
     readonly Button[] _keyBtns = new Button[12];
     readonly DeckController _deck;
     List<PadAction> _padActions = new();
@@ -56,7 +58,6 @@ public partial class EditorWindow : Window
         _deck = deck;
 
         for (int p = 0; p < 8; p++) ProfPreset.Items.Add(p.ToString());
-        foreach (var (name, _) in Protocol.HidKeys) BindKeyCombo.Items.Add(name);
         foreach (var (name, _) in Protocol.MediaKeys) BindMedia.Items.Add(name);
 
         // The builtin list comes off the pad, so it can only be filled once the
@@ -91,7 +92,7 @@ public partial class EditorWindow : Window
         for (int k = 0; k < 12; k++)
         {
             int idx = k;
-            var btn = new Button { Margin = new Thickness(5), Cursor = System.Windows.Input.Cursors.Hand };
+            var btn = new Button { Margin = new Thickness(4), Cursor = System.Windows.Input.Cursors.Hand };
             btn.Click += (_, _) => SelectKey(idx);
             _keyBtns[k] = btn;
             KeyGrid.Children.Add(btn);
@@ -102,7 +103,8 @@ public partial class EditorWindow : Window
             LinkStatus.Text = $"● {s}";
             bool up = s.Contains("online") || s.Contains("Connected") ||
                       s.Contains("written") || s.Contains("reloaded");
-            LinkStatus.Foreground = Brush(up ? "#4C9A6B" : "#B0553E");
+            // Darkened from #4C9A6B / #B0553E, which sat near 3:1 on the card at 11px.
+        LinkStatus.Foreground = Brush(up ? "#3D7F57" : "#9E4632");
         });
 
         LoadFromDisk();
@@ -153,7 +155,7 @@ public partial class EditorWindow : Window
             DockPanel.SetDock(dot, Dock.Left);
             var preset = new TextBlock
             {
-                Text = $"P{p.Preset + 1}", Foreground = Brush("#87867F"),
+                Text = $"P{p.Preset + 1}", Foreground = Brush("#6B6A63"),
                 FontSize = 11, VerticalAlignment = VerticalAlignment.Center,
             };
             DockPanel.SetDock(preset, Dock.Right);
@@ -258,11 +260,9 @@ public partial class EditorWindow : Window
             BindArgs.Text = b.Args;
             BindHidden.IsChecked = b.Hidden;
             BindLabel.Text = b.Label;
-            ModCtrl.IsChecked  = (b.Mod & 1) != 0;
-            ModShift.IsChecked = (b.Mod & 2) != 0;
-            ModAlt.IsChecked   = (b.Mod & 4) != 0;
-            ModWin.IsChecked   = (b.Mod & 8) != 0;
-            BindKeyCombo.SelectedIndex = Array.FindIndex(Protocol.HidKeys, h => h.Name == b.Key);
+            _recMod = b.Mod;
+            _recKey = b.Key;
+            RenderShortcut();
             BindMedia.SelectedIndex = Array.FindIndex(Protocol.MediaKeys, m => m.Name == b.Media);
             // Match on id, not label — a renamed action keeps working
             BindPadAction.SelectedIndex = _padActions.FindIndex(a => a.Id == b.ActionId);
@@ -318,9 +318,8 @@ public partial class EditorWindow : Window
         b.Args = BindArgs.Text;
         b.Hidden = BindHidden.IsChecked == true;
         b.Label = BindLabel.Text;
-        b.Mod = (ModCtrl.IsChecked == true ? 1 : 0) | (ModShift.IsChecked == true ? 2 : 0)
-              | (ModAlt.IsChecked == true ? 4 : 0) | (ModWin.IsChecked == true ? 8 : 0);
-        b.Key = BindKeyCombo.SelectedIndex >= 0 ? Protocol.HidKeys[BindKeyCombo.SelectedIndex].Name : "";
+        b.Mod = _recMod;
+        b.Key = _recKey;
         b.Media = BindMedia.SelectedIndex >= 0 ? Protocol.MediaKeys[BindMedia.SelectedIndex].Name : "";
         if (BindPadAction.SelectedIndex >= 0 && BindPadAction.SelectedIndex < _padActions.Count)
             b.ActionId = _padActions[BindPadAction.SelectedIndex].Id;
@@ -355,6 +354,8 @@ public partial class EditorWindow : Window
         ShortcutPanel.Visibility = shortcut ? Visibility.Visible : Visibility.Collapsed;
         BindMedia.Visibility = media ? Visibility.Visible : Visibility.Collapsed;
         PadActionPanel.Visibility = t == "padAction" ? Visibility.Visible : Visibility.Collapsed;
+        // write takes no parameters at all — only the pad label applies.
+        WriteHint.Visibility = t == "write" ? Visibility.Visible : Visibility.Collapsed;
         ArgsLabel.Visibility = run || t == "focusOrLaunch" ? Visibility.Visible : Visibility.Collapsed;
         BindArgs.Visibility = ArgsLabel.Visibility;
         BindHidden.Visibility = run ? Visibility.Visible : Visibility.Collapsed;
@@ -363,17 +364,18 @@ public partial class EditorWindow : Window
     }
 
     // ── helpers ─────────────────────────────────
+    // Indices are positions in BindType's ComboBoxItem list — append only.
     static int TypeToIndex(string t) => t.ToLowerInvariant() switch
     {
         "focusorlaunch" => 1, "open" => 2, "run" => 3, "window" => 4,
         "shortcut" => 5, "media" => 6, "text" => 7, "favorite" => 8,
-        "padaction" => 9, _ => 0,
+        "padaction" => 9, "write" => 10, _ => 0,
     };
     static string IndexToType(int i) => i switch
     {
         1 => "focusOrLaunch", 2 => "open", 3 => "run", 4 => "window",
         5 => "shortcut", 6 => "media", 7 => "text", 8 => "favorite",
-        9 => "padAction", _ => "none",
+        9 => "padAction", 10 => "write", _ => "none",
     };
     static int WindowOpToIndex(string op) => op.ToLowerInvariant() switch
     {
@@ -395,11 +397,13 @@ public partial class EditorWindow : Window
         VerticalAlignment = VerticalAlignment.Center,
         Children =
         {
-            new TextBlock { Text = title, FontSize = 10.5, Foreground = Brush("#87867F"), HorizontalAlignment = HorizontalAlignment.Center },
+            new TextBlock { Text = title, FontSize = 11, Foreground = Brush("#6B6A63"), HorizontalAlignment = HorizontalAlignment.Center },
             new TextBlock
             {
                 Text = label, FontSize = 13, FontWeight = FontWeights.SemiBold,
-                Foreground = Brush(bound ? "#141413" : "#B9B5A9"),
+                // #B9B5A9 put the unbound label near 2:1 against the tile. #7D7C74 keeps
+                // it a clear tier below ink without being unreadable.
+                Foreground = Brush(bound ? "#141413" : "#7D7C74"),
                 HorizontalAlignment = HorizontalAlignment.Center, Margin = new Thickness(0, 2, 0, 0),
             },
         },
@@ -422,10 +426,16 @@ public partial class EditorWindow : Window
     static ControlTemplate KeyTileTemplate(bool selected, bool bound, string accent)
     {
         var border = new FrameworkElementFactory(typeof(Border));
-        border.SetValue(Border.BackgroundProperty, bound ? Tint(accent) : Brush("#F7F5EE"));
+        border.SetValue(Border.BackgroundProperty, bound ? Tint(accent) : Brush("#F1EFE6"));
         border.SetValue(Border.CornerRadiusProperty, new CornerRadius(12));
-        border.SetValue(Border.BorderThicknessProperty, new Thickness(selected ? 2 : 1));
-        border.SetValue(Border.BorderBrushProperty, Brush(selected ? accent : "#DAD5C9"));
+        // Thickness is constant so selecting never nudges the grid by a pixel, and the
+        // ring is ink rather than the profile colour: selection used to be drawn in the
+        // profile's own hue, so a pale profile (#F7E8A6) was near-invisible against the
+        // tile. Ink is also now the only border in the grid, so "outlined" reads as
+        // "selected" and nothing else.
+        border.SetValue(Border.BorderThicknessProperty, new Thickness(2));
+        border.SetValue(Border.BorderBrushProperty,
+            selected ? Brush("#141413") : (System.Windows.Media.Brush)System.Windows.Media.Brushes.Transparent);
         var content = new FrameworkElementFactory(typeof(ContentPresenter));
         content.SetValue(HorizontalAlignmentProperty, HorizontalAlignment.Center);
         content.SetValue(VerticalAlignmentProperty, VerticalAlignment.Center);
@@ -443,4 +453,110 @@ public partial class EditorWindow : Window
         border.SetValue(Border.BorderBrushProperty, Brush("#DAD5C9"));
         return new ControlTemplate(typeof(Button)) { VisualTree = border };
     }
+
+    // ── shortcut recorder ───────────────────────
+    // System.Windows.Input is deliberately not imported: KeyEventArgs and friends
+    // also exist in System.Windows.Forms, which this project references for the tray.
+
+    void ShortcutBox_Click(object s, System.Windows.Input.MouseButtonEventArgs e)
+    {
+        // No Handled here — the Clear button sits inside this Border and still needs the click.
+        System.Windows.Input.Keyboard.Focus(ShortcutBox);
+    }
+
+    void ShortcutBox_FocusChanged(object s, System.Windows.Input.KeyboardFocusChangedEventArgs e)
+    {
+        bool on = ShortcutBox.IsKeyboardFocusWithin;
+        ShortcutBox.BorderBrush = on ? Brush("#D97757") : Brush("#DAD5C9");
+        ShortcutHint.Text = on
+            ? "Listening — press the chord you want. Esc cancels."
+            : "Esc cancels without changing it. Clear removes the shortcut.";
+    }
+
+    void ShortcutClear_Click(object s, RoutedEventArgs e)
+    {
+        _recMod = 0;
+        _recKey = "";
+        RenderShortcut();
+        Bind_Changed(s, e);
+    }
+
+    void ShortcutBox_PreviewKeyDown(object s, System.Windows.Input.KeyEventArgs e)
+    {
+        // Handled unconditionally: Tab and Space are both bindable and would otherwise
+        // move focus or press the Clear button instead of being recorded.
+        e.Handled = true;
+
+        // Alt-chords arrive as Key.System with the real key in SystemKey.
+        var k = e.Key == System.Windows.Input.Key.System ? e.SystemKey : e.Key;
+
+        if (k is System.Windows.Input.Key.LeftCtrl or System.Windows.Input.Key.RightCtrl
+              or System.Windows.Input.Key.LeftShift or System.Windows.Input.Key.RightShift
+              or System.Windows.Input.Key.LeftAlt or System.Windows.Input.Key.RightAlt
+              or System.Windows.Input.Key.LWin or System.Windows.Input.Key.RWin)
+            return;                       // modifier on its own: keep waiting for the real key
+
+        var mods = System.Windows.Input.Keyboard.Modifiers;
+
+        // Bare Esc backs out. Esc *with* modifiers is a legitimate chord, so it falls through.
+        if (k == System.Windows.Input.Key.Escape && mods == System.Windows.Input.ModifierKeys.None)
+        {
+            System.Windows.Input.Keyboard.ClearFocus();
+            RenderShortcut();
+            return;
+        }
+
+        string name = HidName(k);
+        if (name.Length == 0)
+        {
+            // The pad can only send what Protocol.HidKeys can name — numpad, media and
+            // OEM punctuation have no entry, so say so instead of recording a wrong code.
+            ShortcutHint.Text = $"{k} can't be sent by the pad — pick another key.";
+            return;
+        }
+
+        _recKey = name;
+        _recMod = ((mods & System.Windows.Input.ModifierKeys.Control) != 0 ? 1 : 0)
+                | ((mods & System.Windows.Input.ModifierKeys.Shift) != 0 ? 2 : 0)
+                | ((mods & System.Windows.Input.ModifierKeys.Alt) != 0 ? 4 : 0)
+                | ((mods & System.Windows.Input.ModifierKeys.Windows) != 0 ? 8 : 0);
+        RenderShortcut();
+        Bind_Changed(s, e);
+    }
+
+    void RenderShortcut()
+    {
+        var parts = new List<string>();
+        if ((_recMod & 1) != 0) parts.Add("Ctrl");
+        if ((_recMod & 2) != 0) parts.Add("Shift");
+        if ((_recMod & 4) != 0) parts.Add("Alt");
+        if ((_recMod & 8) != 0) parts.Add("Win");
+        if (_recKey.Length > 0) parts.Add(_recKey);
+        ShortcutChips.ItemsSource = parts;
+        ShortcutEmpty.Visibility = parts.Count == 0 ? Visibility.Visible : Visibility.Collapsed;
+    }
+
+    /// WPF Key -> the name Protocol.HidKeys uses, or "" when the pad has no code for it.
+    static string HidName(System.Windows.Input.Key k) => k switch
+    {
+        >= System.Windows.Input.Key.A and <= System.Windows.Input.Key.Z => k.ToString(),
+        >= System.Windows.Input.Key.D0 and <= System.Windows.Input.Key.D9
+            => ((char)('0' + (k - System.Windows.Input.Key.D0))).ToString(),
+        >= System.Windows.Input.Key.F1 and <= System.Windows.Input.Key.F12 => k.ToString(),
+        System.Windows.Input.Key.Return => "Enter",
+        System.Windows.Input.Key.Escape => "Esc",
+        System.Windows.Input.Key.Back => "Backspace",
+        System.Windows.Input.Key.Tab => "Tab",
+        System.Windows.Input.Key.Space => "Space",
+        System.Windows.Input.Key.Delete => "Delete",
+        System.Windows.Input.Key.Home => "Home",
+        System.Windows.Input.Key.End => "End",
+        System.Windows.Input.Key.PageUp => "PgUp",
+        System.Windows.Input.Key.PageDown => "PgDn",
+        System.Windows.Input.Key.Right => "Right",
+        System.Windows.Input.Key.Left => "Left",
+        System.Windows.Input.Key.Down => "Down",
+        System.Windows.Input.Key.Up => "Up",
+        _ => "",
+    };
 }
