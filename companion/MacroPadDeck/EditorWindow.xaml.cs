@@ -52,6 +52,7 @@ public partial class EditorWindow : Window
     int _recMod;                         // shortcut recorder: Ctrl1 Shift2 Alt4 Win8
     string _recKey = "";                 // ...and a Protocol.HidKeys name
     readonly Button[] _keyBtns = new Button[12];
+    readonly ShortcutCapture _capture = new();   // LL keyboard hook, live only while ShortcutBox has focus
     readonly DeckController _deck;
     List<PadAction> _padActions = new();
 
@@ -108,6 +109,10 @@ public partial class EditorWindow : Window
                       s.Contains("written") || s.Contains("reloaded");
             SetLink(up);
         });
+
+        _capture.Chord += OnChordCaptured;
+        _capture.Cancelled += () => { System.Windows.Input.Keyboard.ClearFocus(); RenderShortcut(); };
+        Closed += (_, _) => _capture.Dispose();
 
         LoadFromDisk();
     }
@@ -499,6 +504,9 @@ public partial class EditorWindow : Window
     void ShortcutBox_FocusChanged(object s, System.Windows.Input.KeyboardFocusChangedEventArgs e)
     {
         bool on = ShortcutBox.IsKeyboardFocusWithin;
+        // The hook owns the keyboard while this box has focus — nothing reaches the
+        // OS, so Win+L records instead of locking. Focus loss always brings it down.
+        if (on) _capture.Start(); else _capture.Stop();
         ShortcutBox.BorderBrush = T(on ? "EmberFlat" : "Hair");
         ShortcutHint.Text = on
             ? "Listening — press the chord you want. Esc cancels."
@@ -513,11 +521,35 @@ public partial class EditorWindow : Window
         Bind_Changed(s, e);
     }
 
+    // Chord from the low-level hook. Runs on the UI thread (the hook was installed there).
+    void OnChordCaptured(int mod, System.Windows.Input.Key k)
+    {
+        string name = HidName(k);
+        if (name.Length == 0)
+        {
+            // The pad can only send what Protocol.HidKeys can name — numpad, media and
+            // OEM punctuation have no entry, so say so and keep listening.
+            ShortcutHint.Text = $"{k} can't be sent by the pad — pick another key.";
+            _capture.Reject();
+            return;
+        }
+        _recKey = name;
+        _recMod = mod;
+        RenderShortcut();
+        Bind_Changed(this, new RoutedEventArgs());
+        // Recorded: drop focus so the hook comes down as soon as the modifiers are
+        // released (ShortcutCapture.Stop defers until then).
+        Dispatcher.BeginInvoke(() => System.Windows.Input.Keyboard.ClearFocus());
+    }
+
+    // Fallback only: with the hook active no key ever reaches WPF. This path runs
+    // if SetWindowsHookEx failed (it never has), and then OS chords still win.
     void ShortcutBox_PreviewKeyDown(object s, System.Windows.Input.KeyEventArgs e)
     {
         // Handled unconditionally: Tab and Space are both bindable and would otherwise
         // move focus or press the Clear button instead of being recorded.
         e.Handled = true;
+        if (_capture.Active) return;
 
         // Alt-chords arrive as Key.System with the real key in SystemKey.
         var k = e.Key == System.Windows.Input.Key.System ? e.SystemKey : e.Key;
