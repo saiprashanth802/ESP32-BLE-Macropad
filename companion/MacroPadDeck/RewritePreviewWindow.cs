@@ -13,12 +13,14 @@ using Color = System.Windows.Media.Color;
 using ColorConverter = System.Windows.Media.ColorConverter;
 using FontFamily = System.Windows.Media.FontFamily;
 using TextBox = System.Windows.Controls.TextBox;
+using Button = System.Windows.Controls.Button;
+using Cursors = System.Windows.Input.Cursors;
 using HorizontalAlignment = System.Windows.HorizontalAlignment;
 using VerticalAlignment = System.Windows.VerticalAlignment;
 
 namespace MacroPadDeck;
 
-/// Side-by-side rewrite review, in the app's existing Claude design language.
+/// Side-by-side rewrite review, in the app's "Void Deck" design language.
 ///
 /// Side-by-side rather than an inline word diff on purpose: a diff is the right
 /// view for a typo fix, but a tone rewrite changes nearly every word and the
@@ -31,23 +33,20 @@ namespace MacroPadDeck;
 /// every one marshals to the WPF dispatcher.
 public sealed class RewritePreviewWindow : IRewritePreview
 {
-    // Claude palette — same values as EditorWindow.
-    static readonly Brush Page   = Hex("#FAF9F5");
-    static readonly Brush Card   = Hex("#F0EEE5");
-    static readonly Brush Line   = Hex("#E7E3D8");
-    static readonly Brush Accent = Hex("#D97757");
-    static readonly Brush Ink    = Hex("#141413");
-    // Kept in step with EditorWindow's Muted — #87867F was 3.15:1 on Card and failed
-    // WCAG AA. NOTE: this palette is a hand-copy of the editor's; the two will drift
-    // again until they share a ResourceDictionary.
-    static readonly Brush Muted  = Hex("#6B6A63");
-
-    static SolidColorBrush Hex(string h)
+    // One palette for both windows: Theme.xaml, the same dictionary EditorWindow
+    // merges. (This used to be a hand-copy of the editor's values, and it drifted.)
+    static readonly ResourceDictionary Theme = new()
     {
-        var b = new SolidColorBrush((Color)ColorConverter.ConvertFromString(h)!);
-        b.Freeze();
-        return b;
-    }
+        Source = new Uri("/MacroPadDeck;component/Theme.xaml", UriKind.Relative),
+    };
+    static Brush T(string key) => (Brush)Theme[key];
+    static readonly Brush Page   = T("Void");
+    static readonly Brush Card   = T("Surface");
+    static readonly Brush Line   = T("Hair");
+    static readonly Brush Accent = T("EmberFlat");
+    static readonly Brush Ink    = T("Bone");
+    static readonly Brush Muted  = T("Muted");
+    static readonly Brush Dim    = T("Dim");
 
     readonly Dispatcher _ui;
 
@@ -158,7 +157,7 @@ public sealed class RewritePreviewWindow : IRewritePreview
         _styleTag = new TextBlock
         {
             Foreground = Accent, FontWeight = FontWeights.SemiBold, FontSize = 11,
-            VerticalAlignment = VerticalAlignment.Center,
+            VerticalAlignment = VerticalAlignment.Center, Margin = new Thickness(2, 0, 14, 0),
         };
 
         _origText = new TextBlock
@@ -166,9 +165,14 @@ public sealed class RewritePreviewWindow : IRewritePreview
             Foreground = Muted, TextWrapping = TextWrapping.Wrap, FontSize = 13, LineHeight = 20,
         };
 
+        // Style = an empty style, not null: the theme's implicit TextBox style is for
+        // one-line fields (mono, centred, focus ring) and would otherwise capture
+        // this multi-line editor.
         _out = new TextBox
         {
+            Style = new Style(typeof(TextBox)),
             Background = Brushes.Transparent, Foreground = Ink, BorderThickness = new Thickness(0),
+            Padding = new Thickness(0), CaretBrush = Accent,
             TextWrapping = TextWrapping.Wrap, AcceptsReturn = true, FontSize = 13,
             VerticalScrollBarVisibility = ScrollBarVisibility.Auto,
             SelectionBrush = Accent,
@@ -185,19 +189,23 @@ public sealed class RewritePreviewWindow : IRewritePreview
         _subjectRow = new Border
         {
             Background = Card, BorderBrush = Line, BorderThickness = new Thickness(1),
-            CornerRadius = new CornerRadius(6), Padding = new Thickness(12, 8, 12, 8),
+            CornerRadius = new CornerRadius(8), Padding = new Thickness(12, 8, 12, 8),
             Margin = new Thickness(0, 0, 0, 10), Visibility = Visibility.Collapsed,
             Child = new StackPanel
             {
                 Children =
                 {
-                    new TextBlock { Text = "SUBJECT (copied to clipboard)", Foreground = Muted, FontSize = 11 },
+                    new TextBlock { Text = "SUBJECT · copied to clipboard", Foreground = Dim, FontSize = 10.5, FontWeight = FontWeights.SemiBold, Margin = new Thickness(0, 0, 0, 4) },
                     _subjectText,
                 },
             },
         };
 
-        _hint = new TextBlock { Foreground = Muted, FontSize = 11, VerticalAlignment = VerticalAlignment.Center };
+        _hint = new TextBlock
+        {
+            Foreground = Muted, FontSize = 11, VerticalAlignment = VerticalAlignment.Center,
+            FontFamily = (FontFamily)Theme["MonoFont"],
+        };
 
         var grid = new Grid { Margin = new Thickness(0, 0, 0, 10) };
         grid.ColumnDefinitions.Add(new ColumnDefinition());
@@ -211,9 +219,21 @@ public sealed class RewritePreviewWindow : IRewritePreview
 
         var root = new DockPanel { Margin = new Thickness(16), LastChildFill = true };
 
-        var header = new DockPanel { Margin = new Thickness(0, 0, 0, 10) };
+        // The header doubles as the caption of the borderless window: style tag on
+        // the left, hint in the middle, a close glyph on the right.
+        var close = new Button
+        {
+            Content = "\uE8BB", FontFamily = new FontFamily("Segoe MDL2 Assets"), FontSize = 10,
+            Foreground = Muted, Background = Brushes.Transparent, BorderThickness = new Thickness(0),
+            Padding = new Thickness(10, 4, 4, 4), Cursor = Cursors.Hand,
+        };
+        close.Click += (_, _) => Cancel?.Invoke();
+        System.Windows.Shell.WindowChrome.SetIsHitTestVisibleInChrome(close, true);
+        var header = new DockPanel { Margin = new Thickness(0, 0, 0, 12), Height = 26 };
         header.Children.Add(_styleTag);
         DockPanel.SetDock(_styleTag, Dock.Left);
+        header.Children.Add(close);
+        DockPanel.SetDock(close, Dock.Right);
         header.Children.Add(_hint);
         DockPanel.SetDock(header, Dock.Top);
         root.Children.Add(header);
@@ -232,7 +252,15 @@ public sealed class RewritePreviewWindow : IRewritePreview
             Topmost = true,
             FontFamily = new FontFamily("Segoe UI"),
             Content = root,
+            WindowStyle = WindowStyle.None,
         };
+        _win.Resources.MergedDictionaries.Add(Theme);   // TextBox / ScrollBar styles
+        System.Windows.Shell.WindowChrome.SetWindowChrome(_win, new System.Windows.Shell.WindowChrome
+        {
+            CaptionHeight = 42, ResizeBorderThickness = new Thickness(6),
+            GlassFrameThickness = new Thickness(0), CornerRadius = new CornerRadius(0),
+            UseAeroCaptionButtons = false,
+        });
 
         _win.KeyDown += (_, e) =>
         {
@@ -267,15 +295,15 @@ public sealed class RewritePreviewWindow : IRewritePreview
         var stack = new DockPanel();
         var cap = new TextBlock
         {
-            Text = caption, Foreground = Muted, FontSize = 11,
-            Margin = new Thickness(2, 0, 0, 6),
+            Text = caption, Foreground = Muted, FontSize = 10.5, FontWeight = FontWeights.SemiBold,
+            Margin = new Thickness(2, 0, 0, 8),
         };
         DockPanel.SetDock(cap, Dock.Top);
         stack.Children.Add(cap);
         stack.Children.Add(new Border
         {
             Background = Card, BorderBrush = Line, BorderThickness = new Thickness(1),
-            CornerRadius = new CornerRadius(8), Padding = new Thickness(12),
+            CornerRadius = new CornerRadius(12), Padding = new Thickness(14),
             Child = body,
         });
 

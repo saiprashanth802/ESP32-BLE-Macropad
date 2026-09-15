@@ -54,6 +54,16 @@ static class Program
         using var fg = new ForegroundWatcher();
         fg.ExeChanged += deck.OnForegroundExe;
 
+        // `--editor`: open the editor straight away and exit when it closes. For UI
+        // work and screenshots — the tray icon lives in Windows 11's hidden overflow,
+        // which UI automation cannot reach, so this is the only scriptable way in.
+        if (Environment.GetCommandLineArgs().Contains("--editor"))
+        {
+            EditorWindow.Open(deck);
+            EditorWindow.Current!.Closed += (_, _) => tray.ExitThread();
+        }
+
+
         WinFormsApp.Run(tray);
         feishin?.Dispose();
     }

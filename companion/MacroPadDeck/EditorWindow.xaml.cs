@@ -8,6 +8,8 @@ using Button = System.Windows.Controls.Button;
 using Color = System.Windows.Media.Color;
 using ColorConverter = System.Windows.Media.ColorConverter;
 using HorizontalAlignment = System.Windows.HorizontalAlignment;
+using Brush = System.Windows.Media.Brush;
+using FontFamily = System.Windows.Media.FontFamily;
 
 namespace MacroPadDeck;
 
@@ -17,6 +19,7 @@ namespace MacroPadDeck;
 public partial class EditorWindow : Window
 {
     static EditorWindow? _open;
+    public static EditorWindow? Current => _open;
     public static void Open(DeckController deck)
     {
         if (_open is not null) { _open.Activate(); return; }
@@ -100,11 +103,10 @@ public partial class EditorWindow : Window
 
         deck.StatusChanged += s => Dispatcher.BeginInvoke(() =>
         {
-            LinkStatus.Text = $"● {s}";
+            LinkStatus.Text = s;
             bool up = s.Contains("online") || s.Contains("Connected") ||
                       s.Contains("written") || s.Contains("reloaded");
-            // Darkened from #4C9A6B / #B0553E, which sat near 3:1 on the card at 11px.
-        LinkStatus.Foreground = Brush(up ? "#3D7F57" : "#9E4632");
+            SetLink(up);
         });
 
         LoadFromDisk();
@@ -149,13 +151,13 @@ public partial class EditorWindow : Window
             var dot = new Border
             {
                 Width = 10, Height = 10, CornerRadius = new CornerRadius(5),
-                Background = Brush(string.IsNullOrWhiteSpace(p.Color) ? "#B9B5A9" : p.Color),
+                Background = string.IsNullOrWhiteSpace(p.Color) ? T("Dim") : Brush(p.Color),
                 Margin = new Thickness(0, 0, 8, 0), VerticalAlignment = VerticalAlignment.Center,
             };
             DockPanel.SetDock(dot, Dock.Left);
             var preset = new TextBlock
             {
-                Text = $"P{p.Preset + 1}", Foreground = Brush("#6B6A63"),
+                Text = $"P{p.Preset + 1}", Foreground = T("Muted"), FontFamily = (FontFamily)FindResource("MonoFont"),
                 FontSize = 11, VerticalAlignment = VerticalAlignment.Center,
             };
             DockPanel.SetDock(preset, Dock.Right);
@@ -386,56 +388,86 @@ public partial class EditorWindow : Window
         1 => "right", 2 => "maximize", 3 => "minimize", 4 => "nextMonitor", _ => "left",
     };
 
+    // Theme.xaml brushes, by key — the code-built tiles use the same palette as the XAML.
+    Brush T(string key) => (Brush)FindResource(key);
+
+    // ── custom chrome ───────────────────────────
+    void Minimise_Click(object s, RoutedEventArgs e) => WindowState = WindowState.Minimized;
+    void CloseBtn_Click(object s, RoutedEventArgs e) => Close();
+
+    // The title-bar dot: breathing ember while the pad is being looked for, steady
+    // once linked. Opacity animation on the dot only; the halo behind it is static.
+    bool _linkUp;
+    void SetLink(bool up)
+    {
+        if (up == _linkUp && LinkDot.HasAnimatedProperties == !up) return;
+        _linkUp = up;
+        LinkStatus.Foreground = T(up ? "Muted" : "Dim");
+        if (up)
+        {
+            LinkDot.BeginAnimation(UIElement.OpacityProperty, null);
+            LinkDot.Opacity = 1;
+        }
+        else
+        {
+            var a = new System.Windows.Media.Animation.DoubleAnimation(0.15, 1, TimeSpan.FromSeconds(1.6))
+            {
+                AutoReverse = true,
+                RepeatBehavior = System.Windows.Media.Animation.RepeatBehavior.Forever,
+                EasingFunction = new System.Windows.Media.Animation.SineEase { EasingMode = System.Windows.Media.Animation.EasingMode.EaseInOut },
+            };
+            LinkDot.BeginAnimation(UIElement.OpacityProperty, a);
+        }
+    }
+
     static SolidColorBrush Brush(string hex)
     {
         try { return new SolidColorBrush((Color)ColorConverter.ConvertFromString(hex)); }
         catch { return new SolidColorBrush(Colors.Gray); }
     }
 
-    static StackPanel KeyTile(string title, string label, bool bound) => new()
+    StackPanel KeyTile(string title, string label, bool bound) => new()
     {
         VerticalAlignment = VerticalAlignment.Center,
         Children =
         {
-            new TextBlock { Text = title, FontSize = 11, Foreground = Brush("#6B6A63"), HorizontalAlignment = HorizontalAlignment.Center },
+            new TextBlock { Text = title, FontSize = 10.5, Foreground = T("Muted"), HorizontalAlignment = HorizontalAlignment.Center },
             new TextBlock
             {
                 Text = label, FontSize = 13, FontWeight = FontWeights.SemiBold,
-                // #B9B5A9 put the unbound label near 2:1 against the tile. #7D7C74 keeps
-                // it a clear tier below ink without being unreadable.
-                Foreground = Brush(bound ? "#141413" : "#7D7C74"),
+                Foreground = T(bound ? "Bone" : "Dim"),
                 HorizontalAlignment = HorizontalAlignment.Center, Margin = new Thickness(0, 2, 0, 0),
             },
         },
     };
 
-    /// White tile washed with ~14% of the profile color — bound keys visibly
-    /// belong to their profile without shouting.
+    /// Raised tile washed with ~22% of the profile colour — bound keys visibly
+    /// belong to their profile without shouting. (The pastel palette was picked
+    /// for the pad's dark screen, so it sits naturally on the void too.)
     static SolidColorBrush Tint(string hex)
     {
+        const double k = 0.22; const byte sr = 0x12, sg = 0x14, sb = 0x1D;   // RaisedColor
         try
         {
             var c = (Color)ColorConverter.ConvertFromString(hex);
             return new SolidColorBrush(Color.FromRgb(
-                (byte)(255 - (255 - c.R) * 0.14), (byte)(255 - (255 - c.G) * 0.14),
-                (byte)(255 - (255 - c.B) * 0.14)));
+                (byte)(sr + (c.R - sr) * k), (byte)(sg + (c.G - sg) * k), (byte)(sb + (c.B - sb) * k)));
         }
-        catch { return new SolidColorBrush(Colors.White); }
+        catch { return new SolidColorBrush(Color.FromRgb(sr, sg, sb)); }
     }
 
-    static ControlTemplate KeyTileTemplate(bool selected, bool bound, string accent)
+    ControlTemplate KeyTileTemplate(bool selected, bool bound, string accent)
     {
         var border = new FrameworkElementFactory(typeof(Border));
-        border.SetValue(Border.BackgroundProperty, bound ? Tint(accent) : Brush("#F1EFE6"));
+        border.SetValue(Border.BackgroundProperty, bound ? Tint(accent) : T("Raised"));
         border.SetValue(Border.CornerRadiusProperty, new CornerRadius(12));
-        // Thickness is constant so selecting never nudges the grid by a pixel, and the
-        // ring is ink rather than the profile colour: selection used to be drawn in the
-        // profile's own hue, so a pale profile (#F7E8A6) was near-invisible against the
-        // tile. Ink is also now the only border in the grid, so "outlined" reads as
-        // "selected" and nothing else.
+        // Thickness is constant so selecting never nudges the grid by a pixel. The ring
+        // is ember, not the profile colour: a pale profile (#F7E8A6) would be
+        // near-invisible against its own tint. Ember is the only border in the grid,
+        // so "outlined" reads as "selected" and nothing else.
         border.SetValue(Border.BorderThicknessProperty, new Thickness(2));
         border.SetValue(Border.BorderBrushProperty,
-            selected ? Brush("#141413") : (System.Windows.Media.Brush)System.Windows.Media.Brushes.Transparent);
+            selected ? T("EmberFlat") : (System.Windows.Media.Brush)System.Windows.Media.Brushes.Transparent);
         var content = new FrameworkElementFactory(typeof(ContentPresenter));
         content.SetValue(HorizontalAlignmentProperty, HorizontalAlignment.Center);
         content.SetValue(VerticalAlignmentProperty, VerticalAlignment.Center);
@@ -443,14 +475,14 @@ public partial class EditorWindow : Window
         return new ControlTemplate(typeof(Button)) { VisualTree = border };
     }
 
-    static ControlTemplate SwatchTemplate()
+    ControlTemplate SwatchTemplate()
     {
         var border = new FrameworkElementFactory(typeof(Border));
         border.SetBinding(Border.BackgroundProperty, new System.Windows.Data.Binding("Background")
         { RelativeSource = new System.Windows.Data.RelativeSource(System.Windows.Data.RelativeSourceMode.TemplatedParent) });
         border.SetValue(Border.CornerRadiusProperty, new CornerRadius(10));
         border.SetValue(Border.BorderThicknessProperty, new Thickness(1));
-        border.SetValue(Border.BorderBrushProperty, Brush("#DAD5C9"));
+        border.SetValue(Border.BorderBrushProperty, T("Hair"));
         return new ControlTemplate(typeof(Button)) { VisualTree = border };
     }
 
@@ -467,7 +499,7 @@ public partial class EditorWindow : Window
     void ShortcutBox_FocusChanged(object s, System.Windows.Input.KeyboardFocusChangedEventArgs e)
     {
         bool on = ShortcutBox.IsKeyboardFocusWithin;
-        ShortcutBox.BorderBrush = on ? Brush("#D97757") : Brush("#DAD5C9");
+        ShortcutBox.BorderBrush = T(on ? "EmberFlat" : "Hair");
         ShortcutHint.Text = on
             ? "Listening — press the chord you want. Esc cancels."
             : "Esc cancels without changing it. Clear removes the shortcut.";
