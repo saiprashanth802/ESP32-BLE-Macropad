@@ -2258,11 +2258,18 @@ void hostLinkTick() {
         break;
 
       case HCMD_FACEV2:                    // [value][mask][persist]
-        // The look switches on the next face frame: drawFaceFrame() resizes
-        // the sprites and clears the old geometry itself.
+        // Changing the LOOK reboots the pad (~3 s, BLE reacquires on its own).
+        // The two looks need differently sized sprites, and resizing them at
+        // runtime failed on a fragmented heap (bot set ~37 KB would not
+        // allocate). Allocating both sizes up front instead added ~8 KB at
+        // boot and the pad crash-looped once a host connected (2026-09-23).
+        // At boot the swap is proven, so the look is only ever set up there.
         if (n >= 2) {
-          faceV2 = ((faceV2 & ~p[1]) | (p[0] & p[1])) & FV2_MASK;
-          if (n >= 3 && p[2]) prefs.putUChar("fv2", faceV2);
+          uint8_t nv = ((faceV2 & ~p[1]) | (p[0] & p[1])) & FV2_MASK;
+          bool lookChanged = (nv ^ faceV2) & FV2_BOT;
+          faceV2 = nv;
+          if ((n >= 3 && p[2]) || lookChanged) prefs.putUChar("fv2", faceV2);
+          if (lookChanged) { delay(50); ESP.restart(); }
         }
         break;
 
