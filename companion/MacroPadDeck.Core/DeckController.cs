@@ -81,6 +81,10 @@ public sealed class DeckController : IDisposable
                 if (p.Length >= 6) _write?.NoteFace(p[4], p[5]);
                 // [faceV2] arrived with face v2 firmware; older pads send 6 bytes
                 PadFaceV2 = p.Length >= 7 ? p[6] : -1;
+                // Byte count identifies the firmware generation at a glance:
+                // 6 = pre face v2, 7 = reports faceV2 (and knows setFaceV2 0x8F)
+                Diag.Log($"hello: fw v{p[0]} bytes={p.Length} preset={p[3]}"
+                       + (PadFaceV2 >= 0 ? $" faceV2=0x{PadFaceV2:X2}" : ""));
                 StatusChanged?.Invoke($"Pad online (fw v{p[0]}, preset {p[3]})");
                 _ = Push(async () =>
                 {
