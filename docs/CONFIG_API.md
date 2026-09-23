@@ -110,6 +110,7 @@ the `face` object in `/api/config`:
   "style": "eyes",        // "eyes" (procedural) | "gif" (uploaded loop)
   "gif":   "/idle.gif",   // active animation (from /api/anim)
   "personality": "calm",  // "calm" | "playful" | "grumpy" | "sleepy"
+  "v2": 15,               // face v2 visuals bitmask — see below
   "eyes": {               // the EXPRESSION PACK — fully generative
     "color": 0,           // RGB565 eye color; 0 = follow active preset color
     "eyeW": 64, "eyeH": 84, "gap": 44, "round": 18,
@@ -123,6 +124,21 @@ the `face` object in `/api/config`:
 
 All eye fields are clamped device-side to renderable bounds. A companion app
 "generates a personality" by POSTing a new `eyes` object — no reflash needed.
+
+### Face v2: mood map, brows, particles
+
+The resting face is a point on a **valence × arousal mood map**, blended
+bilinearly from nine anchor poses (`MOOD_GRID` in the sketch): tense · alert ·
+hyped / grumpy · neutral · happy / melancholy · sleepy · content. The persona's
+rest pose is layered on top at 60 %. The pad's own mood comes from typing rate
+and link health; the companion can lean it with `setMood` (`0x8D`) and drive a
+beat-synced nod with `setBeat` (`0x8E`).
+
+`"v2"` in the `face` object is a bitmask of the new visuals, stored in NVS key
+`fv2` (all on by default): `1` brows, `2` pupils + glint, `4` mood tint (eye
+colour leans ≤15 % warm/cool), `8` particles (Zzz, music notes, sweat drop,
+hearts — drawn only in the side margins beside the eyes). `firmware/v5/tools/face-preview.html`
+renders the same maths in a browser for tuning the grid without a flash.
 
 ### Personality
 
@@ -216,6 +232,8 @@ Wire format both ways: `[opcode:1][len:1][payload:len]`.
 | `0x84` | setFace   | `[mode 0-2][persona 0-3]` | Face mode / personality override (RAM only). **Mode 0 also leaves the face screen immediately** — see below |
 | `0x8B` | setVolume | `[level 0-100 \| 0xFF unknown][flags: bit0 muted]` | True system volume, relayed to the encoder puck. BLE HID volume is relative, so this is the only way the pad can know the real level |
 | `0x8C` | getActions | `[page]` | Ask for one page of the builtin action library; answered with event `0x04` |
+| `0x8D` | setMood   | `[valence i8 ±100][arousal i8 ±100][weight 0-100][ttl s][flags]` | Face v2: the companion's mood opinion. The pad blends toward it by `weight` over its own mood (typing rate, link health) and eases back to autonomous when `ttl` lapses; weight 0 releases at once. Flags: bit0 late-night (more yawns), bit1 focused (fewer glances, more squints). RAM only |
+| `0x8E` | setBeat   | `[bpm×10 lo][hi][ms since last beat lo][hi][confidence 0-100]` | Face v2: tempo + phase for the pad's own beat clock (nod on the beat, sway over two). Sent on drift, never per beat. bpm outside 40-240 or no update for 8 s → back to the free-running bob |
 
 ### Builtin actions over the host link
 

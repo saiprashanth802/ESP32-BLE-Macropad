@@ -1,0 +1,173 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Face Preview</title>
+<style>
+  :root { --bg:#0b0c10; --card:#14161d; --line:#262a36; --text:#ece9e2; --muted:#8d8a80; --accent:#ffb24d; }
+  * { box-sizing: border-box; }
+  body { margin:0; background:var(--bg); color:var(--text); font:14px/1.45 system-ui, sans-serif; padding:16px; }
+  h1 { font-size:18px; margin:0 0 4px; } p.sub { color:var(--muted); margin:0 0 16px; max-width:70ch; }
+  .wrap { display:flex; flex-wrap:wrap; gap:16px; align-items:flex-start; }
+  .card { background:var(--card); border:1px solid var(--line); border-radius:10px; padding:12px; }
+  canvas { display:block; image-rendering:pixelated; border-radius:6px; }
+  #main { width:640px; max-width:100%; height:auto; }
+  label { display:flex; justify-content:space-between; gap:12px; margin:8px 0 2px; color:var(--muted); }
+  input[type=range] { width:100%; accent-color:var(--accent); }
+  .row { display:flex; gap:12px; flex-wrap:wrap; margin-top:8px; }
+  .row label { margin:0; gap:6px; color:var(--text); }
+  select { background:var(--bg); color:var(--text); border:1px solid var(--line); border-radius:6px; padding:4px; }
+  .grid { display:grid; grid-template-columns:repeat(3, 1fr); gap:8px; }
+  .grid figure { margin:0; } .grid canvas { width:100%; height:auto; cursor:pointer; }
+  figcaption { color:var(--muted); font-size:12px; text-align:center; margin-top:2px; }
+  .controls { width:320px; max-width:100%; }
+</style>
+</head>
+<body>
+<h1>Face v2 preview</h1>
+<p class="sub">A port of the firmware's face renderer (<code>blendPose</code>, <code>personaOver</code>,
+<code>drawEyeAt</code>, <code>drawMouthAt</code>, brows, pupils, tint), drawn at the pad's 320×240. Shows the
+<em>resting</em> pose for a mood point — no blinks, glances or emotes. Keep <code>MOOD_GRID</code> here and in
+<code>macropad_v5.ino</code> identical.</p>
+<div class="wrap">
+  <div class="card"><canvas id="main" width="320" height="240"></canvas></div>
+  <div class="card controls">
+    <label>Valence <span id="vOut"></span></label><input id="v" type="range" min="0" max="100" value="50">
+    <label>Arousal <span id="aOut"></span></label><input id="a" type="range" min="0" max="100" value="50">
+    <label>Persona</label>
+    <select id="persona"><option>CALM</option><option>PLAYFUL</option><option>GRUMPY</option><option>SLEEPY</option><option value="-1">none</option></select>
+    <div class="row">
+      <label><input type="checkbox" id="brows" checked> brows</label>
+      <label><input type="checkbox" id="pupils" checked> pupils</label>
+      <label><input type="checkbox" id="tint" checked> tint</label>
+    </div>
+  </div>
+  <div class="card" style="flex:1; min-width:300px; max-width:720px">
+    <div class="grid" id="grid"></div>
+  </div>
+</div>
+<script>
+// ── Mirrors of the firmware tables (keep identical) ──
+// open lidT angle lidB w h gx gy mW mCrv mOpn brY brTilt
+const MOOD_GRID = [
+  [[ 78,22, 55, 0,100, 96,0, 3, 86,-45, 0,-10,-45],[ 74,38,10, 0,100, 96,0,2, 84, -5, 0,-25,  0],[ 88,14,0,30,100,100,0, 0,100,40, 0, -5,  0]],
+  [[ 90,16,-40, 0,100, 98,0, 0, 86,-35, 0,-20, 50],[100, 4, 0, 0,100,100,0,0,100, 10, 0,  0,  0],[100, 0,0,26,102,102,0, 0,106,55, 6, 15,  0]],
+  [[100, 8,-55, 0,104,104,0, 0, 90,-40,12,-15, 70],[100, 0, 0, 0,108,110,0,-2,96,  5,14, 45,  0],[100, 0,0,18,108,108,0,-2,110,80,30, 35,-10]],
+];
+const NAMES = [["melancholy","sleepy","content"],["grumpy","neutral","happy"],["tense","alert","hyped"]];
+const PERSONAS = {
+  CALM:    [100, 8,  0,0,100,100,0,0,100, 18,0,  0, 0],
+  PLAYFUL: [100, 0,  0,8,100,100,0,0,106, 46,0, 12, 0],
+  GRUMPY:  [ 92,18,-35,0,100,100,0,0, 88,-40,0,-10,45],
+  SLEEPY:  [ 80,35, 20,0,100, 96,0,2, 84, -8,0,-15, 0],
+};
+const CFG = { color:0x3DFF, eyeW:64, eyeH:84, gap:44, rnd:18, mouthW:76, mouthThick:6 };
+const EYE_SPR_W=92, EYE_AREA_H=110, BROW_BAND=14, EYE_SPR_H=EYE_AREA_H+BROW_BAND;
+const MOUTH_SPR_W=116, MOUTH_SPR_H=36, MOUTH_CY=194, MOUTH_CURVE_PX=12, MOUTH_OPEN_PX=18;
+const C_BG=0x0841, C_WHITE=0xFFFF, TINT_WARM=0xFD89, TINT_COOL=0x5BDF;
+
+const clamp=(x,l,h)=>Math.max(l,Math.min(h,x));
+const rgb=(c)=>`rgb(${((c>>11)&31)*255/31|0},${((c>>5)&63)*255/63|0},${(c&31)*255/31|0})`;
+function mix565(a,b,t){ let r=(a>>11)&31,g=(a>>5)&63,bl=a&31;
+  r+=Math.trunc((((b>>11)&31)-r)*t); g+=Math.trunc((((b>>5)&63)-g)*t); bl+=Math.trunc(((b&31)-bl)*t);
+  return (r<<11)|(g<<5)|bl; }
+
+function blendPose(v,a){
+  const x=clamp(v,0,1)*2, y=clamp(a,0,1)*2, c=Math.min(1,x|0), r=Math.min(1,y|0), fx=x-c, fy=y-r;
+  const p00=MOOD_GRID[r][c],p01=MOOD_GRID[r][c+1],p10=MOOD_GRID[r+1][c],p11=MOOD_GRID[r+1][c+1];
+  return p00.map((_,i)=>Math.round((1-fx)*(1-fy)*p00[i]+fx*(1-fy)*p01[i]+(1-fx)*fy*p10[i]+fx*fy*p11[i]));
+}
+function personaOver(m,pr){
+  if(!pr) return m; const k=0.6, o=m.slice(), add=(b,d,l,h)=>clamp(b+Math.round(d*k),l,h);
+  o[0]=add(m[0],pr[0]-100,20,100); o[1]=add(m[1],pr[1],0,90); o[2]=add(m[2],pr[2],-100,100);
+  o[3]=add(m[3],pr[3],0,60); o[4]=add(m[4],pr[4]-100,80,125); o[5]=add(m[5],pr[5]-100,80,125);
+  o[7]=add(m[7],pr[7],-10,10); o[8]=add(m[8]||100,(pr[8]||100)-100,60,130);
+  o[9]=add(m[9],pr[9],-100,100); o[11]=add(m[11],pr[11],-100,100); o[12]=add(m[12],pr[12],-100,100);
+  return o;
+}
+
+function render(ctx, v, a, personaKey, flags){
+  const pose = personaOver(blendPose(v,a), PERSONAS[personaKey]);
+  // applyPose, eased values taken as settled
+  const S = { open:pose[0]/100, lidTop:pose[1]/100, lidAngle:pose[2]/100, lidBot:pose[3]/100,
+    sw:pose[4]/100, sh:pose[5]/100, gx:pose[6], gy:pose[7], mWid:(pose[8]||100)/100,
+    mCrv:pose[9]/100, mOpn:pose[10]/100, browY:pose[11]/100, browTilt:pose[12]/100 };
+  let col = CFG.color;
+  if (flags.tint){ const t=(v-0.5)*2; if(t>0.05) col=mix565(col,TINT_WARM,t*0.15); else if(t<-0.05) col=mix565(col,TINT_COOL,-t*0.15); }
+  ctx.fillStyle=rgb(C_BG); ctx.fillRect(0,0,320,240);
+  const half = CFG.gap/2 + CFG.eyeW/2;
+  eye(ctx, 160-half, 120, true, S, col, flags, a);
+  eye(ctx, 160+half, 120, false, S, col, flags, a);
+  mouth(ctx, S, col);
+}
+function rr(ctx,x,y,w,h,r,c){ ctx.fillStyle=rgb(c); ctx.beginPath(); ctx.roundRect(x,y,w,h,Math.max(0,r)); ctx.fill(); }
+function tri(ctx,pts,c){ ctx.fillStyle=rgb(c); ctx.beginPath(); ctx.moveTo(pts[0],pts[1]); ctx.lineTo(pts[2],pts[3]); ctx.lineTo(pts[4],pts[5]); ctx.closePath(); ctx.fill(); }
+function circ(ctx,x,y,r,c){ ctx.fillStyle=rgb(c); ctx.beginPath(); ctx.arc(x,y,r,0,Math.PI*2); ctx.fill(); }
+
+function eye(g, cx, cy, isLeft, S, col, flags, arousal){
+  // draw into an offscreen sprite so clipping matches the firmware
+  const c=document.createElement('canvas'); c.width=EYE_SPR_W; c.height=EYE_SPR_H; const ctx=c.getContext('2d');
+  ctx.fillStyle=rgb(C_BG); ctx.fillRect(0,0,EYE_SPR_W,EYE_SPR_H);
+  let w=Math.trunc(CFG.eyeW*S.sw), h=Math.max(6,Math.trunc(CFG.eyeH*S.open*S.sh));
+  w=Math.min(w,EYE_SPR_W-4); h=Math.min(h,EYE_AREA_H-4);
+  const gx=S.gx|0, gy=S.gy|0;
+  let x=Math.trunc((EYE_SPR_W-w)/2)+gx, y=BROW_BAND+Math.trunc((EYE_AREA_H-h)/2)+gy;
+  x=clamp(x,0,EYE_SPR_W-w); y=clamp(y,BROW_BAND,EYE_SPR_H-h);
+  let r=Math.min(CFG.rnd,h>>1); r=Math.min(r,w>>1);
+  rr(ctx,x,y,w,h,r,col);
+  if(flags.pupils && h>16){
+    const pw=Math.trunc(w*(0.30+0.12*arousal)), ph=Math.min(Math.trunc(pw*1.15),h-8);
+    let px=x+Math.trunc((w-pw)/2)+Math.trunc(S.gx*0.4), py=y+Math.trunc((h-ph)/2)+Math.trunc(S.gy*0.4);
+    px=clamp(px,x+3,x+w-pw-3); py=clamp(py,y+3,y+h-ph-3);
+    rr(ctx,px,py,pw,ph,Math.min(pw,ph)>>1,mix565(col,0,0.62));
+    rr(ctx,px+Math.trunc(pw/5),py+Math.trunc(ph/6),4,4,2,C_WHITE);
+  }
+  const flat=Math.trunc(S.lidTop*h);
+  if(flat>0){ ctx.fillStyle=rgb(C_BG); ctx.fillRect(x,y,w,Math.min(flat,h)); }
+  if(Math.abs(S.lidAngle)>0.02){
+    const wedge=Math.trunc(Math.abs(S.lidAngle)*h*0.55), top=y+flat, deepOuter=S.lidAngle>0, deepLeft=isLeft?deepOuter:!deepOuter;
+    if(deepLeft) tri(ctx,[x,top,x+w,top,x,top+wedge],C_BG); else tri(ctx,[x,top,x+w,top,x+w,top+wedge],C_BG);
+  }
+  if(S.lidBot>0.02){ const rad=w, cyc=y+h+rad-Math.trunc(S.lidBot*h*0.62); circ(ctx,x+w/2,cyc,rad,C_BG); }
+  if(flags.brows){
+    const th=5, restTop=BROW_BAND+Math.trunc((EYE_AREA_H-Math.trunc(CFG.eyeH*S.sh))/2)+gy;
+    const by=restTop-12-Math.trunc(S.browY*6), bw=Math.trunc(CFG.eyeW*S.sw*0.78), bx=Math.trunc((EYE_SPR_W-bw)/2)+gx;
+    const dIn=Math.trunc(S.browTilt*5), dOut=Math.trunc(-S.browTilt*2);
+    let yl=by+(isLeft?dOut:dIn), yr=by+(isLeft?dIn:dOut);
+    const xl=clamp(bx,3,EYE_SPR_W-4), xr=clamp(bx+bw,3,EYE_SPR_W-4), yMax=Math.max(1,restTop-th-1);
+    yl=clamp(yl,1,yMax); yr=clamp(yr,1,yMax);
+    tri(ctx,[xl,yl,xr,yr,xl,yl+th],col); tri(ctx,[xr,yr,xr,yr+th,xl,yl+th],col);
+    circ(ctx,xl,yl+th/2,th/2,col); circ(ctx,xr,yr+th/2,th/2,col);
+  }
+  g.drawImage(c, cx-EYE_SPR_W/2, cy-EYE_AREA_H/2-BROW_BAND);
+}
+function mouth(g, S, col){
+  let w=clamp(Math.trunc(CFG.mouthW*S.mWid),8,MOUTH_SPR_W-4); const th=Math.max(2,CFG.mouthThick);
+  const curve=Math.trunc(S.mCrv*MOUTH_CURVE_PX), openH=Math.trunc(S.mOpn*MOUTH_OPEN_PX);
+  const x0=clamp(Math.trunc((MOUTH_SPR_W-w)/2)+Math.trunc(S.gx*0.5),0,MOUTH_SPR_W-w), ymid=MOUTH_SPR_H/2+Math.trunc(S.gy*0.3);
+  const ox=160-MOUTH_SPR_W/2, oy=MOUTH_CY-MOUTH_SPR_H/2; g.fillStyle=rgb(col);
+  for(let i=0;i<w;i++){ const t=w>1?(i/(w-1))*2-1:0, dy=Math.trunc(-curve*t*t), h=th+openH;
+    const y=clamp(ymid+dy-Math.trunc(h/2),0,MOUTH_SPR_H-h); g.fillRect(ox+x0+i,oy+y,1,h); }
+}
+
+const $=id=>document.getElementById(id);
+const flags=()=>({brows:$('brows').checked,pupils:$('pupils').checked,tint:$('tint').checked});
+function draw(){
+  const v=$('v').value/100, a=$('a').value/100, p=$('persona').value;
+  $('vOut').textContent=v.toFixed(2); $('aOut').textContent=a.toFixed(2);
+  render($('main').getContext('2d'), v, a, p, flags());
+  document.querySelectorAll('#grid canvas').forEach(c=>render(c.getContext('2d'),+c.dataset.v,+c.dataset.a,p,flags()));
+}
+for(let r=2;r>=0;r--) for(let c=0;c<3;c++){
+  const f=document.createElement('figure'), cv=document.createElement('canvas');
+  cv.width=320; cv.height=240; cv.dataset.v=c/2; cv.dataset.a=r/2;
+  cv.onclick=()=>{ $('v').value=c*50; $('a').value=r*50; draw(); };
+  const cap=document.createElement('figcaption'); cap.textContent=`${NAMES[r][c]}  (v ${c/2}, a ${r/2})`;
+  f.append(cv,cap); $('grid').append(f);
+}
+['v','a','persona','brows','pupils','tint'].forEach(id=>$(id).addEventListener('input',draw));
+draw();
+</script>
+</body>
+</html>
