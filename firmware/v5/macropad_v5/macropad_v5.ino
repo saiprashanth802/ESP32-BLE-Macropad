@@ -261,7 +261,9 @@ EmoteMapE emoteMap[TRG_PAD_N] = {
 uint8_t danceLevel = 60;          // NVS "dlvl": 0 off, ~30 bob only, 100 full party
 uint8_t flairBars  = 8;           // NVS "dflr": bars between flair chances, 0 = never
 #define FACE_CAPS 0x80            // hello byte 6: face v3 engine (emote/map/dance cmds)
-#define FACE_PROFILE 0            // 1 = log worst updateFace time + mood every 5 s (Serial)
+#ifndef FACE_PROFILE              // -DFACE_PROFILE=1: log worst updateFace time + mood every 5 s
+#define FACE_PROFILE 0
+#endif
 
 // Persona = a tuning table. Percentages scale the faceCfg intervals and the
 // emote amplitudes, so one enum changes how the whole face carries itself.
