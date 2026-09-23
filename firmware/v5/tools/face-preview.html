@@ -42,6 +42,8 @@
       <label><input type="checkbox" id="pupils" checked> pupils</label>
       <label><input type="checkbox" id="tint" checked> tint</label>
     </div>
+    <label>Brow style</label>
+    <select id="browStyle"><option value="arch">arch (new)</option><option value="bar">bar (v2 build)</option></select>
   </div>
   <div class="card" style="flex:1; min-width:300px; max-width:720px">
     <div class="grid" id="grid"></div>
@@ -130,7 +132,24 @@ function eye(g, cx, cy, isLeft, S, col, flags, arousal){
     if(deepLeft) tri(ctx,[x,top,x+w,top,x,top+wedge],C_BG); else tri(ctx,[x,top,x+w,top,x+w,top+wedge],C_BG);
   }
   if(S.lidBot>0.02){ const rad=w, cyc=y+h+rad-Math.trunc(S.lidBot*h*0.62); circ(ctx,x+w/2,cyc,rad,C_BG); }
-  if(flags.brows){
+  if(flags.brows && flags.browStyle==='arch'){
+    // Arched, tapered brow drawn column by column (same trick as the mouth).
+    // Shorter than the eye, nearer to it, a little toward the nose.
+    const restTop=BROW_BAND+Math.trunc((EYE_AREA_H-Math.trunc(CFG.eyeH*S.sh))/2)+gy;
+    const bw=Math.trunc(CFG.eyeW*S.sw*0.62);
+    const bx=Math.trunc((EYE_SPR_W-bw)/2)+gx+(isLeft?3:-3);
+    const base=restTop-8-S.browY*5;
+    const arch=3+2*Math.max(0,S.browY)-2*Math.max(0,S.browTilt);   // anger flattens it
+    ctx.fillStyle=rgb(col);
+    for(let i=0;i<bw;i++){
+      const t=bw>1?(i/(bw-1))*2-1:0, tIn=isLeft?t:-t;               // +1 = inner end
+      const th=Math.round(2.5+3.5*(1-t*t));
+      let yc=base-arch*(1-t*t)+S.browTilt*5*tIn;
+      yc=Math.min(yc, restTop-3-th/2);
+      const xx=bx+i; if(xx<1||xx>EYE_SPR_W-2) continue;
+      ctx.fillRect(xx, Math.round(Math.max(1,yc-th/2)), 1, th);
+    }
+  } else if(flags.brows){
     const th=5, restTop=BROW_BAND+Math.trunc((EYE_AREA_H-Math.trunc(CFG.eyeH*S.sh))/2)+gy;
     const by=restTop-12-Math.trunc(S.browY*6), bw=Math.trunc(CFG.eyeW*S.sw*0.78), bx=Math.trunc((EYE_SPR_W-bw)/2)+gx;
     const dIn=Math.trunc(S.browTilt*5), dOut=Math.trunc(-S.browTilt*2);
@@ -152,7 +171,7 @@ function mouth(g, S, col){
 }
 
 const $=id=>document.getElementById(id);
-const flags=()=>({brows:$('brows').checked,pupils:$('pupils').checked,tint:$('tint').checked});
+const flags=()=>({brows:$('brows').checked,pupils:$('pupils').checked,tint:$('tint').checked,browStyle:$('browStyle').value});
 function draw(){
   const v=$('v').value/100, a=$('a').value/100, p=$('persona').value;
   $('vOut').textContent=v.toFixed(2); $('aOut').textContent=a.toFixed(2);
@@ -166,7 +185,7 @@ for(let r=2;r>=0;r--) for(let c=0;c<3;c++){
   const cap=document.createElement('figcaption'); cap.textContent=`${NAMES[r][c]}  (v ${c/2}, a ${r/2})`;
   f.append(cv,cap); $('grid').append(f);
 }
-['v','a','persona','brows','pupils','tint'].forEach(id=>$(id).addEventListener('input',draw));
+['v','a','persona','brows','pupils','tint','browStyle'].forEach(id=>$(id).addEventListener('input',draw));
 draw();
 </script>
 </body>

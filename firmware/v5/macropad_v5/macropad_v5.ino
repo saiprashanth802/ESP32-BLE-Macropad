@@ -2878,28 +2878,31 @@ void drawEyeAt(int cx, int cy, float open, float wScale, bool isLeft) {
     sprEye.fillCircle(x + w / 2, cyc, rad, C_BG);
   }
 
-  // Brow: a thick bar anchored to where the eye's top edge sits *at rest*, so
-  // blinks don't drag it down — only scale (surprise) and glance move it.
+  // Brow: a short tapered arch, drawn column by column like the mouth.
+  // Anchored to where the eye's top edge sits *at rest*, so blinks don't drag
+  // it down — only scale (surprise) and glance move it. The first build used a
+  // long flat bar 12px up; it read as a floating dash, and when angry it drew
+  // a second line parallel to the lid wedge. Shorter, closer and nudged toward
+  // the nose, the arch joins the lid into one scowl instead.
   // Tilt is mirrored like the lid wedge: + drops the inner end (anger).
   if (faceV2 & FV2_BROWS) {
-    const int th = 5;
     int restTop = BROW_BAND + (EYE_AREA_H - (int)(faceCfg.eyeH * eyeScaleH)) / 2 + gy;
-    int by = restTop - 12 - (int)(browY * 6.0f);
-    int bw = (int)(faceCfg.eyeW * eyeScaleW * wScale * 0.78f);
-    int bx = (EYE_SPR_W - bw) / 2 + gx;
-    int dIn  = (int)(browTilt * 5.0f);          // inner end drop
-    int dOut = (int)(-browTilt * 2.0f);         // outer end moves a little the other way
-    int yl = by + (isLeft ? dOut : dIn);        // left end of the bar
-    int yr = by + (isLeft ? dIn : dOut);        // right end
-    int xl = constrain(bx, 3, EYE_SPR_W - 4), xr = constrain(bx + bw, 3, EYE_SPR_W - 4);
-    // Never let the bar touch the eye: merged, the two read as one blob
-    int yMax = max(1, restTop - th - 1);
-    yl = constrain(yl, 1, yMax);
-    yr = constrain(yr, 1, yMax);
-    sprEye.fillTriangle(xl, yl, xr, yr, xl, yl + th, col);
-    sprEye.fillTriangle(xr, yr, xr, yr + th, xl, yl + th, col);
-    sprEye.fillCircle(xl, yl + th / 2, th / 2, col);
-    sprEye.fillCircle(xr, yr + th / 2, th / 2, col);
+    int bw = (int)(faceCfg.eyeW * eyeScaleW * wScale * 0.62f);
+    int bx = (EYE_SPR_W - bw) / 2 + gx + (isLeft ? 3 : -3);
+    float base = restTop - 8 - browY * 5.0f;
+    float arch = 3.0f + 2.0f * max(0.0f, browY) - 2.0f * max(0.0f, browTilt);  // anger flattens it
+    for (int i = 0; i < bw; i++) {
+      float t   = (bw > 1) ? ((float)i / (bw - 1)) * 2.0f - 1.0f : 0.0f;
+      float tIn = isLeft ? t : -t;                // +1 = inner end
+      float body = 1.0f - t * t;
+      int   th  = (int)lroundf(2.5f + 3.5f * body); // 6px mid, tapering to ~3
+      float yc  = base - arch * body + browTilt * 5.0f * tIn;
+      // Never let it touch the eye: merged, the two read as one blob
+      yc = min(yc, restTop - 3 - th / 2.0f);
+      int xx = bx + i;
+      if (xx < 1 || xx > EYE_SPR_W - 2) continue;
+      sprEye.fillRect(xx, max(1, (int)lroundf(yc - th / 2.0f)), 1, th, col);
+    }
   }
   // Centre of the *eye area* stays at cy, as before brows existed
   sprEye.pushSprite(cx - EYE_SPR_W / 2, cy - EYE_AREA_H / 2 - BROW_BAND);
