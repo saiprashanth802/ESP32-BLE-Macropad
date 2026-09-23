@@ -52,13 +52,9 @@ public sealed class DeckController : IDisposable
 
     public int ActivePreset => _activePreset;
 
-    /// The pad's face v2 bits as its last hello reported them, or -1 when the
-    /// firmware predates face v2 (or no hello yet).
-    public int PadFaceV2 { get; private set; } = -1;
-
-    /// True/false when the pad has reported its look, null before any hello or
-    /// on pre-face-v2 firmware. The look is fixed per firmware build.
-    public bool? PadIsBot => PadFaceV2 < 0 ? null : (PadFaceV2 & Protocol.FaceV2Bot) != 0;
+    /// Face emotes + dance (the editor's Face view talks to the pad through it).
+    public EmoteDirector? Face { get; private set; }
+    public void AttachFace(EmoteDirector f) => Face = f;
 
     /// Ask the pad to drop into WiFi config mode for an OTA. The link goes down
     /// right after, so a successful write is the only confirmation there is.
@@ -80,12 +76,9 @@ public sealed class DeckController : IDisposable
                 // the face fields let the rewrite menu put back exactly what
                 // was there rather than guessing a default.
                 if (p.Length >= 6) _write?.NoteFace(p[4], p[5]);
-                // [faceV2] arrived with face v2 firmware; older pads send 6 bytes
-                PadFaceV2 = p.Length >= 7 ? p[6] : -1;
-                // Byte count identifies the firmware generation at a glance:
-                // 6 = pre face v2, 7 = reports faceV2 (and knows setFaceV2 0x8F)
+                // Byte 6 = face caps (0x80 = face v3); 6-byte hellos predate it
                 Diag.Log($"hello: fw v{p[0]} bytes={p.Length} preset={p[3]}"
-                       + (PadFaceV2 >= 0 ? $" faceV2=0x{PadFaceV2:X2}" : ""));
+                       + (p.Length >= 7 ? $" faceCaps=0x{p[6]:X2}" : ""));
                 StatusChanged?.Invoke($"Pad online (fw v{p[0]}, preset {p[3]})");
                 _ = Push(async () =>
                 {

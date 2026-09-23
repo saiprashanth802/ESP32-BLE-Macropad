@@ -109,7 +109,7 @@ public sealed class MoodEngine : IDisposable
         return best;
     }
 
-    static bool IsLate(MoodConfig cfg)
+    public static bool IsLate(MoodConfig cfg)
     {
         int h = DateTime.Now.Hour;
         return cfg.LateFrom <= cfg.LateTo ? h >= cfg.LateFrom && h < cfg.LateTo

@@ -30,8 +30,64 @@ public static class Protocol
     public const byte CmdMood    = 0x8D;
     public const byte CmdBeat    = 0x8E;
 
-    public const byte CmdFaceV2  = 0x8F;
     public const byte CmdConfig  = 0x90;
+    public const byte CmdEmote    = 0x91;
+    public const byte CmdEmoteMap = 0x92;
+    public const byte CmdDance    = 0x93;
+
+    /// Hello byte 6 bit: the pad runs face v3 and understands 0x91-0x93.
+    public const byte FaceCapsV3 = 0x80;
+
+    /// Emote ids, in firmware order (EX_* in macropad_v5.ino). Index = wire id.
+    public static readonly string[] Emotes =
+    {
+        "neutral", "happy", "joy", "love", "surprised", "angry", "sad",
+        "tired", "sleepy", "focused", "wink", "skeptical", "vibing", "dizzy",
+    };
+    /// Map entry meaning "pick a flair emote at random" (EMOTE_RANDOM).
+    public const string EmoteRandom = "random";
+
+    /// Pad-side triggers, in firmware order (TRG_*). The pad fires these itself,
+    /// so they keep working with the companion closed.
+    public static readonly string[] PadTriggers =
+    {
+        "boot", "connect", "disconnect", "typing", "idle", "wake",
+        "preset", "slot", "track", "favourite", "paused", "flair",
+    };
+
+    public static int EmoteId(string name) =>
+        name.Equals(EmoteRandom, StringComparison.OrdinalIgnoreCase) ? 0xFF
+        : Array.FindIndex(Emotes, e => e.Equals(name, StringComparison.OrdinalIgnoreCase));
+
+    /// Play an emote now. intensity scales its motion; holdDs is ×100 ms, 0 = default.
+    public static byte[] PlayEmote(int id, int intensity = 100, int holdDs = 0) =>
+        new byte[] { CmdEmote, 3, (byte)id, (byte)Math.Clamp(intensity, 0, 100),
+                     (byte)Math.Clamp(holdDs, 0, 255) };
+
+    /// The pad-side trigger table as writes of ≤ 6 entries (the pad's queue
+    /// caps a payload at 26 bytes). Only the last chunk carries persist, so
+    /// NVS is written once with the whole table.
+    public static IEnumerable<byte[]> SetEmoteMap(
+        IReadOnlyList<(int trigger, int emote, int chance, int cooldownS)> map, bool persist)
+    {
+        for (int at = 0; at < map.Count; at += 6)
+        {
+            var chunk = map.Skip(at).Take(6).ToList();
+            bool last = at + 6 >= map.Count;
+            var b = new List<byte> { CmdEmoteMap, (byte)(2 + chunk.Count * 4),
+                                     (byte)(persist && last ? 1 : 0), (byte)chunk.Count };
+            foreach (var (t, e, c, cd) in chunk)
+                b.AddRange(new[] { (byte)t, (byte)e, (byte)Math.Clamp(c, 0, 100),
+                                   (byte)Math.Clamp(cd, 0, 255) });
+            yield return b.ToArray();
+        }
+    }
+
+    /// Dance level 0-100 (0 off, ~30 bob only, 100 full party) and how many
+    /// bars between flair chances (0 = never).
+    public static byte[] SetDance(int level, int flairBars, bool persist) =>
+        new byte[] { CmdDance, 3, (byte)Math.Clamp(level, 0, 100),
+                     (byte)Math.Clamp(flairBars, 0, 64), (byte)(persist ? 1 : 0) };
 
     /// Put the pad into WiFi config mode (BLE drops, MacroPad-Setup hotspot
     /// comes up) so an OTA can run unattended. 'C','F' are a guard: a stray
@@ -39,15 +95,6 @@ public static class Protocol
     public static byte[] EnterConfigMode() => new byte[] { CmdConfig, 2, (byte)'C', (byte)'F' };
 
     public const byte MoodLate = 0x01, MoodFocused = 0x02;
-
-    /// Face v2 bit for the "bot" look (round LED eyes, D mouth). Off = classic.
-    public const byte FaceV2Bot = 0x10;
-
-    /// Set face v2 bits under a mask — [value][mask][persist] — so one look bit
-    /// flips without touching the others. persist writes the pad's NVS: this is
-    /// the user's choice, sent once per click rather than re-pushed per connect.
-    public static byte[] SetFaceV2(byte value, byte mask, bool persist) =>
-        new byte[] { CmdFaceV2, 3, value, mask, (byte)(persist ? 1 : 0) };
 
     /// The companion's opinion of the face's mood. Valence/arousal -100..100,
     /// weight 0-100 is how far the pad leans toward it over its own mood, and

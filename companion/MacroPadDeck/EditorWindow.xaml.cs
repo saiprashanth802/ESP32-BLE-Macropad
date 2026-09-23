@@ -115,7 +115,11 @@ public partial class EditorWindow : Window
         Closed += (_, _) => _capture.Dispose();
 
         LoadFromDisk();
+        ShowFaceView(false);
     }
+
+    /// Open on the Face view (`--editor --face`, for screenshots).
+    public void ShowFace() => ShowFaceView(true);
 
     // ── model ↔ disk ────────────────────────────
     void LoadFromDisk()
@@ -139,12 +143,23 @@ public partial class EditorWindow : Window
 
     void Save_Click(object s, RoutedEventArgs e)
     {
+        if (FaceVisible) { _ = SaveFace(); return; }
         File.WriteAllText(ProfileStore.FilePath, JsonSerializer.Serialize(_cfg, JsonOpts));
         _ = _deck.ApplyPadConfig(_cfg);    // rewrite app-managed keys on the pad
         Hint.Text = $"Saved {DateTime.Now:HH:mm:ss} — pushed to pad.";
     }
 
-    void Revert_Click(object s, RoutedEventArgs e) { LoadFromDisk(); Hint.Text = "Reverted to last saved state."; }
+    void Revert_Click(object s, RoutedEventArgs e)
+    {
+        if (FaceVisible)
+        {
+            LoadFace();
+            // Undo any live slider preview on the pad as well
+            _ = _deck.Face?.PreviewDance(_face.DanceLevel, _face.FlairBars);
+        }
+        else LoadFromDisk();
+        Hint.Text = "Reverted to last saved state.";
+    }
 
     // ── profiles ────────────────────────────────
     void FillProfileList(int selectIndex)

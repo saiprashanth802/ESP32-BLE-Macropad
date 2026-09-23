@@ -84,12 +84,19 @@ static class Program
             int.TryParse(args[ms + 1], out int pv) && int.TryParse(args[ms + 2], out int pa))
             mood.Pin = (pv, pa);
 
+        // Face emotes: pushes face.json's trigger table + dance to the pad, and
+        // fires the events only the PC sees (music drop, app context, late night).
+        using var face = new FaceStore();
+        using var emotes = new EmoteDirector(ble, face, moods, media, loopback);
+        deck.AttachFace(emotes);
+
         using var tray = new TrayContext(deck, media, llm, styles, mood);
 
         // Hook must live on the message-pump thread.
         using var fg = new ForegroundWatcher();
         fg.ExeChanged += deck.OnForegroundExe;
         fg.ExeChanged += mood.OnForegroundExe;
+        fg.ExeChanged += emotes.OnForegroundExe;
 
         // `--editor`: open the editor straight away and exit when it closes. For UI
         // work and screenshots — the tray icon lives in Windows 11's hidden overflow,
@@ -98,6 +105,7 @@ static class Program
         {
             EditorWindow.Open(deck);
             EditorWindow.Current!.Closed += (_, _) => tray.ExitThread();
+            if (args.Contains("--face")) EditorWindow.Current.ShowFace();
         }
 
 
@@ -128,21 +136,6 @@ sealed class TrayContext : ApplicationContext
         menu.Items.Add("Edit moods.json", null, (_, _) =>
             Process.Start(new ProcessStartInfo(MoodStore.FilePath) { UseShellExecute = true }));
 
-        // Face look = which firmware build is on the pad; picking the other one
-        // flashes it (FaceStyleFlasher). Ticks follow the pad's hello; before any
-        // hello (or on pre-v2 firmware) neither is ticked.
-        var faceMenu = new ToolStripMenuItem("Face style");
-        var botItem = new ToolStripMenuItem("Bot (LED)");
-        var classicItem = new ToolStripMenuItem("Classic");
-        botItem.Click += async (_, _) => await FaceStyleFlasher.Run(deck, true, deck.RaiseStatus);
-        classicItem.Click += async (_, _) => await FaceStyleFlasher.Run(deck, false, deck.RaiseStatus);
-        faceMenu.DropDownItems.AddRange(new ToolStripItem[] { botItem, classicItem });
-        faceMenu.DropDownOpening += (_, _) =>
-        {
-            botItem.Checked = deck.PadIsBot == true;
-            classicItem.Checked = deck.PadIsBot == false;
-        };
-        menu.Items.Add(faceMenu);
         menu.Items.Add("Open editor", null, (_, _) => EditorWindow.Open(deck));
         menu.Items.Add("Edit profiles.json", null, (_, _) =>
             Process.Start(new ProcessStartInfo(ProfileStore.FilePath) { UseShellExecute = true }));
@@ -164,7 +157,7 @@ sealed class TrayContext : ApplicationContext
         });
 
         menu.Items.Add("Update firmware…", null, async (_, _) =>
-            await FirmwareUpdater.Run(s => deck.RaiseStatus(s)));
+            await FirmwareUpdater.Run(deck, s => deck.RaiseStatus(s)));
 
         var autostart = new ToolStripMenuItem("Start with Windows") { CheckOnClick = true, Checked = IsAutostart() };
         autostart.CheckedChanged += (_, _) => SetAutostart(autostart.Checked);
