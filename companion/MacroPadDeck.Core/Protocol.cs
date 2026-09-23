@@ -27,6 +27,35 @@ public static class Protocol
     public const byte CmdMedia  = 0x8A;
     public const byte CmdVolume  = 0x8B;
     public const byte CmdActions = 0x8C;
+    public const byte CmdMood    = 0x8D;
+    public const byte CmdBeat    = 0x8E;
+
+    public const byte MoodLate = 0x01, MoodFocused = 0x02;
+
+    /// The companion's opinion of the face's mood. Valence/arousal -100..100,
+    /// weight 0-100 is how far the pad leans toward it over its own mood, and
+    /// ttl is how long the opinion stays valid — when it lapses the pad fades
+    /// back to autonomous, so a dead companion never freezes the face.
+    /// Weight 0 releases the face immediately. Firmware without face v2
+    /// ignores the opcode.
+    public static byte[] SetMood(int valence, int arousal, int weight, int ttlSeconds, byte flags) =>
+        new byte[] { CmdMood, 5,
+                     (byte)(sbyte)Math.Clamp(valence, -100, 100),
+                     (byte)(sbyte)Math.Clamp(arousal, -100, 100),
+                     (byte)Math.Clamp(weight, 0, 100),
+                     (byte)Math.Clamp(ttlSeconds, 0, 255), flags };
+
+    /// Tempo + phase for the pad's own beat clock: [bpm×10][ms since last beat][confidence].
+    /// Sent on drift, never per beat — BLE write jitter (30-60 ms) is larger than
+    /// the accuracy a per-beat push would need. bpm 0 means "no beat".
+    public static byte[] SetBeat(double bpm, int msSinceBeat, int confidence)
+    {
+        ushort b10 = (ushort)Math.Clamp((int)Math.Round(bpm * 10), 0, 2400);
+        ushort ms = (ushort)Math.Clamp(msSinceBeat, 0, ushort.MaxValue);
+        return new byte[] { CmdBeat, 5, (byte)(b10 & 0xFF), (byte)(b10 >> 8),
+                            (byte)(ms & 0xFF), (byte)(ms >> 8),
+                            (byte)Math.Clamp(confidence, 0, 100) };
+    }
 
     /// Ask the pad for one page of its builtin action library.
     /// The list is deliberately not duplicated in C# — it lives in the

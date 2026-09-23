@@ -5,9 +5,33 @@ namespace MacroPadDeck;
 
 static class Program
 {
+    [System.Runtime.InteropServices.DllImport("kernel32.dll")]
+    static extern bool AttachConsole(int pid);
+
     [STAThread]
     static void Main()
     {
+        var args = Environment.GetCommandLineArgs();
+
+        // `--audio-probe [s]`: print what the loopback analyzer hears, then exit.
+        // Needs no pad and touches nothing else — for tuning the beat tracker.
+        if (args.Contains("--audio-probe"))
+        {
+            AttachConsole(-1);
+            int secs = args.SkipWhile(a => a != "--audio-probe").Skip(1)
+                           .Select(a => int.TryParse(a, out int n) ? n : 0).FirstOrDefault();
+            using var probe = new LoopbackAnalyzer();
+            for (int i = 0; i < (secs > 0 ? secs : 30); i++)
+            {
+                Thread.Sleep(1000);
+                var f = probe.Read();
+                Console.WriteLine($"{i + 1,3}s active={f.Active} loud={f.Loudness:F2} bright={f.Brightness:F2} "
+                                + $"bpm={f.Bpm:F1} conf={f.Confidence} "
+                                + $"sinceBeat={(f.Active && f.Bpm > 0 ? BeatTracker.NowMs() - f.LastBeatMs : 0):F0}ms");
+            }
+            return;
+        }
+
         ApplicationConfiguration.Initialize();
 
         ProfileStore.DeckSampleKeys = WindowsDefaults.DeckSampleKeys;
@@ -48,16 +72,29 @@ static class Program
         using var volume = new VolumePusher(ble, volSource);
         ble.LinkChanged += up => { if (up) volume.Invalidate(); };
 
-        using var tray = new TrayContext(deck, media, llm, styles);
+        // Face mood: music tags + system audio + app context → HCMD_MOOD/BEAT.
+        // Audio capture is only started when moods.json allows it.
+        using var moods = new MoodStore();
+        using var loopback = moods.Config.Audio ? new LoopbackAnalyzer() : null;
+        using var mood = new MoodEngine(ble, moods, media, feishin, loopback);
+        ble.LinkChanged += up => { if (up) mood.Invalidate(); };
+        // `--mood-set v a`: pin one point of the mood map (−100..100 each)
+        int ms = Array.IndexOf(args, "--mood-set");
+        if (ms >= 0 && ms + 2 < args.Length &&
+            int.TryParse(args[ms + 1], out int pv) && int.TryParse(args[ms + 2], out int pa))
+            mood.Pin = (pv, pa);
+
+        using var tray = new TrayContext(deck, media, llm, styles, mood);
 
         // Hook must live on the message-pump thread.
         using var fg = new ForegroundWatcher();
         fg.ExeChanged += deck.OnForegroundExe;
+        fg.ExeChanged += mood.OnForegroundExe;
 
         // `--editor`: open the editor straight away and exit when it closes. For UI
         // work and screenshots — the tray icon lives in Windows 11's hidden overflow,
         // which UI automation cannot reach, so this is the only scriptable way in.
-        if (Environment.GetCommandLineArgs().Contains("--editor"))
+        if (args.Contains("--editor"))
         {
             EditorWindow.Open(deck);
             EditorWindow.Current!.Closed += (_, _) => tray.ExitThread();
@@ -76,13 +113,20 @@ sealed class TrayContext : ApplicationContext
 
     readonly NotifyIcon _icon;
 
-    public TrayContext(DeckController deck, MediaPusher media, LlmClient llm, StyleStore styles)
+    public TrayContext(DeckController deck, MediaPusher media, LlmClient llm, StyleStore styles,
+                       MoodEngine mood)
     {
         var menu = new ContextMenuStrip();
 
         var nowPlaying = new ToolStripMenuItem("Now playing → pad") { CheckOnClick = true, Checked = media.Enabled };
         nowPlaying.CheckedChanged += (_, _) => media.Enabled = nowPlaying.Checked;
         menu.Items.Add(nowPlaying);
+        // Off releases the face at once (weight 0) — the pad goes back to its own mood
+        var moodItem = new ToolStripMenuItem("Mood from music && apps") { CheckOnClick = true, Checked = mood.Enabled };
+        moodItem.CheckedChanged += (_, _) => mood.Enabled = moodItem.Checked;
+        menu.Items.Add(moodItem);
+        menu.Items.Add("Edit moods.json", null, (_, _) =>
+            Process.Start(new ProcessStartInfo(MoodStore.FilePath) { UseShellExecute = true }));
         menu.Items.Add("Open editor", null, (_, _) => EditorWindow.Open(deck));
         menu.Items.Add("Edit profiles.json", null, (_, _) =>
             Process.Start(new ProcessStartInfo(ProfileStore.FilePath) { UseShellExecute = true }));

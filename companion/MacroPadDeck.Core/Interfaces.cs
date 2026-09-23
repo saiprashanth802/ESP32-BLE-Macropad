@@ -111,3 +111,20 @@ public interface ITextCapture
     /// Drop the captured target without pasting.
     void Abandon();
 }
+
+/// One reading of what the system is playing, reduced to what the face needs.
+/// Loudness/Brightness are 0..1 and smoothed over a few seconds. Beat fields
+/// are valid when Confidence > 0: LastBeatMs is a Stopwatch timestamp (ms) of
+/// the most recent beat, so the caller can derive phase at send time.
+public readonly record struct AudioFeatures(bool Active, float Loudness, float Brightness,
+                                            double Bpm, double LastBeatMs, int Confidence)
+{
+    public static readonly AudioFeatures Silent = new(false, 0, 0, 0, 0, 0);
+}
+
+/// A platform's system-audio listener (Windows: WASAPI loopback). Feeds a
+/// BeatTracker and hands back its latest reading. Must never throw from Read.
+public interface IAudioAnalyzer : IDisposable
+{
+    AudioFeatures Read();
+}

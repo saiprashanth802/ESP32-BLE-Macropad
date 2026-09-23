@@ -32,6 +32,13 @@ public sealed class FeishinSource : IDisposable
 
     public int Duration => _dur;
     public bool IsFavorite => _userFavorite;
+
+    // Mood tags for the face — Feishin's song object carries these from the
+    // server (Navidrome/Jellyfin), they were simply never read before.
+    volatile string[] _genres = Array.Empty<string>();
+    public string[] Genres => _genres;
+    public volatile float Bpm;              // 0 when the track isn't tagged
+    public volatile int Rating;             // 0 unrated, else 1-5
     /// Song name without the " - artist" suffix, for matching against SMTC.
     public string SongName => Title.Split(" - ")[0];
 
@@ -191,9 +198,33 @@ public sealed class FeishinSource : IDisposable
         string newId = s.TryGetProperty("id", out var id) ? id.GetString() ?? "" : "";
         _userFavorite = s.TryGetProperty("userFavorite", out var uf) &&
                         uf.ValueKind == JsonValueKind.True;
-        if (newId != _songId) Log($"state: '{Title}' fav={_userFavorite}");
+        ReadTags(s);
+        if (newId != _songId)
+            Log($"state: '{Title}' fav={_userFavorite} genres=[{string.Join(",", _genres)}] "
+              + $"bpm={Bpm} rating={Rating}");
         _songId = newId;
         LastUpdate = DateTime.UtcNow;
+    }
+
+    /// Genres arrive as [{id,name}] objects on Feishin's normalised Song, but
+    /// tolerate plain strings too — the shape has changed between versions and
+    /// a missing tag must never break now-playing.
+    void ReadTags(JsonElement s)
+    {
+        var g = new List<string>();
+        if (s.TryGetProperty("genres", out var ga) && ga.ValueKind == JsonValueKind.Array)
+            foreach (var e in ga.EnumerateArray())
+            {
+                string? name = e.ValueKind == JsonValueKind.String ? e.GetString()
+                             : e.ValueKind == JsonValueKind.Object && e.TryGetProperty("name", out var gn)
+                               ? gn.GetString() : null;
+                if (!string.IsNullOrWhiteSpace(name)) g.Add(name.Trim());
+            }
+        _genres = g.ToArray();
+        Bpm = s.TryGetProperty("bpm", out var b) && b.ValueKind == JsonValueKind.Number
+              ? (float)b.GetDouble() : 0f;
+        Rating = s.TryGetProperty("userRating", out var r) && r.ValueKind == JsonValueKind.Number
+                 ? Math.Clamp((int)Math.Round(r.GetDouble()), 0, 5) : 0;
     }
 
     /// Toggle the favorite flag on whatever is playing.
