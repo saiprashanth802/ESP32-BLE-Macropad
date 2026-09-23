@@ -110,10 +110,11 @@ the `face` object in `/api/config`:
   "style": "eyes",        // "eyes" (procedural) | "gif" (uploaded loop)
   "gif":   "/idle.gif",   // active animation (from /api/anim)
   "personality": "calm",  // "calm" | "playful" | "grumpy" | "sleepy"
-  "v2": 15,               // face v2 visuals bitmask — see below
-  "eyes": {               // the EXPRESSION PACK — fully generative
+  "dance": 60,            // face v3: 0 still … ~30 nod … 100 full party
+  "flairBars": 8,         // face v3: bars between flair-emote chances, 0 = never
+  "eyes": {               // timing + colour; face v3 ignores the size fields
     "color": 0,           // RGB565 eye color; 0 = follow active preset color
-    "eyeW": 64, "eyeH": 84, "gap": 44, "round": 18,
+    "eyeW": 64, "eyeH": 84, "gap": 44, "round": 18,   // kept for old blobs, unused
     "blinkMinS": 3,  "blinkMaxS": 6,      // idle blink interval (s)
     "glanceMinS": 7, "glanceMaxS": 15,    // idle glance interval (s)
     "pairScalePct": 115,                  // wide-eye scale in pairing mode
@@ -125,27 +126,44 @@ the `face` object in `/api/config`:
 All eye fields are clamped device-side to renderable bounds. A companion app
 "generates a personality" by POSTing a new `eyes` object — no reflash needed.
 
-### Face v2: mood map, brows, particles
+### Face v3: one visor face, emotes, dance
 
-The resting face is a point on a **valence × arousal mood map**, blended
-bilinearly from nine anchor poses (`MOOD_GRID` in the sketch): tense · alert ·
-hyped / grumpy · neutral · happy / melancholy · sleepy · content. The persona's
-rest pose is layered on top at 60 %. The pad's own mood comes from typing rate
-and link health; the companion can lean it with `setMood` (`0x8D`) and drive a
-beat-synced nod with `setBeat` (`0x8E`).
+One look only: glowing eyes and mouth on the dark screen. Both are
+signed-distance shapes rendered into a single 240×150 4-bit sprite with a
+16-level glow palette, and every shape number is a spring, so any expression
+morphs smoothly into any other. `firmware/v5/tools/face-preview.html` runs the
+same maths in a browser: tune expressions there, *Copy as C*, paste into
+`EXPR[]`.
 
-`"v2"` in the `face` object is a bitmask of the new visuals, stored in NVS key
-`fv2` (all on by default): `1` brows, `2` pupils + glint, `4` mood tint (eye
-colour leans ≤15 % warm/cool), `8` particles (Zzz, music notes, sweat drop,
-hearts — drawn only in the side margins beside the eyes). `firmware/v5/tools/face-preview.html`
-renders the same maths in a browser for tuning the grid without a flash.
+**Expressions / emote ids** (wire order): `0` neutral, `1` happy, `2` joy,
+`3` love, `4` surprised, `5` angry, `6` sad, `7` tired, `8` sleepy,
+`9` focused, `10` wink, `11` skeptical, `12` vibing, `13` dizzy. `0xFF` in the
+emote map = a random flair emote.
+
+**Resting face** is a point on a valence × arousal mood map: nine cells, each an
+expression at a strength (`MOOD_GRID`), blended bilinearly. The pad's own mood
+comes from typing rate and link health; the companion leans it with `setMood`
+(`0x8D`) and drives the dance with `setBeat` (`0x8E`).
+
+**Pad-side triggers** (wire order, the pad fires these itself): `0` boot,
+`1` connect, `2` disconnect, `3` typing burst, `4` idle ≥ 60 s, `5` wake press,
+`6` preset picked on the pad, `7` host slot switch, `8` new track, `9` track
+favourited, `10` music paused, `11` dance flair. Each has an emote, a chance and
+a cooldown; the cooldown is spent on every attempt, won or lost. The table
+lives in NVS `emap`, written only when `setEmoteMap` asks to persist.
+
+**Dance** runs on the beat clock while music plays: bob, sway, tilt, side-step,
+bounce, and a headbang when arousal is high. `dance` (NVS `dlvl`) picks how
+much: 0 still, < 35 bob only, < 70 adds sway and tilt, above that every move.
+Moves change every 4 bars; every `flairBars` bars (NVS `dflr`) the flair
+trigger gets a roll.
 
 ### Personality
 
 `eyes` sets how the face *looks*; `personality` sets how it *behaves*. Each
 persona is a tuning table baked into firmware that scales blink and glance
-intervals, emote intensity, micro-behaviour rates, and the resting posture of
-the lids:
+intervals, emote intensity and length, micro-behaviour rates, and a resting mood
+bias (face v3 no longer uses the persona rest pose — the mood map owns posture):
 
 | Persona   | Feel                                                        |
 |-----------|-------------------------------------------------------------|
@@ -217,7 +235,7 @@ Wire format both ways: `[opcode:1][len:1][payload:len]`.
 
 | Op | Name | Payload |
 |----|------|---------|
-| `0x01` | hello  | `[fwMajor][keys][presets][activePreset][faceMode][persona][faceV2]` — sent on subscribe; `faceV2` (face v2 firmware and later) is the `face.v2` bitmask |
+| `0x01` | hello  | `[fwMajor][keys][presets][activePreset][faceMode][persona][faceCaps]` — sent on subscribe; `faceCaps` bit `0x80` = face v3 (understands `0x91`–`0x93`). Face v2 builds sent their feature bitmask here |
 | `0x02` | key    | `[preset][keyIdx]` — a `host` key was tapped |
 | `0x03` | preset | `[preset]` — active preset changed (either side) |
 | `0x04` | actions | `[page][totalPages][count]` + `count` × `[id lo][id hi][label 9, null-padded]` — one page of `ACTION_LIB`, in reply to `0x8C` |
@@ -234,7 +252,11 @@ Wire format both ways: `[opcode:1][len:1][payload:len]`.
 | `0x8C` | getActions | `[page]` | Ask for one page of the builtin action library; answered with event `0x04` |
 | `0x8D` | setMood   | `[valence i8 ±100][arousal i8 ±100][weight 0-100][ttl s][flags]` | Face v2: the companion's mood opinion. The pad blends toward it by `weight` over its own mood (typing rate, link health) and eases back to autonomous when `ttl` lapses; weight 0 releases at once. Flags: bit0 late-night (more yawns), bit1 focused (fewer glances, more squints). RAM only |
 | `0x8E` | setBeat   | `[bpm×10 lo][hi][ms since last beat lo][hi][confidence 0-100]` | Face v2: tempo + phase for the pad's own beat clock (nod on the beat, sway over two). Sent on drift, never per beat. bpm outside 40-240 or no update for 8 s → back to the free-running bob |
-| `0x8F` | setFaceV2 | `[value][mask][persist]` | Face v2 bits under a mask: `faceV2 = (faceV2 & ~mask) \| (value & mask)`. The tray's Face style menu sends `[0x10 or 0][0x10][1]` to flip bot/classic without touching the other bits. `persist=1` writes NVS `fv2` |
+| `0x8F` | *(retired)* | — | Face v2 feature bits. Face v3 has one look and ignores it |
+| `0x90` | enterConfig | `['C']['F']` | Enter WiFi config mode (BLE drops, `MacroPad-Setup` hotspot up) so the companion's *Update firmware…* can OTA unattended. The two magic bytes stop a stray write from knocking the pad off Bluetooth |
+| `0x91` | playEmote | `[emote id][intensity 0-100][hold ×100 ms, 0 = default]` | Face v3: play an emote now (host-side events: music drop, app context, late night; the editor's ▶ buttons). Intensity scales its motion |
+| `0x92` | setEmoteMap | `[persist][n]` + n × `[trigger][emote \| 0xFF][chance %][cooldown s]` | Face v3: the pad-side trigger table. ≤ 6 entries per write (the command queue caps a payload at 26 bytes); send `persist=1` only on the last chunk, which writes NVS `emap` |
+| `0x93` | setDance | `[level 0-100][flair every N bars, 0 = never][persist]` | Face v3: dance level and flair spacing. `persist=1` writes NVS `dlvl` / `dflr`; the editor's sliders send `persist=0` while dragging |
 
 ### Builtin actions over the host link
 
