@@ -3087,7 +3087,7 @@ void drawEyeAt(int cx, int cy, float open, float wScale, bool isLeft) {
     }
   }
   // Centre of the *eye area* stays at cy, as before brows existed
-  sprEye.pushSprite(cx - EYE_SPR_W / 2, cy - EYE_AREA_H / 2 - BROW_BAND, 0, 0, EYE_SPR_W, EYE_SPR_H);
+  sprEye.pushSprite(cx - EYE_SPR_W / 2, cy - EYE_AREA_H / 2 - BROW_BAND);
 }
 
 // Mouth: a parabolic band. Corners rise for a smile, fall for a frown, and
@@ -3125,7 +3125,7 @@ void drawMouthAt(int cx, int cy) {
     sprMouth.fillRect(x0 + i, y, 1, h, col);
   }
 
-  sprMouth.pushSprite(cx - MOUTH_SPR_W / 2, cy - MOUTH_SPR_H / 2, 0, 0, MOUTH_SPR_W, MOUTH_SPR_H);
+  sprMouth.pushSprite(cx - MOUTH_SPR_W / 2, cy - MOUTH_SPR_H / 2);
 }
 
 // ── "Bot" look (FV2_BOT) ────────────────────────
@@ -3152,21 +3152,26 @@ void drawMouthAt(int cx, int cy) {
 #define DOT_PITCH      3          // 2×2 dots, 1px gaps
 #define BOT_GLOW       3          // halo width (px)
 
-// Sprite buffers big enough for either look (eye 100×124, mouth 160×64 = 45 KB)
-#define EYE_BUF_W   (EYE_SPR_W > BOT_ESPR_W ? EYE_SPR_W : BOT_ESPR_W)
-#define EYE_BUF_H   (EYE_SPR_H > BOT_ESPR_H ? EYE_SPR_H : BOT_ESPR_H)
-#define MOUTH_BUF_W (MOUTH_SPR_W > BOT_MOUTH_W ? MOUTH_SPR_W : BOT_MOUTH_W)
-#define MOUTH_BUF_H (MOUTH_SPR_H > BOT_MOUTH_H ? MOUTH_SPR_H : BOT_MOUTH_H)
+bool faceBotSprites = false;      // which geometry sprEye/sprMouth are sized for
 
-bool faceBotSprites = false;      // which look was drawn last
-
-// Switch looks. No allocation: both sprites were created once in setup() at
-// the larger of the two looks' sizes (see EYE_BUF_*), so this only notes the
-// look and wipes the old geometry. Resizing here was the first design — it
-// failed on a fragmented heap and silently fell back to classic.
+// Resize the two face sprites for the active look. Delete-then-create keeps
+// the peak heap near one set (bot 37 KB vs classic 31 KB). If the bigger set
+// cannot be allocated, fall back to classic rather than draw into nothing.
 void ensureFaceSprites(bool bot) {
-  if (bot == faceBotSprites) return;
+  if (bot == faceBotSprites && sprEye.created() && sprMouth.created()) return;
+  sprEye.deleteSprite(); sprMouth.deleteSprite();
+  bool ok = bot && sprEye.createSprite(BOT_ESPR_W, BOT_ESPR_H) &&
+                   sprMouth.createSprite(BOT_MOUTH_W, BOT_MOUTH_H);
+  if (!ok) {
+    if (bot) Serial.println("[face] bot sprites failed to allocate — classic look");
+    sprEye.deleteSprite(); sprMouth.deleteSprite();
+    sprEye.createSprite(EYE_SPR_W, EYE_SPR_H);
+    sprMouth.createSprite(MOUTH_SPR_W, MOUTH_SPR_H);
+    if (bot) faceV2 &= ~FV2_BOT;          // RAM only: the next boot tries again
+    bot = false;
+  }
   faceBotSprites = bot;
+  // Old geometry may still be on screen when this runs mid-face
   if (currentScreen == SCR_FACE) tft.fillRect(0, 51, 320, 163, C_BG);
 }
 
@@ -3212,7 +3217,7 @@ void drawBotEyeAt(int cx, int cy, float open, float wScale, bool isLeft) {
   }
   int sx0 = cx - W / 2, sy0 = cy - BOT_ESPR_CY;
   dotGrid(sprEye, W, H, sx0, sy0);
-  sprEye.pushSprite(sx0, sy0, 0, 0, W, H);
+  sprEye.pushSprite(sx0, sy0);
 }
 
 // D mouth. A smile opens downward into a grin whose top lip flattens as it
@@ -3252,7 +3257,7 @@ void drawBotMouth() {
   }
   int sx0 = 160 - W / 2, sy0 = BOT_MOUTH_CY - H / 2;
   dotGrid(sprMouth, W, H, sx0, sy0);
-  sprMouth.pushSprite(sx0, sy0, 0, 0, W, H);
+  sprMouth.pushSprite(sx0, sy0);
 }
 
 // ── Favourite heart ─────────────────────────────
@@ -4665,23 +4670,10 @@ void setup() {
                                  // flips this only around its own pushImage
   sprBar.setColorDepth(16);  sprBar.createSprite(320, 26);
   sprCell.setColorDepth(16); sprCell.createSprite(CELL_W, CELL_H);
-  // Face sprites are allocated ONCE, at the larger of the two looks' sizes,
-  // while the heap is fresh; each look draws and pushes its own window. The
-  // first build resized them per look and the bot set (~37 KB) failed to
-  // allocate at runtime on a fragmented heap — the tray toggle silently fell
-  // back to classic.
-  sprEye.setColorDepth(16);  sprEye.createSprite(EYE_BUF_W, EYE_BUF_H);
-  sprMouth.setColorDepth(16); sprMouth.createSprite(MOUTH_BUF_W, MOUTH_BUF_H);
+  sprEye.setColorDepth(16);  sprEye.createSprite(EYE_SPR_W, EYE_SPR_H);
+  sprMouth.setColorDepth(16); sprMouth.createSprite(MOUTH_SPR_W, MOUTH_SPR_H);
   sprFx.setColorDepth(16);    sprFx.createSprite(FX_SPR, FX_SPR);
-  if (!sprEye.created() || !sprMouth.created()) {
-    // Never seen, but a blank face is worse than the classic one
-    sprEye.deleteSprite(); sprMouth.deleteSprite();
-    sprEye.createSprite(EYE_SPR_W, EYE_SPR_H);
-    sprMouth.createSprite(MOUTH_SPR_W, MOUTH_SPR_H);
-    faceV2 &= ~FV2_BOT;
-    Serial.println("[face] 45 KB face buffers failed — classic look only");
-  }
-  // Face v2 budget check — face buffers 45 KB (was 31 KB classic), sprFx 1.1 KB
+  // Face v2 budget check — the eye sprite grew by 2.5 KB and sprFx is 1.1 KB
   Serial.printf("[face] heap free %u, largest block %u\n",
                 (unsigned)ESP.getFreeHeap(),
                 (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_8BIT));
