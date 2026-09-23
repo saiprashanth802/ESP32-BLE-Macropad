@@ -31,6 +31,12 @@ public static class Protocol
     public const byte CmdBeat    = 0x8E;
 
     public const byte CmdFaceV2  = 0x8F;
+    public const byte CmdConfig  = 0x90;
+
+    /// Put the pad into WiFi config mode (BLE drops, MacroPad-Setup hotspot
+    /// comes up) so an OTA can run unattended. 'C','F' are a guard: a stray
+    /// write can't knock the pad off Bluetooth. Ignored by pre-0x90 firmware.
+    public static byte[] EnterConfigMode() => new byte[] { CmdConfig, 2, (byte)'C', (byte)'F' };
 
     public const byte MoodLate = 0x01, MoodFocused = 0x02;
 

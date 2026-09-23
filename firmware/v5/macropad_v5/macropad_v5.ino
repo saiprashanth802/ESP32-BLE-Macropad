@@ -221,6 +221,15 @@ const EyePose POSE_NEUTRAL = { 100, 0, 0, 0, 100, 100, 0, 0, 100, 0, 0, 0, 0 };
 #define FV2_BOT    0x10   // "bot" look: round LED eyes, D mouth, dot-matrix texture
                           // (brows/pupils are classic-only and ignored here)
 #define FV2_MASK   0x1F
+// The look is fixed per BUILD: two images (bot / classic), flashed from the
+// companion's Face style menu. Switching at runtime needs differently sized
+// sprites, and every runtime scheme tried on 2026-09-23 failed on the heap
+// (resize: fragmentation; both sizes up front: crash-loop once a host
+// connected). Classic build: -DFACE_LOOK_BOT=0 via compiler.cpp.extra_flags.
+#ifndef FACE_LOOK_BOT
+#define FACE_LOOK_BOT 1
+#endif
+#define FV2_LOOK   (FACE_LOOK_BOT ? FV2_BOT : 0)
 #define FACE_PROFILE 0    // 1 = log worst updateFace time + mood every 5 s (Serial)
 uint8_t faceV2 = FV2_BROWS | FV2_PUPILS | FV2_TINT | FV2_FX | FV2_BOT;
 
@@ -620,10 +629,12 @@ enum : uint8_t {  // host → device
   HCMD_BEAT   = 0x8E,  // [bpm×10 lo][hi][ms since last beat lo][hi][confidence 0-100]
                        // Tempo + phase only — the pad keeps time itself. Sent on
                        // drift, never per beat: BLE jitter exceeds the accuracy.
-  HCMD_FACEV2 = 0x8F,  // [value][mask][persist] — face v2 bits: faceV2 = (faceV2 & ~mask)
-                       // | (value & mask). The mask lets the tray flip one look
-                       // bit without clobbering the others. persist=1 writes NVS
-                       // "fv2" (a user's choice, sent once per click, not per connect).
+  HCMD_FACEV2 = 0x8F,  // [value][mask][persist] — face v2 bits under a mask. The LOOK bit
+                       // (FV2_BOT) is fixed per build and ignored here; the tray
+                       // switches looks by flashing the other image (HCMD_CONFIG).
+  HCMD_CONFIG = 0x90,  // ['C']['F'] — enter WiFi config mode (BLE drops, SoftAP up)
+                       // so the companion can OTA a different build unattended.
+                       // The two magic bytes keep a stray write from triggering it.
 };
 
 NimBLECharacteristic* pEvtChar = nullptr;
@@ -1550,7 +1561,8 @@ void loadState() {
   // Persona is its own key, so an old "fcfg" blob still loads unchanged
   facePersona = min((uint8_t)(NUM_PERSONAS - 1), (uint8_t)prefs.getUChar("fpers", 0));
   mediaShow   = prefs.getUChar("media", 1) ? 1 : 0;
-  faceV2      = prefs.getUChar("fv2", faceV2) & FV2_MASK;
+  // NVS keeps the other bits; the look bit always comes from the build
+  faceV2      = ((prefs.getUChar("fv2", faceV2) & FV2_MASK) & ~FV2_BOT) | FV2_LOOK;
   // Off by default: a pad with no puck should never bring up the WiFi stack
   puckEnabled = prefs.getBool("puck", false);
   puckSpeed   = constrain((int)prefs.getUChar("pspd", PUCK_SPEED_DEF),
@@ -2258,18 +2270,21 @@ void hostLinkTick() {
         break;
 
       case HCMD_FACEV2:                    // [value][mask][persist]
-        // Changing the LOOK reboots the pad (~3 s, BLE reacquires on its own).
-        // The two looks need differently sized sprites, and resizing them at
-        // runtime failed on a fragmented heap (bot set ~37 KB would not
-        // allocate). Allocating both sizes up front instead added ~8 KB at
-        // boot and the pad crash-looped once a host connected (2026-09-23).
-        // At boot the swap is proven, so the look is only ever set up there.
+        // The look bit is masked out: it belongs to the build (FACE_LOOK_BOT),
+        // and the tray changes looks by flashing the other image instead.
         if (n >= 2) {
-          uint8_t nv = ((faceV2 & ~p[1]) | (p[0] & p[1])) & FV2_MASK;
-          bool lookChanged = (nv ^ faceV2) & FV2_BOT;
-          faceV2 = nv;
-          if ((n >= 3 && p[2]) || lookChanged) prefs.putUChar("fv2", faceV2);
-          if (lookChanged) { delay(50); ESP.restart(); }
+          uint8_t m = p[1] & ~FV2_BOT;
+          faceV2 = (((faceV2 & ~m) | (p[0] & m)) & FV2_MASK);
+          if (n >= 3 && p[2]) prefs.putUChar("fv2", faceV2);
+        }
+        break;
+
+      case HCMD_CONFIG:                    // ['C']['F'] — no return: reboots on exit
+        if (n >= 2 && p[0] == 'C' && p[1] == 'F') {
+          saveSettings();
+          enterConfigMode();                 // BLE is torn down from here on,
+          hostCmdTail = hostCmdHead;         // so drop anything still queued
+          return;
         }
         break;
 
@@ -4316,7 +4331,7 @@ void handlePostConfig() {
     } else if (f["personality"].is<int>())
       facePersona = constrain((int)f["personality"], 0, NUM_PERSONAS - 1);
     if (f["v2"].is<int>()) {
-      faceV2 = (uint8_t)((int)f["v2"] & FV2_MASK);
+      faceV2 = (uint8_t)((((int)f["v2"] & FV2_MASK) & ~FV2_BOT) | FV2_LOOK);
       prefs.putUChar("fv2", faceV2);
     }
     JsonObjectConst e = f["eyes"];

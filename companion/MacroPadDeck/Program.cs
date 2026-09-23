@@ -128,25 +128,19 @@ sealed class TrayContext : ApplicationContext
         menu.Items.Add("Edit moods.json", null, (_, _) =>
             Process.Start(new ProcessStartInfo(MoodStore.FilePath) { UseShellExecute = true }));
 
-        // Face look. The ticks follow what the pad reported in its hello; before
-        // any hello (or on pre-v2 firmware) neither is ticked.
+        // Face look = which firmware build is on the pad; picking the other one
+        // flashes it (FaceStyleFlasher). Ticks follow the pad's hello; before any
+        // hello (or on pre-v2 firmware) neither is ticked.
         var faceMenu = new ToolStripMenuItem("Face style");
         var botItem = new ToolStripMenuItem("Bot (LED)");
         var classicItem = new ToolStripMenuItem("Classic");
-        async Task PickFace(bool bot)
-        {
-            deck.RaiseStatus(await deck.SetBotFace(bot)
-                ? $"Face: {(bot ? "bot" : "classic")}"
-                : "Face: pad not connected");
-        }
-        botItem.Click += async (_, _) => await PickFace(true);
-        classicItem.Click += async (_, _) => await PickFace(false);
+        botItem.Click += async (_, _) => await FaceStyleFlasher.Run(deck, true, deck.RaiseStatus);
+        classicItem.Click += async (_, _) => await FaceStyleFlasher.Run(deck, false, deck.RaiseStatus);
         faceMenu.DropDownItems.AddRange(new ToolStripItem[] { botItem, classicItem });
         faceMenu.DropDownOpening += (_, _) =>
         {
-            int v = deck.PadFaceV2;
-            botItem.Checked = v >= 0 && (v & Protocol.FaceV2Bot) != 0;
-            classicItem.Checked = v >= 0 && (v & Protocol.FaceV2Bot) == 0;
+            botItem.Checked = deck.PadIsBot == true;
+            classicItem.Checked = deck.PadIsBot == false;
         };
         menu.Items.Add(faceMenu);
         menu.Items.Add("Open editor", null, (_, _) => EditorWindow.Open(deck));

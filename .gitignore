@@ -6,3 +6,5 @@ build/
 Thumbs.db
 desktop.ini
 .vscode/
+build-bot/
+build-classic/

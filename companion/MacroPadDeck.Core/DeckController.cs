@@ -56,16 +56,17 @@ public sealed class DeckController : IDisposable
     /// firmware predates face v2 (or no hello yet).
     public int PadFaceV2 { get; private set; } = -1;
 
-    /// Switch between the bot and classic look. Persisted on the pad, so it
-    /// holds with the companion closed and on the other OS's slot too.
-    public async Task<bool> SetBotFace(bool bot)
+    /// True/false when the pad has reported its look, null before any hello or
+    /// on pre-face-v2 firmware. The look is fixed per firmware build.
+    public bool? PadIsBot => PadFaceV2 < 0 ? null : (PadFaceV2 & Protocol.FaceV2Bot) != 0;
+
+    /// Ask the pad to drop into WiFi config mode for an OTA. The link goes down
+    /// right after, so a successful write is the only confirmation there is.
+    public async Task<bool> RequestConfigMode()
     {
         if (!_ble.IsUp) return false;
-        bool ok = await _ble.Write(Protocol.SetFaceV2(bot ? Protocol.FaceV2Bot : (byte)0,
-                                                      Protocol.FaceV2Bot, persist: true));
-        if (ok && PadFaceV2 >= 0)
-            PadFaceV2 = bot ? PadFaceV2 | Protocol.FaceV2Bot : PadFaceV2 & ~Protocol.FaceV2Bot;
-        Diag.Log($"face: style {(bot ? "bot" : "classic")} write={ok}");
+        bool ok = await _ble.Write(Protocol.EnterConfigMode());
+        Diag.Log($"config: requested config mode write={ok}");
         return ok;
     }
 
