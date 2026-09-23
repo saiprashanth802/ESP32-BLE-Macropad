@@ -204,8 +204,21 @@ struct EyePose {
   uint8_t mouthWPct;    // width scale; 0 means "default" (=100), not "hidden"
   int8_t  mouthCurve;   // -100 frown … 0 flat … +100 smile
   uint8_t mouthOpenPct; // 0 = closed line, 100 = fully open (yawn, gasp)
+  // ── Brows ── appended after the mouth for the same reason: rows written
+  // before brows existed zero-fill to a level brow at rest height.
+  int8_t  browY;        // -100 lowered … 0 rest … +100 raised (surprise)
+  int8_t  browTilt;     // + inner end down (angry), − inner end up (worried)
 };
-const EyePose POSE_NEUTRAL = { 100, 0, 0, 0, 100, 100, 0, 0, 100, 0, 0 };
+const EyePose POSE_NEUTRAL = { 100, 0, 0, 0, 100, 100, 0, 0, 100, 0, 0, 0, 0 };
+
+// Face v2 feature bits — NVS "fv2", its own key so an old "fcfg" blob still
+// loads. All on by default; the config API can switch any of them off.
+#define FV2_BROWS  0x01   // brows above each eye
+#define FV2_PUPILS 0x02   // darker pupil + glint inside each eye
+#define FV2_TINT   0x04   // eye colour leans warm/cool with mood (≤15 %)
+#define FV2_FX     0x08   // particles in the side margins (Zzz, notes, sweat, hearts)
+#define FACE_PROFILE 0    // 1 = log worst updateFace time + mood every 5 s (Serial)
+uint8_t faceV2 = FV2_BROWS | FV2_PUPILS | FV2_TINT | FV2_FX;
 
 // A keyframe holds a pose from tMs until the next frame's tMs.
 // winkMask: bit0 = left eye closed, bit1 = right eye closed.
@@ -225,13 +238,13 @@ struct Personality {
   EyePose rest;                             // posture with nothing happening
 };
 const Personality PERSONAS[] = {
-  // The last three of each rest pose are the mouth: width%, curve, open%.
+  // After the eye fields: mouth width%, curve, open%; then brow height, tilt.
   // timePct stretches emote playback per persona, on top of EMOTE_TIME_PCT.
   // name      blink glance emote time sacc dbl yawn sqnt  eBias vBias  rest pose
-  { "CALM",     120,  110,   70, 105,   30,  10,  15,  20,   -10,   10, { 100,  8,   0,  0, 100, 100, 0, 0, 100,  18, 0 } },
-  { "PLAYFUL",   70,   60,  130,  85,  100,  40,  10,  25,    25,   25, { 100,  0,   0,  8, 100, 100, 0, 0, 106,  46, 0 } },
-  { "GRUMPY",   140,  130,   60, 115,   20,   5,   5,  50,   -15,  -30, {  92, 18, -35,  0, 100, 100, 0, 0,  88, -40, 0 } },
-  { "SLEEPY",   170,  150,   50, 145,   15,  10,  60,  30,   -40,    0, {  80, 35,  20,  0, 100,  96, 0, 2,  84,  -8, 0 } },
+  { "CALM",     120,  110,   70, 105,   30,  10,  15,  20,   -10,   10, { 100,  8,   0,  0, 100, 100, 0, 0, 100,  18, 0,   0,   0 } },
+  { "PLAYFUL",   70,   60,  130,  85,  100,  40,  10,  25,    25,   25, { 100,  0,   0,  8, 100, 100, 0, 0, 106,  46, 0,  12,   0 } },
+  { "GRUMPY",   140,  130,   60, 115,   20,   5,   5,  50,   -15,  -30, {  92, 18, -35,  0, 100, 100, 0, 0,  88, -40, 0, -10,  45 } },
+  { "SLEEPY",   170,  150,   50, 145,   15,  10,  60,  30,   -40,    0, {  80, 35,  20,  0, 100,  96, 0, 2,  84,  -8, 0, -15,   0 } },
 };
 const uint8_t NUM_PERSONAS = sizeof(PERSONAS) / sizeof(PERSONAS[0]);
 uint8_t facePersona = 0;
@@ -435,6 +448,14 @@ enum : uint8_t {  // host → device
                        // encoder puck. flags: bit0 = muted.
                        // BLE HID volume is relative, so this is the only path
                        // by which the pad or puck can know the real level.
+  HCMD_MOOD   = 0x8D,  // [valence i8 ±100][arousal i8 ±100][weight 0-100][ttl s][flags]
+                       // The companion's opinion of the mood. Blended over the
+                       // pad's own by weight and dropped when ttl lapses, so a
+                       // dead companion fades the face back to autonomous.
+                       // flags: bit0 = late-night context, bit1 = focused (IDE)
+  HCMD_BEAT   = 0x8E,  // [bpm×10 lo][hi][ms since last beat lo][hi][confidence 0-100]
+                       // Tempo + phase only — the pad keeps time itself. Sent on
+                       // drift, never per beat: BLE jitter exceeds the accuracy.
 };
 
 NimBLECharacteristic* pEvtChar = nullptr;
@@ -467,6 +488,20 @@ volatile bool mediaNewSong = false, mediaJustFaved = false;
 // but only real music drives the face — a 3-hour audiobook chapter changing
 // is not an "ooh, new track" moment.
 bool mediaIsMusic = false;
+
+// Companion mood (HCMD_MOOD). 0..1 on both axes like the pad's own mood; the
+// face blends toward it by hostMoodW until the ttl lapses, then eases back.
+float    hostMoodV = 0.5f, hostMoodA = 0.5f, hostMoodW = 0.0f;
+unsigned long hostMoodRxMs = 0, hostMoodTtlMs = 0;
+uint8_t  hostMoodFlags = 0;
+#define HMOOD_LATE    0x01
+#define HMOOD_FOCUSED 0x02
+
+// Beat clock (HCMD_BEAT). The pad keeps time from the anchor; the companion
+// only corrects drift. Stale after 8 s, and then the plain bob takes over.
+float    beatPeriodMs = 0;
+unsigned long beatAnchorMs = 0, beatRxMs = 0;
+uint8_t  beatConf = 0;
 
 class EvtCB : public NimBLECharacteristicCallbacks {
   void onSubscribe(NimBLECharacteristic* c, NimBLEConnInfo& info,
@@ -1269,9 +1304,16 @@ Preferences prefs;
 TFT_eSPI    tft    = TFT_eSPI();
 TFT_eSprite sprBar = TFT_eSprite(&tft);   // 320×26 status bar
 TFT_eSprite sprCell= TFT_eSprite(&tft);   // 78×68 reusable key cell
-TFT_eSprite sprEye = TFT_eSprite(&tft);   // 92×110 reusable eye canvas (face)
+TFT_eSprite sprEye = TFT_eSprite(&tft);   // 92×124 reusable eye canvas (face)
 #define EYE_SPR_W 92
-#define EYE_SPR_H 110
+// The eye owns a 110px area; the sprite grows 14px upward for the brow, so
+// brows are mirrored per eye, follow the glance and can never leave trails.
+// Top edge lands at y=51 — just clear of the puck label (y 34..50).
+#define EYE_AREA_H 110
+#define BROW_BAND  14
+#define EYE_SPR_H  (EYE_AREA_H + BROW_BAND)
+TFT_eSprite sprFx = TFT_eSprite(&tft);    // 24×24 particle canvas (face v2)
+#define FX_SPR 24
 
 // Mouth lives in the band between the eye sprites (which end at y=175) and
 // the now-playing strip (y=214). 36px tall keeps it clear of both, so the
@@ -1343,6 +1385,7 @@ void loadState() {
   // Persona is its own key, so an old "fcfg" blob still loads unchanged
   facePersona = min((uint8_t)(NUM_PERSONAS - 1), (uint8_t)prefs.getUChar("fpers", 0));
   mediaShow   = prefs.getUChar("media", 1) ? 1 : 0;
+  faceV2      = prefs.getUChar("fv2", faceV2) & 0x0F;
   // Off by default: a pad with no puck should never bring up the WiFi stack
   puckEnabled = prefs.getBool("puck", false);
   puckSpeed   = constrain((int)prefs.getUChar("pspd", PUCK_SPEED_DEF),
@@ -1379,6 +1422,7 @@ void saveSettings() {
   prefs.putUChar("fstyle", faceStyle);
   prefs.putUChar("fpers", facePersona);
   prefs.putUChar("media", mediaShow);
+  prefs.putUChar("fv2", faceV2);
   prefs.putBool("puck", puckEnabled);
   prefs.putUChar("pspd", puckSpeed);
   prefs.putUChar("pacc", puckAccel);
@@ -2029,6 +2073,30 @@ void hostLinkTick() {
         if (n >= 1) hostNotifyActions(p[0]);
         break;
 
+      case HCMD_MOOD:                      // [v i8][a i8][weight][ttl s][flags]
+        if (n >= 4) {
+          hostMoodV     = constrain(((int8_t)p[0] + 100) / 200.0f, 0.0f, 1.0f);
+          hostMoodA     = constrain(((int8_t)p[1] + 100) / 200.0f, 0.0f, 1.0f);
+          hostMoodW     = min(p[2], (uint8_t)100) / 100.0f;
+          hostMoodTtlMs = (unsigned long)p[3] * 1000UL;
+          hostMoodFlags = (n >= 5) ? p[4] : 0;
+          hostMoodRxMs  = millis();
+        }
+        break;
+
+      case HCMD_BEAT:                      // [bpm×10 lo][hi][phase ms lo][hi][conf]
+        if (n >= 5) {
+          uint16_t bpm10 = (uint16_t)(p[0] | (p[1] << 8));
+          uint16_t since = (uint16_t)(p[2] | (p[3] << 8));
+          if (bpm10 >= 400 && bpm10 <= 2400) {     // 40..240 BPM; else "no beat"
+            beatPeriodMs = 600000.0f / bpm10;
+            beatAnchorMs = millis() - since;
+            beatConf     = min(p[4], (uint8_t)100);
+            beatRxMs     = millis();
+          } else beatConf = 0;
+        }
+        break;
+
       case HCMD_VOLUME:                    // [level][flags]
         if (n >= 1) {
           uint8_t v = p[0];
@@ -2660,7 +2728,22 @@ float mouthCrv = 0,  mouthCrvT = 0;     // -1 frown .. +1 smile
 float mouthOpn = 0,  mouthOpnT = 0;     // 0 closed line .. 1 fully open
 float eyeScaleW = 1, eyeScaleWT = 1;    // size multipliers on top of faceCfg
 float eyeScaleH = 1, eyeScaleHT = 1;
+float browY = 0,    browYT = 0;         // -1 lowered .. +1 raised
+float browTilt = 0, browTiltT = 0;      // + inner end down (angry) .. − worried
 uint8_t eyeWinkMask = 0;                // bit0 left eye shut, bit1 right
+
+// Render-only offsets for the music bob. Kept out of the glance targets on
+// purpose: those persist between frames, so adding a sine to them every frame
+// integrates it into a drift instead of an oscillation.
+float faceBobX = 0, faceBobY = 0;
+uint16_t faceColNow = 0x3DFF;           // eye colour this frame, tint applied
+
+// What the face actually shows: the pad's own mood blended with the
+// companion's, eased so a new host opinion glides in rather than snapping.
+float faceMoodV = 0.5f, faceMoodA = 0.5f;
+float hostMix = 0.0f;                   // eased hostMoodW actually applied
+extern unsigned long fxSleepySince;     // particles — defined with the pool below
+void fxClear(bool erase);
 
 // Mood: two slow scalars in 0..1. Energy tracks how much you have been using
 // the pad, valence how well things are going (BLE up/down). They bias the
@@ -2716,6 +2799,28 @@ uint16_t faceEyeColor() {
   return faceCfg.color ? faceCfg.color : PRESET_COLORS[activePreset];
 }
 
+// Lerp two RGB565 colours per channel, t in 0..1.
+static uint16_t mix565(uint16_t a, uint16_t b, float t) {
+  int r = ((a >> 11) & 31), g = ((a >> 5) & 63), bl = (a & 31);
+  r  += (int)((((b >> 11) & 31) - r)  * t);
+  g  += (int)((((b >> 5)  & 63) - g)  * t);
+  bl += (int)(((b & 31)         - bl) * t);
+  return (uint16_t)((r << 11) | (g << 5) | bl);
+}
+
+// The user's eye colour, leaning at most 15 % warm (happy) or cool (low).
+// The media strip keeps the untinted colour — it is UI, not expression.
+#define TINT_WARM 0xFD89                // #FFB24D
+#define TINT_COOL 0x5BDF                // #5A7BFF
+uint16_t faceTintedColor() {
+  uint16_t base = faceEyeColor();
+  if (!(faceV2 & FV2_TINT)) return base;
+  float t = (faceMoodV - 0.5f) * 2.0f;  // -1..1
+  if (t >  0.05f) return mix565(base, TINT_WARM,  t * 0.15f);
+  if (t < -0.05f) return mix565(base, TINT_COOL, -t * 0.15f);
+  return base;
+}
+
 // Draw one eye into sprEye and push at center (cx, cy).
 // The eye itself is one rounded rect; expression comes from painting lids
 // back over it in the background colour, which costs 2-3 primitives and
@@ -2725,15 +2830,31 @@ void drawEyeAt(int cx, int cy, float open, float wScale, bool isLeft) {
   if (eyeWinkMask & (isLeft ? 1 : 2)) open = 0.04f;   // this eye is winking
   int w = (int)(faceCfg.eyeW * wScale * eyeScaleW);
   int h = max(6, (int)(faceCfg.eyeH * open * eyeScaleH));
-  w = min(w, EYE_SPR_W - 4); h = min(h, EYE_SPR_H - 4);
-  int gx = (int)eyeGlanceX, gy = (int)eyeGlanceY;
+  w = min(w, EYE_SPR_W - 4); h = min(h, EYE_AREA_H - 4);
+  int gx = (int)(eyeGlanceX + faceBobX), gy = (int)(eyeGlanceY + faceBobY);
   int x = (EYE_SPR_W - w) / 2 + gx;
-  int y = (EYE_SPR_H - h) / 2 + gy;
+  int y = BROW_BAND + (EYE_AREA_H - h) / 2 + gy;
   x = constrain(x, 0, EYE_SPR_W - w);
-  y = constrain(y, 0, EYE_SPR_H - h);
+  y = constrain(y, BROW_BAND, EYE_SPR_H - h);   // the eye never enters the brow band
   int r = min((int)faceCfg.rnd, h / 2);
   r = min(r, w / 2);
-  sprEye.fillRoundRect(x, y, w, h, r, faceEyeColor());
+  uint16_t col = faceColNow;
+  sprEye.fillRoundRect(x, y, w, h, r, col);
+
+  // Pupil: a darker rounded rect that leads the glance a little (parallax),
+  // widening with arousal. Drawn before the lids so they cut it too. Skipped
+  // on a near-closed eye, where it would just be a dark smear.
+  if ((faceV2 & FV2_PUPILS) && h > 16) {
+    int pw = (int)(w * (0.30f + 0.12f * faceMoodA));
+    int ph = min((int)(pw * 1.15f), h - 8);
+    int px = x + (w - pw) / 2 + (int)((eyeGlanceX + faceBobX) * 0.4f);
+    int py = y + (h - ph) / 2 + (int)((eyeGlanceY + faceBobY) * 0.4f);
+    px = constrain(px, x + 3, x + w - pw - 3);
+    py = constrain(py, y + 3, y + h - ph - 3);
+    sprEye.fillRoundRect(px, py, pw, ph, min(pw, ph) / 2, mix565(col, 0x0000, 0.62f));
+    // Glint top-left on both eyes: one light source reads as one face
+    sprEye.fillRoundRect(px + pw / 5, py + ph / 6, 4, 4, 2, C_WHITE);
+  }
 
   // Top lid: a flat band plus a wedge. The wedge is deeper on the outer
   // edge for sadness and on the inner edge for anger — mirrored per eye,
@@ -2756,7 +2877,32 @@ void drawEyeAt(int cx, int cy, float open, float wScale, bool isLeft) {
     int cyc = y + h + rad - (int)(lidBot * h * 0.62f);
     sprEye.fillCircle(x + w / 2, cyc, rad, C_BG);
   }
-  sprEye.pushSprite(cx - EYE_SPR_W / 2, cy - EYE_SPR_H / 2);
+
+  // Brow: a thick bar anchored to where the eye's top edge sits *at rest*, so
+  // blinks don't drag it down — only scale (surprise) and glance move it.
+  // Tilt is mirrored like the lid wedge: + drops the inner end (anger).
+  if (faceV2 & FV2_BROWS) {
+    const int th = 5;
+    int restTop = BROW_BAND + (EYE_AREA_H - (int)(faceCfg.eyeH * eyeScaleH)) / 2 + gy;
+    int by = restTop - 12 - (int)(browY * 6.0f);
+    int bw = (int)(faceCfg.eyeW * eyeScaleW * wScale * 0.78f);
+    int bx = (EYE_SPR_W - bw) / 2 + gx;
+    int dIn  = (int)(browTilt * 5.0f);          // inner end drop
+    int dOut = (int)(-browTilt * 2.0f);         // outer end moves a little the other way
+    int yl = by + (isLeft ? dOut : dIn);        // left end of the bar
+    int yr = by + (isLeft ? dIn : dOut);        // right end
+    int xl = constrain(bx, 3, EYE_SPR_W - 4), xr = constrain(bx + bw, 3, EYE_SPR_W - 4);
+    // Never let the bar touch the eye: merged, the two read as one blob
+    int yMax = max(1, restTop - th - 1);
+    yl = constrain(yl, 1, yMax);
+    yr = constrain(yr, 1, yMax);
+    sprEye.fillTriangle(xl, yl, xr, yr, xl, yl + th, col);
+    sprEye.fillTriangle(xr, yr, xr, yr + th, xl, yl + th, col);
+    sprEye.fillCircle(xl, yl + th / 2, th / 2, col);
+    sprEye.fillCircle(xr, yr + th / 2, th / 2, col);
+  }
+  // Centre of the *eye area* stays at cy, as before brows existed
+  sprEye.pushSprite(cx - EYE_SPR_W / 2, cy - EYE_AREA_H / 2 - BROW_BAND);
 }
 
 // Mouth: a parabolic band. Corners rise for a smile, fall for a frown, and
@@ -2776,12 +2922,12 @@ void drawMouthAt(int cx, int cy) {
   // less than the eyes, and the vertical band is only 36px so full follow
   // would clip a wide-open mouth. This is also what makes the music bob read
   // as the whole head nodding rather than the eyes sliding off the mouth.
-  int mgx = (int)(eyeGlanceX * 0.50f);
-  int mgy = (int)(eyeGlanceY * 0.30f);
+  int mgx = (int)((eyeGlanceX + faceBobX) * 0.50f);
+  int mgy = (int)((eyeGlanceY + faceBobY) * 0.30f);
 
   int x0   = constrain((MOUTH_SPR_W - w) / 2 + mgx, 0, MOUTH_SPR_W - w);
   int ymid = MOUTH_SPR_H / 2 + mgy;
-  uint16_t col = faceEyeColor();
+  uint16_t col = faceColNow;
 
   for (int i = 0; i < w; i++) {
     // t runs -1..1 across the mouth; t² is 0 at the centre and 1 at the
@@ -2801,6 +2947,7 @@ void drawFaceFrame(float open, float wScale) {
   // Eye *positions* stay fixed while scale changes: the two 92px sprites sit
   // shoulder to shoulder, so moving them would overlap and leave trails.
   int half = faceCfg.gap / 2 + faceCfg.eyeW / 2;
+  faceColNow = faceTintedColor();         // once per frame: eyes, brows, mouth agree
   drawEyeAt(160 - half, 120, open, wScale, true);
   drawEyeAt(160 + half, 120, open, wScale, false);
   if (faceCfg.mouthOn) drawMouthAt(160, MOUTH_CY);
@@ -2824,6 +2971,8 @@ void applyPose(const EyePose& p, float amp, bool withGlance = false) {
   mouthWidT = 1.0f + ((mw / 100.0f) - 1.0f) * amp;
   mouthCrvT = (p.mouthCurve / 100.0f) * amp;
   mouthOpnT = (p.mouthOpenPct / 100.0f) * amp;
+  browYT    = (p.browY / 100.0f) * amp;
+  browTiltT = (p.browTilt / 100.0f) * amp;
   if (withGlance) {
     eyeGlanceTX = p.gx * amp;
     eyeGlanceTY = p.gy * amp;
@@ -2837,7 +2986,9 @@ void applyPose(const EyePose& p, float amp, bool withGlance = false) {
 // The trailing three numbers are the mouth: width%, curve (− frown / + smile),
 // open%. They ease a little slower than the lids, so a keyframe that opens the
 // mouth and widens the eyes together still reads as one gesture.
-//                          open lidT angle lidB   w    h  gx gy  mW  mCrv mOpn
+// Two more after that are the brows: height (+ raised) and tilt (+ angry,
+// − worried). Rows that stop at the mouth keep a level brow at rest height.
+//                          open lidT angle lidB   w    h  gx gy  mW  mCrv mOpn  brY brTilt
 const EmoteKey EK_BOOT[] = {
   {   0, {   4, 90,   0,  0, 100, 100, 0, 0,  60,   0,  0 }, 0 },
   { 380, {  55, 30,   0,  0, 100, 100, 0, 0,  80,  10,  0 }, 0 },
@@ -2845,25 +2996,25 @@ const EmoteKey EK_BOOT[] = {
   { 950, { 100,  0,   0,  0, 106, 106, 0,-2, 106,  55, 15 }, 0 },
 };
 const EmoteKey EK_HAPPY[] = {
-  {   0, { 100,  0,   0, 25, 106, 106, 0,-6, 108,  70, 20 }, 0 },
-  { 220, {  70,  0,   0, 55, 100, 100, 0, 2, 112,  95, 34 }, 0 },
-  { 430, { 100,  0,   0, 25, 106, 106, 0,-5, 108,  75, 18 }, 0 },
-  { 650, {  85,  0,   0, 45, 100, 100, 0, 0, 105,  80,  8 }, 0 },
+  {   0, { 100,  0,   0, 25, 106, 106, 0,-6, 108,  70, 20,  20,   0 }, 0 },
+  { 220, {  70,  0,   0, 55, 100, 100, 0, 2, 112,  95, 34,  20,   0 }, 0 },
+  { 430, { 100,  0,   0, 25, 106, 106, 0,-5, 108,  75, 18,  20,   0 }, 0 },
+  { 650, {  85,  0,   0, 45, 100, 100, 0, 0, 105,  80,  8,  20,   0 }, 0 },
 };
 const EmoteKey EK_SAD[] = {
-  {   0, {  70, 20,  70,  0, 100,  96,-8, 4,  84, -70,  0 }, 0 },
-  { 450, {  62, 28,  80,  0, 100,  94, 8, 5,  80, -85,  0 }, 0 },
-  { 950, {  66, 24,  75,  0, 100,  95,-6, 5,  82, -78,  0 }, 0 },
+  {   0, {  70, 20,  70,  0, 100,  96,-8, 4,  84, -70,  0, -10, -70 }, 0 },
+  { 450, {  62, 28,  80,  0, 100,  94, 8, 5,  80, -85,  0, -10, -70 }, 0 },
+  { 950, {  66, 24,  75,  0, 100,  95,-6, 5,  82, -78,  0, -10, -70 }, 0 },
 };
 const EmoteKey EK_WINK[] = {
   {   0, { 100,  0,   0, 30, 100, 100, 0, 0, 104,  85, 10 }, 2 },   // right eye shut
   { 260, { 100,  0,   0, 20, 100, 100, 0, 0, 100,  55,  0 }, 0 },
 };
 const EmoteKey EK_EXCITED[] = {
-  {   0, { 100,  0, -10,  0, 108, 108,-4,-4, 100,  60, 45 }, 0 },
-  { 160, { 100,  0,   0, 15, 108, 108, 4,-4, 110,  85, 60 }, 0 },
-  { 320, { 100,  0, -10,  0, 108, 108,-4,-4, 100,  60, 45 }, 0 },
-  { 480, { 100,  0,   0, 20, 104, 104, 0,-2, 106,  75, 20 }, 0 },
+  {   0, { 100,  0, -10,  0, 108, 108,-4,-4, 100,  60, 45,  55,   0 }, 0 },
+  { 160, { 100,  0,   0, 15, 108, 108, 4,-4, 110,  85, 60,  55,   0 }, 0 },
+  { 320, { 100,  0, -10,  0, 108, 108,-4,-4, 100,  60, 45,  55,   0 }, 0 },
+  { 480, { 100,  0,   0, 20, 104, 104, 0,-2, 106,  75, 20,  30,   0 }, 0 },
 };
 const EmoteKey EK_GLANCE[] = {
   {   0, {  62,  0,   0, 10, 100, 100, 0, 0,   0,   0,  0 }, 0 },   // gx/gy from the trigger
@@ -2871,16 +3022,16 @@ const EmoteKey EK_GLANCE[] = {
 };
 // The mouth earns its keep here: a yawn without one never really read as a yawn.
 const EmoteKey EK_YAWN[] = {
-  {   0, {  90,  5,   0,  0, 100, 106, 0, 0,  90,   0, 20 }, 0 },
-  { 260, { 100,  0,   0,  0, 104, 114, 0,-3,  84, -20, 75 }, 0 },
-  { 620, {   6, 80,   0,  0,  96, 100, 0, 3,  78, -30,100 }, 0 },
-  { 980, {  85, 12,  15,  0, 100, 100, 0, 1,  92,   5, 15 }, 0 },
+  {   0, {  90,  5,   0,  0, 100, 106, 0, 0,  90,   0, 20,  10,   0 }, 0 },
+  { 260, { 100,  0,   0,  0, 104, 114, 0,-3,  84, -20, 75,  45, -20 }, 0 },
+  { 620, {   6, 80,   0,  0,  96, 100, 0, 3,  78, -30,100,  30, -10 }, 0 },
+  { 980, {  85, 12,  15,  0, 100, 100, 0, 1,  92,   5, 15,   5,   0 }, 0 },
 };
 const EmoteKey EK_SQUINT[] = {              // thoughtful squint — narrows, holds
-  {   0, {  62, 22,   0, 26, 103,  96, 0, 0,  70, -15,  0 }, 0 },
-  { 480, {  48, 32,   0, 36, 105,  92, 2, 1,  62, -25,  0 }, 0 },
-  {1050, {  56, 26,   0, 30, 104,  94,-2, 0,  66, -18,  0 }, 0 },
-  {1500, {  85,  8,   0, 10, 100, 100, 0, 0,  96,  15,  0 }, 0 },
+  {   0, {  62, 22,   0, 26, 103,  96, 0, 0,  70, -15,  0, -30,  35 }, 0 },
+  { 480, {  48, 32,   0, 36, 105,  92, 2, 1,  62, -25,  0, -30,  35 }, 0 },
+  {1050, {  56, 26,   0, 30, 104,  94,-2, 0,  66, -18,  0, -30,  35 }, 0 },
+  {1500, {  85,  8,   0, 10, 100, 100, 0, 0,  96,  15,  0,  -5,   5 }, 0 },
 };
 #define EM_DEF(tbl, dur) { tbl, sizeof(tbl)/sizeof(EmoteKey), dur }
 const Emote EM_BOOT    = EM_DEF(EK_BOOT,    1400);
@@ -2893,10 +3044,10 @@ const Emote EM_YAWN    = EM_DEF(EK_YAWN,    1300);
 const Emote EM_SQUINT  = EM_DEF(EK_SQUINT,  1900);
 // Loved a track: a big warm squint with the bottom crescent right up.
 const EmoteKey EK_LOVE[] = {
-  {   0, { 100,  0,   0, 20, 110, 110, 0,-4, 110,  70, 25 }, 0 },
-  { 200, {  55,  0,   0, 62, 104, 100, 0, 3, 118, 100, 40 }, 0 },
-  { 620, {  62,  0,   0, 55, 106, 102, 0, 2, 116,  95, 30 }, 0 },
-  { 980, {  95,  0,   0, 22, 100, 100, 0, 0, 106,  70,  8 }, 0 },
+  {   0, { 100,  0,   0, 20, 110, 110, 0,-4, 110,  70, 25,  25, -10 }, 0 },
+  { 200, {  55,  0,   0, 62, 104, 100, 0, 3, 118, 100, 40,  25, -10 }, 0 },
+  { 620, {  62,  0,   0, 55, 106, 102, 0, 2, 116,  95, 30,  25, -10 }, 0 },
+  { 980, {  95,  0,   0, 22, 100, 100, 0, 0, 106,  70,  8,  25, -10 }, 0 },
 };
 const Emote EM_LOVE = EM_DEF(EK_LOVE, 1300);
 
@@ -2941,6 +3092,10 @@ void faceEnter() {
   mouthWid = mouthWidT = 1.0f;
   mouthCrv = mouthCrvT = P.rest.mouthCurve / 100.0f;
   mouthOpn = mouthOpnT = 0.0f;
+  browY = browYT = 0; browTilt = browTiltT = 0;
+  faceBobX = faceBobY = 0;
+  fxClear(false);                         // beginDraw already wiped the screen
+  fxSleepySince = 0;
   eyeWinkMask = 0;
   faceBlinking = false; faceDblBlink = false;
   unsigned long now = millis();
@@ -2973,6 +3128,211 @@ void faceSleepClose() {
   delay(120);
 }
 
+// ── Mood map ────────────────────────────────────
+// The resting face is a point on valence × arousal, blended bilinearly from
+// nine anchor poses. Rows are arousal (low → high), columns valence
+// (negative → positive). Same 13-number format as the emote tables, so a
+// cell is tuned exactly like a keyframe.
+//                     open lidT angle lidB   w    h  gx gy  mW  mCrv mOpn  brY brTilt
+const EyePose MOOD_GRID[3][3] = {
+  { {  78, 22,  55,  0, 100,  96, 0, 3,  86, -45,  0, -10, -45 },   // melancholy
+    {  74, 38,  10,  0, 100,  96, 0, 2,  84,  -5,  0, -25,   0 },   // sleepy
+    {  88, 14,   0, 30, 100, 100, 0, 0, 100,  40,  0,  -5,   0 } }, // content
+  { {  90, 16, -40,  0, 100,  98, 0, 0,  86, -35,  0, -20,  50 },   // grumpy
+    { 100,  4,   0,  0, 100, 100, 0, 0, 100,  10,  0,   0,   0 },   // neutral
+    { 100,  0,   0, 26, 102, 102, 0, 0, 106,  55,  6,  15,   0 } }, // happy
+  { { 100,  8, -55,  0, 104, 104, 0, 0,  90, -40, 12, -15,  70 },   // tense
+    { 100,  0,   0,  0, 108, 110, 0,-2,  96,   5, 14,  45,   0 },   // alert
+    { 100,  0,   0, 18, 108, 108, 0,-2, 110,  80, 30,  35, -10 } }, // hyped
+};
+
+// Bilinear blend of the four cells around (v, a), both 0..1.
+EyePose blendPose(float v, float a) {
+  float x = constrain(v, 0.0f, 1.0f) * 2.0f, y = constrain(a, 0.0f, 1.0f) * 2.0f;
+  int c = min(1, (int)x), r = min(1, (int)y);
+  float fx = x - c, fy = y - r;
+  const EyePose &p00 = MOOD_GRID[r][c],     &p01 = MOOD_GRID[r][c + 1];
+  const EyePose &p10 = MOOD_GRID[r + 1][c], &p11 = MOOD_GRID[r + 1][c + 1];
+  float w00 = (1 - fx) * (1 - fy), w01 = fx * (1 - fy), w10 = (1 - fx) * fy, w11 = fx * fy;
+  #define BL(f) (w00 * p00.f + w01 * p01.f + w10 * p10.f + w11 * p11.f)
+  EyePose o;
+  o.openPct = (uint8_t)lroundf(BL(openPct));   o.lidTopPct = (uint8_t)lroundf(BL(lidTopPct));
+  o.lidTopAngle = (int8_t)lroundf(BL(lidTopAngle));
+  o.lidBotPct = (uint8_t)lroundf(BL(lidBotPct));
+  o.wPct = (uint8_t)lroundf(BL(wPct));         o.hPct = (uint8_t)lroundf(BL(hPct));
+  o.gx = (int8_t)lroundf(BL(gx));              o.gy = (int8_t)lroundf(BL(gy));
+  o.mouthWPct = (uint8_t)lroundf(BL(mouthWPct));
+  o.mouthCurve = (int8_t)lroundf(BL(mouthCurve));
+  o.mouthOpenPct = (uint8_t)lroundf(BL(mouthOpenPct));
+  o.browY = (int8_t)lroundf(BL(browY));        o.browTilt = (int8_t)lroundf(BL(browTilt));
+  #undef BL
+  return o;
+}
+
+// Layer a persona's character over the mood pose: its rest pose as a delta
+// from neutral, at 60 % — the persona's energy/valence bias already moved the
+// mood point, so the full delta on top would double-count it.
+EyePose personaOver(EyePose m, const EyePose& pr) {
+  const float k = 0.6f;
+  auto add = [&](int base, int d, int lo, int hi) {
+    return constrain(base + (int)lroundf(d * k), lo, hi);
+  };
+  m.openPct      = add(m.openPct,     pr.openPct - 100,    20, 100);
+  m.lidTopPct    = add(m.lidTopPct,   pr.lidTopPct,         0,  90);
+  m.lidTopAngle  = add(m.lidTopAngle, pr.lidTopAngle,    -100, 100);
+  m.lidBotPct    = add(m.lidBotPct,   pr.lidBotPct,         0,  60);
+  m.wPct         = add(m.wPct,        pr.wPct - 100,       80, 125);
+  m.hPct         = add(m.hPct,        pr.hPct - 100,       80, 125);
+  m.gy           = add(m.gy,          pr.gy,              -10,  10);
+  uint8_t pw     = pr.mouthWPct ? pr.mouthWPct : 100;
+  m.mouthWPct    = add(m.mouthWPct ? m.mouthWPct : 100, pw - 100, 60, 130);
+  m.mouthCurve   = add(m.mouthCurve,  pr.mouthCurve,     -100, 100);
+  m.browY        = add(m.browY,       pr.browY,          -100, 100);
+  m.browTilt     = add(m.browTilt,    pr.browTilt,       -100, 100);
+  return m;
+}
+
+// ── Particles (face v2) ─────────────────────────
+// A tiny pool drawn through one 24px sprite, confined to the margins beside
+// the eye sprites so nothing ever overlaps a surface another sprite repaints.
+// Moving one repaints the new square and erases only the strip it vacated.
+enum : uint8_t { FX_NONE, FX_ZZZ, FX_NOTE, FX_SWEAT, FX_HEART };
+struct FxP {
+  uint8_t kind; bool left, drawn;
+  float x, y, vx, vy;
+  unsigned long born; uint16_t lifeMs;
+  int16_t dx, dy;                         // where it is on screen now
+};
+#define FX_MAX 4
+FxP fxPool[FX_MAX];
+unsigned long fxNextZ = 0, fxNextNote = 0, fxNextSweat = 0, fxSleepySince = 0;
+uint32_t fxLastBeat = 0;
+bool fxNoteLeft = false;
+
+// Margin x-ranges for a particle's left edge, from the live eye geometry — a
+// wide gap or eyeW can squeeze them to nothing, and then nothing spawns.
+static bool fxMargins(int& lx0, int& lx1, int& rx0, int& rx1) {
+  int half = faceCfg.gap / 2 + faceCfg.eyeW / 2;
+  lx0 = 2;  lx1 = 160 - half - EYE_SPR_W / 2 - FX_SPR - 2;
+  rx0 = 160 + half + EYE_SPR_W / 2 + 2;  rx1 = 320 - FX_SPR - 2;
+  return lx1 >= lx0 && rx1 >= rx0;
+}
+
+void fxClear(bool erase) {
+  for (auto& p : fxPool) {
+    if (erase && p.kind && p.drawn) tft.fillRect(p.dx, p.dy, FX_SPR, FX_SPR, C_BG);
+    p.kind = FX_NONE; p.drawn = false;
+  }
+}
+
+static void fxSpawn(uint8_t kind, bool left, float x, float y,
+                    float vx, float vy, uint16_t lifeMs) {
+  for (auto& p : fxPool) if (!p.kind) {
+    p = FxP{ kind, left, false, x, y, vx, vy, millis(), lifeMs, 0, 0 };
+    return;
+  }                                        // pool full: skip, never evict
+}
+
+// Old square minus new square — two strips at most, since both are FX_SPR wide
+static void fxEraseExposed(int ox, int oy, int nx, int ny) {
+  if (abs(nx - ox) >= FX_SPR || abs(ny - oy) >= FX_SPR) {
+    tft.fillRect(ox, oy, FX_SPR, FX_SPR, C_BG); return;
+  }
+  if (ny > oy)      tft.fillRect(ox, oy, FX_SPR, ny - oy, C_BG);
+  else if (ny < oy) tft.fillRect(ox, ny + FX_SPR, FX_SPR, oy - ny, C_BG);
+  if (nx > ox)      tft.fillRect(ox, oy, nx - ox, FX_SPR, C_BG);
+  else if (nx < ox) tft.fillRect(nx + FX_SPR, oy, ox - nx, FX_SPR, C_BG);
+}
+
+static void fxDrawGlyph(uint8_t kind, uint16_t col) {
+  sprFx.fillSprite(C_BG);
+  switch (kind) {
+    case FX_ZZZ:
+      sprFx.setTextSize(2); sprFx.setTextColor(col, C_BG);
+      sprFx.setCursor(6, 4); sprFx.print('z');
+      break;
+    case FX_NOTE:                          // eighth note: head, stem, flag
+      sprFx.fillEllipse(8, 18, 5, 4, col);
+      sprFx.fillRect(12, 4, 2, 14, col);
+      sprFx.fillTriangle(13, 4, 20, 9, 13, 10, col);
+      break;
+    case FX_SWEAT:                         // drop: round base, pointed top
+      sprFx.fillCircle(12, 15, 5, col);
+      sprFx.fillTriangle(12, 4, 7, 14, 17, 14, col);
+      break;
+    case FX_HEART:
+      sprFx.fillCircle(8, 9, 5, col);
+      sprFx.fillCircle(16, 9, 5, col);
+      sprFx.fillTriangle(3, 11, 21, 11, 12, 21, col);
+      break;
+  }
+}
+
+void fxHearts() {
+  int lx0, lx1, rx0, rx1;
+  if (!(faceV2 & FV2_FX) || !fxMargins(lx0, lx1, rx0, rx1)) return;
+  fxSpawn(FX_HEART, true,  (lx0 + lx1) / 2, 150, -0.2f, -1.6f, 1600);
+  fxSpawn(FX_HEART, false, (rx0 + rx1) / 2, 150,  0.2f, -1.6f, 1600);
+}
+
+// Spawn rules + motion, once per face frame. beatIdx counts beats from the
+// anchor when the beat clock is live; notes then land on every second beat.
+void faceFxTick(unsigned long now, bool music, bool beatLive, uint32_t beatIdx) {
+  int lx0, lx1, rx0, rx1;
+  bool on = (faceV2 & FV2_FX) && !pairingMode && bleConnected &&
+            fxMargins(lx0, lx1, rx0, rx1);
+  if (!on) { fxClear(true); return; }
+
+  // Zzz: properly drowsy (low arousal) and left alone for a while
+  bool drowsy = faceMoodA < 0.28f && (millis() - lastActivityMs > 20000UL);
+  if (!drowsy) fxSleepySince = 0;
+  else if (!fxSleepySince) fxSleepySince = now;
+  if (fxSleepySince && now - fxSleepySince > 30000UL && now >= fxNextZ) {
+    fxNextZ = now + 2600;
+    fxSpawn(FX_ZZZ, false, rx0 + 2, 110, 0.35f, -0.9f, 3000);
+  }
+
+  if (music) {
+    bool due;
+    if (beatLive) { due = (beatIdx != fxLastBeat) && (beatIdx % 2 == 0); fxLastBeat = beatIdx; }
+    else          { due = now >= fxNextNote; }
+    if (due) {
+      fxNextNote = now + 1700;
+      fxNoteLeft = !fxNoteLeft;
+      float x = fxNoteLeft ? lx0 + (float)frnd(0, lx1 - lx0) : rx0 + (float)frnd(0, rx1 - rx0);
+      fxSpawn(FX_NOTE, fxNoteLeft, x, 170, 0, -1.4f, 2200);
+    }
+  }
+
+  if (faceMoodA > 0.72f && faceMoodV < 0.32f && now >= fxNextSweat) {
+    fxNextSweat = now + 4500;
+    fxSpawn(FX_SWEAT, false, rx0 + 2, 72, 0, 0.9f, 1300);
+  }
+
+  for (auto& p : fxPool) {
+    if (!p.kind) continue;
+    unsigned long age = now - p.born;
+    if (age >= p.lifeMs) {
+      if (p.drawn) tft.fillRect(p.dx, p.dy, FX_SPR, FX_SPR, C_BG);
+      p.kind = FX_NONE; p.drawn = false;
+      continue;
+    }
+    p.x += p.vx; p.y += p.vy;
+    float sway = (p.kind == FX_NOTE || p.kind == FX_ZZZ) ? sinf(age * 0.006f) * 3.0f : 0;
+    int nx = (int)(p.x + sway), ny = (int)p.y;
+    nx = p.left ? constrain(nx, lx0, lx1) : constrain(nx, rx0, rx1);
+    ny = constrain(ny, 0, 212 - FX_SPR);  // the now-playing strip starts at 214
+    // Fade over the last 30 % of life toward the background
+    float f = (float)age / p.lifeMs;
+    uint16_t col = (p.kind == FX_HEART) ? C_PINK : (p.kind == FX_SWEAT ? 0x9EFF : faceColNow);
+    if (f > 0.7f) col = mix565(col, C_BG, (f - 0.7f) / 0.3f);
+    if (p.drawn) fxEraseExposed(p.dx, p.dy, nx, ny);
+    fxDrawGlyph(p.kind, col);
+    sprFx.pushSprite(nx, ny);
+    p.dx = nx; p.dy = ny; p.drawn = true;
+  }
+}
+
 // Mood drifts on a minutes-long clock so the pad has a baseline temperament
 // rather than just twitching per event. Energy follows how much you type,
 // valence follows whether the link is healthy.
@@ -2991,6 +3351,9 @@ void faceMoodTick(unsigned long now) {
 void updateFace(unsigned long now) {
   if (now - faceFrameMs < 33) return;     // ~30 fps
   faceFrameMs = now;
+#if FACE_PROFILE
+  uint32_t profT0 = micros();
+#endif
   const Personality& P = PERSONAS[facePersona];
   faceMoodTick(now);
 
@@ -2999,14 +3362,20 @@ void updateFace(unsigned long now) {
   bool calm = false;
   eyeWinkMask = 0;
 
-  // ── L0: resting posture from persona + mood ──
-  // Low energy adds lid weight, low valence tips the lids into a sad angle,
-  // high valence lifts a hint of the happy crescent.
-  EyePose rest = P.rest;
-  rest.lidTopPct   = min(90, rest.lidTopPct + (int)((1.0f - moodEnergy) * 22.0f));
-  rest.lidTopAngle = constrain(rest.lidTopAngle + (int)((0.5f - moodValence) * 60.0f), -100, 100);
-  rest.lidBotPct   = min(60, rest.lidBotPct + (int)(max(0.0f, moodValence - 0.6f) * 40.0f));
-  applyPose(rest, 1.0f);
+  // ── L0: resting posture from the mood map ──
+  // The pad's own mood, with the companion's blended in by its weight while
+  // its ttl is live. The weight eases back to zero once the ttl lapses, so a
+  // dead companion fades the face home rather than freezing it on a stale
+  // opinion. Both stages are eased: host changes glide in over ~2 s.
+  bool hostLive = hostMoodTtlMs && (now - hostMoodRxMs < hostMoodTtlMs);
+  hostMix += ((hostLive ? hostMoodW : 0.0f) - hostMix) * 0.006f;
+  float tv = moodValence + hostMix * (hostMoodV - moodValence);
+  float ta = moodEnergy  + hostMix * (hostMoodA - moodEnergy);
+  faceMoodV += (tv - faceMoodV) * 0.03f;
+  faceMoodA += (ta - faceMoodA) * 0.03f;
+  applyPose(personaOver(blendPose(faceMoodV, faceMoodA), P.rest), 1.0f);
+  bool ctxFocused = hostLive && (hostMoodFlags & HMOOD_FOCUSED);
+  bool ctxLate    = hostLive && (hostMoodFlags & HMOOD_LATE);
 
   // ── L1: what the pad is actually doing right now ──
   if (pairingMode) {                      // wide + curious
@@ -3033,8 +3402,10 @@ void updateFace(unsigned long now) {
       eyeGlanceTX = (frnd(0, 1) ? 10.0f : -10.0f);
       eyeGlanceTY = (float)((int)frnd(0, 6)) - 3.0f;
       faceGlanceEnd  = now + frnd(500, 900);
-      faceNextGlance = now + frnd(personaMs(faceCfg.glanceMinS, P.glancePct),
-                                  personaMs(faceCfg.glanceMaxS, P.glancePct));
+      // Focused (IDE in front): it looks around less — it's working with you
+      uint8_t gp = ctxFocused ? (uint8_t)min(255, P.glancePct * 8 / 5) : P.glancePct;
+      faceNextGlance = now + frnd(personaMs(faceCfg.glanceMinS, gp),
+                                  personaMs(faceCfg.glanceMaxS, gp));
     }
   }
 
@@ -3051,7 +3422,7 @@ void updateFace(unsigned long now) {
     }
     unsigned long idle = millis() - lastActivityMs;
     if (idle > 60000UL && now - faceLastYawn > 120000UL &&
-        (int)frnd(0, 999) < P.yawnPct) {
+        (int)frnd(0, 999) < P.yawnPct * (ctxLate ? 3 : 1)) {
       faceLastYawn = now;
       faceEmote(&EM_YAWN);
     }
@@ -3059,7 +3430,7 @@ void updateFace(unsigned long now) {
     // needs no long idle; it's the face concentrating, not getting bored.
     if (now >= faceNextSquint) {
       faceNextSquint = now + frnd(9000, 22000);
-      if ((int)frnd(0, 99) < P.squintPct) faceEmote(&EM_SQUINT);
+      if ((int)frnd(0, 99) < P.squintPct + (ctxFocused ? 25 : 0)) faceEmote(&EM_SQUINT);
     }
   }
 
@@ -3067,7 +3438,7 @@ void updateFace(unsigned long now) {
   // Edge events set by the host-link handler; consumed here so the drawing
   // always happens on the loop task.
   if (mediaJustFaved) { mediaJustFaved = false; mediaNewSong = false;
-                        faceEmote(&EM_LOVE); }
+                        faceEmote(&EM_LOVE); fxHearts(); }
   // Only real music gets the "ooh, new track" reaction. A video or audiobook
   // changing chapter would otherwise fire this every few minutes.
   if (mediaNewSong)   { mediaNewSong = false;
@@ -3077,12 +3448,30 @@ void updateFace(unsigned long now) {
   // the branches (which rewrite the glance targets every frame) but before
   // emotes, so any emote still wins outright. Music only: bobbing along to a
   // YouTube video reads as broken rather than charming.
-  if (mediaShow && mediaIsMusic && mediaPlaying && !emoteCur
-      && (now - mediaRxMs < 30000UL)) {
+  // With a live beat clock (HCMD_BEAT) it nods on the beat — sharp attack,
+  // slow return, deeper with arousal — and sways over two beats. Without one
+  // it falls back to the slow free-running lissajous.
+  bool music = mediaShow && mediaIsMusic && mediaPlaying && (now - mediaRxMs < 30000UL);
+  bool beatLive = music && beatConf > 40 && beatPeriodMs > 0 && (now - beatRxMs < 8000UL);
+  uint32_t beatIdx = 0;
+  float bx = 0, by = 0;
+  if (beatLive) {
+    float t   = (float)(now - beatAnchorMs);
+    float ph  = fmodf(t, beatPeriodMs) / beatPeriodMs;               // 0 = on the beat
+    float ph2 = fmodf(t, beatPeriodMs * 2.0f) / (beatPeriodMs * 2.0f);
+    float nod = expf(-ph * 5.0f);
+    by = nod * (1.5f + 3.5f * faceMoodA);
+    bx = sinf(ph2 * 6.2832f) * (1.0f + 1.5f * faceMoodA);
+    beatIdx = (uint32_t)(t / beatPeriodMs);
+    if (!emoteCur) eyeScaleHT *= 1.0f - nod * 0.05f * faceMoodA;    // squash on the downbeat
+  } else if (music) {
     float ph = (float)(now % 2400) / 2400.0f * 6.2832f;
-    eyeGlanceTY += sinf(ph) * 2.0f;
-    eyeGlanceTX += sinf(ph * 0.5f) * 1.2f;
+    by = sinf(ph) * 3.0f;
+    bx = sinf(ph * 0.5f) * 2.0f;
   }
+  if (emoteCur) bx = by = 0;              // an emote owns the head outright
+  faceBobX += (bx - faceBobX) * 0.5f;
+  faceBobY += (by - faceBobY) * 0.5f;
 
   // ── L3: transient emote overrides everything above ──
   if (!emoteCur && emotePending && now < emotePendingUntil) {
@@ -3107,7 +3496,11 @@ void updateFace(unsigned long now) {
       const EmoteKey* k = &emoteCur->keys[0];
       for (uint8_t n = 0; n < emoteCur->n; n++)
         if (t >= emoteCur->keys[n].tMs) k = &emoteCur->keys[n];
+      float keepBY = browYT, keepBT = browTiltT;
       applyPose(k->pose, P.emotePct / 100.0f, true);
+      // GLANCE fires on every keypress; letting it level the brows would make
+      // them twitch to neutral while typing. It keeps the mood's brows.
+      if (emoteCur == &EM_GLANCE) { browYT = keepBY; browTiltT = keepBT; }
       eyeGlanceTX += emoteGx; eyeGlanceTY += emoteGy;
       eyeWinkMask = k->winkMask;
       allowBlink = false;                 // the emote owns the lids
@@ -3159,7 +3552,20 @@ void updateFace(unsigned long now) {
   mouthWid   += (mouthWidT - mouthWid) * 0.26f;
   mouthCrv   += (mouthCrvT - mouthCrv) * 0.26f;
   mouthOpn   += (mouthOpnT - mouthOpn) * 0.26f;
+  browY      += (browYT    - browY)    * 0.26f;
+  browTilt   += (browTiltT - browTilt) * 0.26f;
   drawFaceFrame(eyeOpen, wScale);
+  faceFxTick(now, music, beatLive, beatIdx);
+
+#if FACE_PROFILE
+  static uint32_t worstUs = 0; static unsigned long lastRep = 0;
+  worstUs = max(worstUs, (uint32_t)(micros() - profT0));
+  if (now - lastRep > 5000) {
+    Serial.printf("[face] worst frame %lu us  mood v=%.2f a=%.2f host=%.2f\n",
+                  (unsigned long)worstUs, faceMoodV, faceMoodA, hostMix);
+    worstUs = 0; lastRep = now;
+  }
+#endif
 }
 
 // ── GIF playback (faceStyle == 1) ───────────────
@@ -3457,6 +3863,7 @@ void handleGetConfig() {
   f["style"] = (faceStyle == 0) ? "eyes" : "gif";
   f["gif"]   = faceGif;
   f["personality"] = personaName(facePersona);
+  f["v2"] = faceV2;   // FV2_* bits: 1 brows, 2 pupils, 4 mood tint, 8 particles
   JsonObject e = f["eyes"].to<JsonObject>();
   e["color"] = faceCfg.color;   e["eyeW"] = faceCfg.eyeW;
   e["eyeH"] = faceCfg.eyeH;     e["gap"] = faceCfg.gap;
@@ -3509,6 +3916,10 @@ void handlePostConfig() {
       if (p >= 0) facePersona = p;       // unknown names leave it alone
     } else if (f["personality"].is<int>())
       facePersona = constrain((int)f["personality"], 0, NUM_PERSONAS - 1);
+    if (f["v2"].is<int>()) {
+      faceV2 = (uint8_t)((int)f["v2"] & 0x0F);
+      prefs.putUChar("fv2", faceV2);
+    }
     JsonObjectConst e = f["eyes"];
     if (!e.isNull()) {
       if (e["color"].is<int>())        faceCfg.color = e["color"];
@@ -3869,6 +4280,11 @@ void setup() {
   sprCell.setColorDepth(16); sprCell.createSprite(CELL_W, CELL_H);
   sprEye.setColorDepth(16);  sprEye.createSprite(EYE_SPR_W, EYE_SPR_H);
   sprMouth.setColorDepth(16); sprMouth.createSprite(MOUTH_SPR_W, MOUTH_SPR_H);
+  sprFx.setColorDepth(16);    sprFx.createSprite(FX_SPR, FX_SPR);
+  // Face v2 budget check — the eye sprite grew by 2.5 KB and sprFx is 1.1 KB
+  Serial.printf("[face] heap free %u, largest block %u\n",
+                (unsigned)ESP.getFreeHeap(),
+                (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_8BIT));
   gifDec.begin(GIF_PALETTE_RGB565_BE);
 
   // ── NimBLE init ──────────────────────────────
