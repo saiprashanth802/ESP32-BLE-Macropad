@@ -578,7 +578,7 @@ volatile uint16_t bleConnHandle = 0;
 #define HOSTLINK_CMD_UUID "6d616372-6f70-6164-0000-000000000003"
 
 enum : uint8_t {  // device → host
-  HEV_HELLO  = 0x01,   // [fwMajor][keys][presets][activePreset][faceMode][persona]
+  HEV_HELLO  = 0x01,   // [fwMajor][keys][presets][activePreset][faceMode][persona][faceV2]
   HEV_KEY    = 0x02,   // [preset][keyIdx] — a KA_HOST key was tapped
   HEV_PRESET = 0x03,   // [preset] — active preset changed (either side)
   HEV_ACTIONS= 0x04,   // [page][totalPages][count] + count × [id lo][id hi][label 9]
@@ -620,6 +620,10 @@ enum : uint8_t {  // host → device
   HCMD_BEAT   = 0x8E,  // [bpm×10 lo][hi][ms since last beat lo][hi][confidence 0-100]
                        // Tempo + phase only — the pad keeps time itself. Sent on
                        // drift, never per beat: BLE jitter exceeds the accuracy.
+  HCMD_FACEV2 = 0x8F,  // [value][mask][persist] — face v2 bits: faceV2 = (faceV2 & ~mask)
+                       // | (value & mask). The mask lets the tray flip one look
+                       // bit without clobbering the others. persist=1 writes NVS
+                       // "fv2" (a user's choice, sent once per click, not per connect).
 };
 
 NimBLECharacteristic* pEvtChar = nullptr;
@@ -2111,8 +2115,9 @@ void hostNotifyActions(uint8_t page) {
 void hostLinkTick() {
   if (hostHelloPending) {
     hostHelloPending = false;
-    uint8_t ev[8] = { HEV_HELLO, 6, 5 /*fw major*/, NUM_KEYS, NUM_PRESETS,
-                      (uint8_t)activePreset, faceMode, facePersona };
+    // faceV2 appended last: a companion that reads 6 bytes never notices it
+    uint8_t ev[9] = { HEV_HELLO, 7, 5 /*fw major*/, NUM_KEYS, NUM_PRESETS,
+                      (uint8_t)activePreset, faceMode, facePersona, faceV2 };
     hostNotify(ev, sizeof(ev));
   }
   while (hostCmdTail != hostCmdHead) {
@@ -2249,6 +2254,15 @@ void hostLinkTick() {
           hostMoodTtlMs = (unsigned long)p[3] * 1000UL;
           hostMoodFlags = (n >= 5) ? p[4] : 0;
           hostMoodRxMs  = millis();
+        }
+        break;
+
+      case HCMD_FACEV2:                    // [value][mask][persist]
+        // The look switches on the next face frame: drawFaceFrame() resizes
+        // the sprites and clears the old geometry itself.
+        if (n >= 2) {
+          faceV2 = ((faceV2 & ~p[1]) | (p[0] & p[1])) & FV2_MASK;
+          if (n >= 3 && p[2]) prefs.putUChar("fv2", faceV2);
         }
         break;
 

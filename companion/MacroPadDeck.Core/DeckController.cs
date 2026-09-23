@@ -52,6 +52,23 @@ public sealed class DeckController : IDisposable
 
     public int ActivePreset => _activePreset;
 
+    /// The pad's face v2 bits as its last hello reported them, or -1 when the
+    /// firmware predates face v2 (or no hello yet).
+    public int PadFaceV2 { get; private set; } = -1;
+
+    /// Switch between the bot and classic look. Persisted on the pad, so it
+    /// holds with the companion closed and on the other OS's slot too.
+    public async Task<bool> SetBotFace(bool bot)
+    {
+        if (!_ble.IsUp) return false;
+        bool ok = await _ble.Write(Protocol.SetFaceV2(bot ? Protocol.FaceV2Bot : (byte)0,
+                                                      Protocol.FaceV2Bot, persist: true));
+        if (ok && PadFaceV2 >= 0)
+            PadFaceV2 = bot ? PadFaceV2 | Protocol.FaceV2Bot : PadFaceV2 & ~Protocol.FaceV2Bot;
+        Diag.Log($"face: style {(bot ? "bot" : "classic")} write={ok}");
+        return ok;
+    }
+
     void OnPadEvent(byte op, byte[] p)
     {
         switch (op)
@@ -62,6 +79,8 @@ public sealed class DeckController : IDisposable
                 // the face fields let the rewrite menu put back exactly what
                 // was there rather than guessing a default.
                 if (p.Length >= 6) _write?.NoteFace(p[4], p[5]);
+                // [faceV2] arrived with face v2 firmware; older pads send 6 bytes
+                PadFaceV2 = p.Length >= 7 ? p[6] : -1;
                 StatusChanged?.Invoke($"Pad online (fw v{p[0]}, preset {p[3]})");
                 _ = Push(async () =>
                 {

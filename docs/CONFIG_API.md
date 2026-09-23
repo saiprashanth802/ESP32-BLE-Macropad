@@ -217,7 +217,7 @@ Wire format both ways: `[opcode:1][len:1][payload:len]`.
 
 | Op | Name | Payload |
 |----|------|---------|
-| `0x01` | hello  | `[fwMajor][keys][presets][activePreset][faceMode][persona]` — sent on subscribe |
+| `0x01` | hello  | `[fwMajor][keys][presets][activePreset][faceMode][persona][faceV2]` — sent on subscribe; `faceV2` (face v2 firmware and later) is the `face.v2` bitmask |
 | `0x02` | key    | `[preset][keyIdx]` — a `host` key was tapped |
 | `0x03` | preset | `[preset]` — active preset changed (either side) |
 | `0x04` | actions | `[page][totalPages][count]` + `count` × `[id lo][id hi][label 9, null-padded]` — one page of `ACTION_LIB`, in reply to `0x8C` |
@@ -234,6 +234,7 @@ Wire format both ways: `[opcode:1][len:1][payload:len]`.
 | `0x8C` | getActions | `[page]` | Ask for one page of the builtin action library; answered with event `0x04` |
 | `0x8D` | setMood   | `[valence i8 ±100][arousal i8 ±100][weight 0-100][ttl s][flags]` | Face v2: the companion's mood opinion. The pad blends toward it by `weight` over its own mood (typing rate, link health) and eases back to autonomous when `ttl` lapses; weight 0 releases at once. Flags: bit0 late-night (more yawns), bit1 focused (fewer glances, more squints). RAM only |
 | `0x8E` | setBeat   | `[bpm×10 lo][hi][ms since last beat lo][hi][confidence 0-100]` | Face v2: tempo + phase for the pad's own beat clock (nod on the beat, sway over two). Sent on drift, never per beat. bpm outside 40-240 or no update for 8 s → back to the free-running bob |
+| `0x8F` | setFaceV2 | `[value][mask][persist]` | Face v2 bits under a mask: `faceV2 = (faceV2 & ~mask) | (value & mask)`. The tray's Face style menu sends `[0x10 or 0][0x10][1]` to flip bot/classic without touching the other bits. `persist=1` writes NVS `fv2` |
 
 ### Builtin actions over the host link
 

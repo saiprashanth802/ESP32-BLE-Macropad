@@ -30,7 +30,18 @@ public static class Protocol
     public const byte CmdMood    = 0x8D;
     public const byte CmdBeat    = 0x8E;
 
+    public const byte CmdFaceV2  = 0x8F;
+
     public const byte MoodLate = 0x01, MoodFocused = 0x02;
+
+    /// Face v2 bit for the "bot" look (round LED eyes, D mouth). Off = classic.
+    public const byte FaceV2Bot = 0x10;
+
+    /// Set face v2 bits under a mask — [value][mask][persist] — so one look bit
+    /// flips without touching the others. persist writes the pad's NVS: this is
+    /// the user's choice, sent once per click rather than re-pushed per connect.
+    public static byte[] SetFaceV2(byte value, byte mask, bool persist) =>
+        new byte[] { CmdFaceV2, 3, value, mask, (byte)(persist ? 1 : 0) };
 
     /// The companion's opinion of the face's mood. Valence/arousal -100..100,
     /// weight 0-100 is how far the pad leans toward it over its own mood, and

@@ -127,6 +127,28 @@ sealed class TrayContext : ApplicationContext
         menu.Items.Add(moodItem);
         menu.Items.Add("Edit moods.json", null, (_, _) =>
             Process.Start(new ProcessStartInfo(MoodStore.FilePath) { UseShellExecute = true }));
+
+        // Face look. The ticks follow what the pad reported in its hello; before
+        // any hello (or on pre-v2 firmware) neither is ticked.
+        var faceMenu = new ToolStripMenuItem("Face style");
+        var botItem = new ToolStripMenuItem("Bot (LED)");
+        var classicItem = new ToolStripMenuItem("Classic");
+        async Task PickFace(bool bot)
+        {
+            deck.RaiseStatus(await deck.SetBotFace(bot)
+                ? $"Face: {(bot ? "bot" : "classic")}"
+                : "Face: pad not connected");
+        }
+        botItem.Click += async (_, _) => await PickFace(true);
+        classicItem.Click += async (_, _) => await PickFace(false);
+        faceMenu.DropDownItems.AddRange(new ToolStripItem[] { botItem, classicItem });
+        faceMenu.DropDownOpening += (_, _) =>
+        {
+            int v = deck.PadFaceV2;
+            botItem.Checked = v >= 0 && (v & Protocol.FaceV2Bot) != 0;
+            classicItem.Checked = v >= 0 && (v & Protocol.FaceV2Bot) == 0;
+        };
+        menu.Items.Add(faceMenu);
         menu.Items.Add("Open editor", null, (_, _) => EditorWindow.Open(deck));
         menu.Items.Add("Edit profiles.json", null, (_, _) =>
             Process.Start(new ProcessStartInfo(ProfileStore.FilePath) { UseShellExecute = true }));
