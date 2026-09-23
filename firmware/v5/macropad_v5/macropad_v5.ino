@@ -216,9 +216,12 @@ const EyePose POSE_NEUTRAL = { 100, 0, 0, 0, 100, 100, 0, 0, 100, 0, 0, 0, 0 };
 #define FV2_BROWS  0x01   // brows above each eye
 #define FV2_PUPILS 0x02   // darker pupil + glint inside each eye
 #define FV2_TINT   0x04   // eye colour leans warm/cool with mood (≤15 %)
-#define FV2_FX     0x08   // particles in the side margins (Zzz, notes, sweat, hearts)
+#define FV2_FX     0x08   // particles in the side margins (Zzz, notes, sweat)
+#define FV2_BOT    0x10   // "bot" look: round LED eyes, D mouth, dot-matrix texture
+                          // (brows/pupils are classic-only and ignored here)
+#define FV2_MASK   0x1F
 #define FACE_PROFILE 0    // 1 = log worst updateFace time + mood every 5 s (Serial)
-uint8_t faceV2 = FV2_BROWS | FV2_PUPILS | FV2_TINT | FV2_FX;
+uint8_t faceV2 = FV2_BROWS | FV2_PUPILS | FV2_TINT | FV2_FX | FV2_BOT;
 
 // A keyframe holds a pose from tMs until the next frame's tMs.
 // winkMask: bit0 = left eye closed, bit1 = right eye closed.
@@ -1385,7 +1388,7 @@ void loadState() {
   // Persona is its own key, so an old "fcfg" blob still loads unchanged
   facePersona = min((uint8_t)(NUM_PERSONAS - 1), (uint8_t)prefs.getUChar("fpers", 0));
   mediaShow   = prefs.getUChar("media", 1) ? 1 : 0;
-  faceV2      = prefs.getUChar("fv2", faceV2) & 0x0F;
+  faceV2      = prefs.getUChar("fv2", faceV2) & FV2_MASK;
   // Off by default: a pad with no puck should never bring up the WiFi stack
   puckEnabled = prefs.getBool("puck", false);
   puckSpeed   = constrain((int)prefs.getUChar("pspd", PUCK_SPEED_DEF),
@@ -2946,11 +2949,208 @@ void drawMouthAt(int cx, int cy) {
   sprMouth.pushSprite(cx - MOUTH_SPR_W / 2, cy - MOUTH_SPR_H / 2);
 }
 
+// ── "Bot" look (FV2_BOT) ────────────────────────
+// Round LED eyes, a D-shaped mouth and a dot-matrix texture: every third row
+// and column knocked back to the background, on the *screen's* lattice so the
+// eyes and mouth share one grid. Its own geometry, not faceCfg's — a stored
+// "fcfg" blob still carries the classic sizes and would fight this layout.
+// Eyes sit below the puck label (y 34..50); the mouth sits above the
+// now-playing strip (y 214).
+#define BOT_EYE_W     56
+#define BOT_EYE_H     58
+#define BOT_EYE_DX    76          // centres at 160 ± 76
+#define BOT_EYE_CY    92
+#define BOT_ESPR_W   100          // eye sprite: rows 52..135 on screen
+#define BOT_ESPR_H    84
+#define BOT_ESPR_CY   40          // eye centre row inside the sprite
+#define BOT_MOUTH_W  160          // mouth sprite: rows 138..201
+#define BOT_MOUTH_H   64
+#define BOT_MOUTH_CY 170
+#define BOT_MOUTH_REST 96         // mouth width at rest (px)
+#define BOT_THIN       7          // closed-mouth stroke
+#define BOT_CURVE_PX  10
+#define BOT_OPEN_PX   40
+#define DOT_PITCH      3          // 2×2 dots, 1px gaps
+#define BOT_GLOW       3          // halo width (px)
+
+bool faceBotSprites = false;      // which geometry sprEye/sprMouth are sized for
+
+// Resize the two face sprites for the active look. Delete-then-create keeps
+// the peak heap near one set (bot 37 KB vs classic 31 KB). If the bigger set
+// cannot be allocated, fall back to classic rather than draw into nothing.
+void ensureFaceSprites(bool bot) {
+  if (bot == faceBotSprites && sprEye.created() && sprMouth.created()) return;
+  sprEye.deleteSprite(); sprMouth.deleteSprite();
+  bool ok = bot && sprEye.createSprite(BOT_ESPR_W, BOT_ESPR_H) &&
+                   sprMouth.createSprite(BOT_MOUTH_W, BOT_MOUTH_H);
+  if (!ok) {
+    if (bot) Serial.println("[face] bot sprites failed to allocate — classic look");
+    sprEye.deleteSprite(); sprMouth.deleteSprite();
+    sprEye.createSprite(EYE_SPR_W, EYE_SPR_H);
+    sprMouth.createSprite(MOUTH_SPR_W, MOUTH_SPR_H);
+    if (bot) faceV2 &= ~FV2_BOT;          // RAM only: the next boot tries again
+    bot = false;
+  }
+  faceBotSprites = bot;
+  // Old geometry may still be on screen when this runs mid-face
+  if (currentScreen == SCR_FACE) tft.fillRect(0, 51, 320, 163, C_BG);
+}
+
+static inline bool faceBot() { return (faceV2 & FV2_BOT) && faceBotSprites; }
+
+static void dotGrid(TFT_eSprite& s, int W, int H, int sx0, int sy0) {
+  for (int y = 0; y < H; y++)
+    if ((sy0 + y) % DOT_PITCH == DOT_PITCH - 1) s.drawFastHLine(0, y, W, C_BG);
+  for (int x = 0; x < W; x++)
+    if ((sx0 + x) % DOT_PITCH == DOT_PITCH - 1) s.drawFastVLine(x, 0, H, C_BG);
+}
+
+// Same lid language as the classic eye (flat top lid, mirrored wedge, happy
+// crescent), cutting the halo as well so a squint reads as one shape.
+void drawBotEyeAt(int cx, int cy, float open, float wScale, bool isLeft) {
+  const int W = BOT_ESPR_W, H = BOT_ESPR_H;
+  sprEye.fillSprite(C_BG);
+  if (eyeWinkMask & (isLeft ? 1 : 2)) open = 0.04f;
+  int w = min((int)lroundf(BOT_EYE_W * wScale * eyeScaleW), W - 2 * BOT_GLOW - 4);
+  int h = min(max(4, (int)lroundf(BOT_EYE_H * open * eyeScaleH)), H - 2 * BOT_GLOW - 4);
+  int x = (int)lroundf(W / 2 + eyeGlanceX + faceBobX - w / 2.0f);
+  int y = (int)lroundf(BOT_ESPR_CY + eyeGlanceY + faceBobY - h / 2.0f);
+  x = constrain(x, BOT_GLOW + 2, W - w - BOT_GLOW - 2);
+  y = constrain(y, BOT_GLOW + 2, H - h - BOT_GLOW - 2);
+  int r = min(w, h) / 2;
+  uint16_t col = faceColNow, glow = mix565(col, C_BG, 0.72f);
+  sprEye.fillRoundRect(x - BOT_GLOW, y - BOT_GLOW, w + 2 * BOT_GLOW, h + 2 * BOT_GLOW, r + BOT_GLOW, glow);
+  sprEye.fillRoundRect(x, y, w, h, r, col);
+
+  int flat = (int)(lidTop * h);
+  if (flat > 0) sprEye.fillRect(x - BOT_GLOW, y - BOT_GLOW, w + 2 * BOT_GLOW, flat + BOT_GLOW, C_BG);
+  if (lidAngle > 0.02f || lidAngle < -0.02f) {
+    int wedge = (int)(fabsf(lidAngle) * h * 0.55f);
+    int top = y + flat - BOT_GLOW, L = x - BOT_GLOW, R = x + w + BOT_GLOW;
+    bool deepOuter = (lidAngle > 0);
+    bool deepLeft  = isLeft ? deepOuter : !deepOuter;
+    if (deepLeft) sprEye.fillTriangle(L, top, R, top, L, top + wedge + BOT_GLOW, C_BG);
+    else          sprEye.fillTriangle(L, top, R, top, R, top + wedge + BOT_GLOW, C_BG);
+  }
+  if (lidBot > 0.02f) {
+    int rad = w + BOT_GLOW;
+    sprEye.fillCircle(x + w / 2, y + h + rad - (int)(lidBot * h * 0.62f), rad, C_BG);
+  }
+  int sx0 = cx - W / 2, sy0 = cy - BOT_ESPR_CY;
+  dotGrid(sprEye, W, H, sx0, sy0);
+  sprEye.pushSprite(sx0, sy0);
+}
+
+// D mouth. A smile opens downward into a grin whose top lip flattens as it
+// opens (the reference D); a frown stays a line or opens upward; an open
+// neutral mouth goes round. A smile opens itself a little — at rest this
+// look is a grin, not the classic's thin line.
+void drawBotMouth() {
+  const int W = BOT_MOUTH_W, H = BOT_MOUTH_H;
+  sprMouth.fillSprite(C_BG);
+  int w = constrain((int)lroundf(BOT_MOUTH_REST * mouthWid), 10, W - 2 * BOT_GLOW - 4);
+  float open  = constrain(mouthOpn + max(0.0f, mouthCrv) * 0.55f, 0.0f, 1.0f);
+  float openH = open * BOT_OPEN_PX;
+  float df    = (1.0f + constrain(mouthCrv * 2.5f, -1.0f, 1.0f)) / 2.0f;   // share opening downward
+  int   x0    = (int)lroundf(W / 2 - w / 2.0f + (eyeGlanceX + faceBobX) * 0.5f);
+  float ymid  = H / 2 + (eyeGlanceY + faceBobY) * 0.3f - openH * (df - 0.5f);
+  uint16_t col = faceColNow, glow = mix565(col, C_BG, 0.72f);
+
+  // Two passes over the same column profile: halo (grown by BOT_GLOW, and
+  // extended past both ends), then the mouth itself.
+  for (int pass = 0; pass < 2; pass++) {
+    int grow = pass ? 0 : BOT_GLOW;
+    uint16_t c = pass ? col : glow;
+    for (int k = -grow; k < w + grow; k++) {
+      int i = constrain(k, 0, w - 1);
+      float t  = (w > 1) ? ((float)i / (w - 1)) * 2.0f - 1.0f : 0.0f;
+      float at = fabsf(t);
+      float e  = sqrtf(max(0.0f, 1.0f - at * at * at));           // fuller than an ellipse
+      float taper = sqrtf(max(0.35f, 1.0f - powf(at, 8)));          // soften the stroke ends
+      float dy    = -mouthCrv * BOT_CURVE_PX * t * t;
+      float dyTop = dy * (1.0f - 0.8f * open * df);
+      float th    = BOT_THIN * taper;
+      int top = (int)lroundf(ymid + dyTop - th / 2 - openH * e * (1.0f - df)) - grow;
+      int bot = (int)lroundf(ymid + dy + th / 2 + openH * e * df) + grow;
+      top = constrain(top, 2, H - 3); bot = constrain(bot, 2, H - 2);
+      if (bot > top) sprMouth.drawFastVLine(x0 + k, top, bot - top, c);
+    }
+  }
+  int sx0 = 160 - W / 2, sy0 = BOT_MOUTH_CY - H / 2;
+  dotGrid(sprMouth, W, H, sx0, sy0);
+  sprMouth.pushSprite(sx0, sy0);
+}
+
+// ── Favourite heart ─────────────────────────────
+// The whole face becomes one LED-matrix heart: pops in, beats twice
+// (lub-dub, lub-dub), shrinks away, then the happy LOVE squint plays. The box
+// has no sprite of its own; it is rendered in tiles through sprEye (whatever
+// size the active look gave it) with windowed pushes, so no extra RAM.
+#define HEART_X   80
+#define HEART_Y   54
+#define HEART_W  160
+#define HEART_H  144
+#define HEART_CY 126
+#define HEART_PX  56              // px per heart unit at scale 1
+#define HEART_MS 2400
+#define C_HEART  0xF9CB           // #FF3B5C
+unsigned long heartStartMs = 0;
+
+static inline float heartF(float x, float y) {   // ≤ 0 inside the classic heart curve
+  float a = x * x + y * y - 1.0f;
+  return a * a * a - x * x * y * y * y;
+}
+
+static float heartScale(unsigned long t) {
+  float s;
+  if (t < 220) { float u = t / 220.0f; s = 1.08f * (1.0f - (1 - u) * (1 - u) * (1 - u)); }
+  else s = (t < 350) ? 1.08f - 0.08f * (t - 220) / 130.0f : 1.0f;
+  const uint16_t beats[] = { 600, 820, 1300, 1520 };
+  for (uint16_t b : beats) if (t >= b) s += 0.12f * expf(-(float)(t - b) / 90.0f);
+  if (t > 2150) s *= max(0.0f, 1.0f - (t - 2150) / 250.0f);
+  return s;
+}
+
+void heartBegin(unsigned long now) {
+  heartStartMs = now ? now : 1;
+  fxClear(false);
+  tft.fillRect(0, 51, 320, 163, C_BG);    // below the puck label, above the media strip
+}
+
+void heartDraw(float s) {
+  const int tw = sprEye.width(), th = sprEye.height();
+  const float S = HEART_PX * max(s, 0.01f);
+  uint16_t glow = mix565(C_HEART, C_BG, 0.72f);
+  for (int ty = HEART_Y; ty < HEART_Y + HEART_H; ty += th)
+    for (int tx = HEART_X; tx < HEART_X + HEART_W; tx += tw) {
+      int ww = min(tw, HEART_X + HEART_W - tx), hh = min(th, HEART_Y + HEART_H - ty);
+      sprEye.fillSprite(C_BG);
+      if (s > 0.01f)
+        for (int y = (ty + DOT_PITCH - 1) / DOT_PITCH * DOT_PITCH; y < ty + hh; y += DOT_PITCH)
+          for (int x = (tx + DOT_PITCH - 1) / DOT_PITCH * DOT_PITCH; x < tx + ww; x += DOT_PITCH) {
+            float hx = (x + 1 - 160) / S, hy = -(y + 1 - HEART_CY) / S + 0.12f;
+            uint16_t c;
+            if (heartF(hx, hy) <= 0)                  c = C_HEART;
+            else if (heartF(hx / 1.08f, hy / 1.08f) <= 0) c = glow;
+            else continue;
+            sprEye.fillRect(x - tx, y - ty, DOT_PITCH - 1, DOT_PITCH - 1, c);
+          }
+      sprEye.pushSprite(tx, ty, 0, 0, ww, hh);
+    }
+}
+
 void drawFaceFrame(float open, float wScale) {
+  ensureFaceSprites(faceV2 & FV2_BOT);
+  faceColNow = faceTintedColor();         // once per frame: eyes, brows, mouth agree
+  if (faceBot()) {
+    drawBotEyeAt(160 - BOT_EYE_DX, BOT_EYE_CY, open, wScale, true);
+    drawBotEyeAt(160 + BOT_EYE_DX, BOT_EYE_CY, open, wScale, false);
+    if (faceCfg.mouthOn) drawBotMouth();
+    return;
+  }
   // Eye *positions* stay fixed while scale changes: the two 92px sprites sit
   // shoulder to shoulder, so moving them would overlap and leave trails.
   int half = faceCfg.gap / 2 + faceCfg.eyeW / 2;
-  faceColNow = faceTintedColor();         // once per frame: eyes, brows, mouth agree
   drawEyeAt(160 - half, 120, open, wScale, true);
   drawEyeAt(160 + half, 120, open, wScale, false);
   if (faceCfg.mouthOn) drawMouthAt(160, MOUTH_CY);
@@ -3085,6 +3285,8 @@ void faceSlotGlance(int slot) {           // called from switchToSlot
 void faceEnter() {
   const Personality& P = PERSONAS[facePersona];
   beginDraw(SCR_FACE);
+  ensureFaceSprites(faceV2 & FV2_BOT);
+  heartStartMs = 0;                       // beginDraw wiped any heart in progress
   puckLabelReset();                       // beginDraw may have wiped the label
   eyeOpen = 0.0f; eyeOpenTarget = 1.0f;   // eyes open on arrival
   eyeGlanceX = eyeGlanceY = eyeGlanceTX = eyeGlanceTY = 0;
@@ -3199,7 +3401,7 @@ EyePose personaOver(EyePose m, const EyePose& pr) {
 // A tiny pool drawn through one 24px sprite, confined to the margins beside
 // the eye sprites so nothing ever overlaps a surface another sprite repaints.
 // Moving one repaints the new square and erases only the strip it vacated.
-enum : uint8_t { FX_NONE, FX_ZZZ, FX_NOTE, FX_SWEAT, FX_HEART };
+enum : uint8_t { FX_NONE, FX_ZZZ, FX_NOTE, FX_SWEAT };
 struct FxP {
   uint8_t kind; bool left, drawn;
   float x, y, vx, vy;
@@ -3215,9 +3417,11 @@ bool fxNoteLeft = false;
 // Margin x-ranges for a particle's left edge, from the live eye geometry — a
 // wide gap or eyeW can squeeze them to nothing, and then nothing spawns.
 static bool fxMargins(int& lx0, int& lx1, int& rx0, int& rx1) {
-  int half = faceCfg.gap / 2 + faceCfg.eyeW / 2;
-  lx0 = 2;  lx1 = 160 - half - EYE_SPR_W / 2 - FX_SPR - 2;
-  rx0 = 160 + half + EYE_SPR_W / 2 + 2;  rx1 = 320 - FX_SPR - 2;
+  bool bot = faceBot();
+  int half = bot ? BOT_EYE_DX : faceCfg.gap / 2 + faceCfg.eyeW / 2;
+  int sprHalf = (bot ? BOT_ESPR_W : EYE_SPR_W) / 2;
+  lx0 = 2;  lx1 = 160 - half - sprHalf - FX_SPR - 2;
+  rx0 = 160 + half + sprHalf + 2;  rx1 = 320 - FX_SPR - 2;
   return lx1 >= lx0 && rx1 >= rx0;
 }
 
@@ -3263,19 +3467,7 @@ static void fxDrawGlyph(uint8_t kind, uint16_t col) {
       sprFx.fillCircle(12, 15, 5, col);
       sprFx.fillTriangle(12, 4, 7, 14, 17, 14, col);
       break;
-    case FX_HEART:
-      sprFx.fillCircle(8, 9, 5, col);
-      sprFx.fillCircle(16, 9, 5, col);
-      sprFx.fillTriangle(3, 11, 21, 11, 12, 21, col);
-      break;
   }
-}
-
-void fxHearts() {
-  int lx0, lx1, rx0, rx1;
-  if (!(faceV2 & FV2_FX) || !fxMargins(lx0, lx1, rx0, rx1)) return;
-  fxSpawn(FX_HEART, true,  (lx0 + lx1) / 2, 150, -0.2f, -1.6f, 1600);
-  fxSpawn(FX_HEART, false, (rx0 + rx1) / 2, 150,  0.2f, -1.6f, 1600);
 }
 
 // Spawn rules + motion, once per face frame. beatIdx counts beats from the
@@ -3327,13 +3519,28 @@ void faceFxTick(unsigned long now, bool music, bool beatLive, uint32_t beatIdx) 
     ny = constrain(ny, 0, 212 - FX_SPR);  // the now-playing strip starts at 214
     // Fade over the last 30 % of life toward the background
     float f = (float)age / p.lifeMs;
-    uint16_t col = (p.kind == FX_HEART) ? C_PINK : (p.kind == FX_SWEAT ? 0x9EFF : faceColNow);
+    uint16_t col = (p.kind == FX_SWEAT) ? 0x9EFF : faceColNow;
     if (f > 0.7f) col = mix565(col, C_BG, (f - 0.7f) / 0.3f);
     if (p.drawn) fxEraseExposed(p.dx, p.dy, nx, ny);
     fxDrawGlyph(p.kind, col);
     sprFx.pushSprite(nx, ny);
     p.dx = nx; p.dy = ny; p.drawn = true;
   }
+}
+
+// True while the heart owns the face. On the last frame it wipes its box and
+// hands over to the LOVE squint.
+bool heartTick(unsigned long now) {
+  if (!heartStartMs) return false;
+  unsigned long t = now - heartStartMs;
+  if (t >= HEART_MS) {
+    heartStartMs = 0;
+    tft.fillRect(HEART_X, HEART_Y, HEART_W, HEART_H, C_BG);
+    faceEmote(&EM_LOVE);
+    return false;
+  }
+  heartDraw(heartScale(t));
+  return true;
 }
 
 // Mood drifts on a minutes-long clock so the pad has a baseline temperament
@@ -3359,6 +3566,11 @@ void updateFace(unsigned long now) {
 #endif
   const Personality& P = PERSONAS[facePersona];
   faceMoodTick(now);
+
+  // Favourited: the heart takes the whole face, then hands over to the LOVE
+  // squint. Checked before anything else draws so no half-frame of face shows.
+  if (mediaJustFaved) { mediaJustFaved = false; mediaNewSong = false; heartBegin(now); }
+  if (heartTick(now)) return;
 
   float wScale = 1.0f;
   bool allowBlink = true;
@@ -3440,8 +3652,6 @@ void updateFace(unsigned long now) {
   // ── Music reactions ──────────────────────────
   // Edge events set by the host-link handler; consumed here so the drawing
   // always happens on the loop task.
-  if (mediaJustFaved) { mediaJustFaved = false; mediaNewSong = false;
-                        faceEmote(&EM_LOVE); fxHearts(); }
   // Only real music gets the "ooh, new track" reaction. A video or audiobook
   // changing chapter would otherwise fire this every few minutes.
   if (mediaNewSong)   { mediaNewSong = false;
@@ -3866,7 +4076,7 @@ void handleGetConfig() {
   f["style"] = (faceStyle == 0) ? "eyes" : "gif";
   f["gif"]   = faceGif;
   f["personality"] = personaName(facePersona);
-  f["v2"] = faceV2;   // FV2_* bits: 1 brows, 2 pupils, 4 mood tint, 8 particles
+  f["v2"] = faceV2;   // FV2_* bits: 1 brows, 2 pupils, 4 mood tint, 8 particles, 16 bot look
   JsonObject e = f["eyes"].to<JsonObject>();
   e["color"] = faceCfg.color;   e["eyeW"] = faceCfg.eyeW;
   e["eyeH"] = faceCfg.eyeH;     e["gap"] = faceCfg.gap;
@@ -3920,7 +4130,7 @@ void handlePostConfig() {
     } else if (f["personality"].is<int>())
       facePersona = constrain((int)f["personality"], 0, NUM_PERSONAS - 1);
     if (f["v2"].is<int>()) {
-      faceV2 = (uint8_t)((int)f["v2"] & 0x0F);
+      faceV2 = (uint8_t)((int)f["v2"] & FV2_MASK);
       prefs.putUChar("fv2", faceV2);
     }
     JsonObjectConst e = f["eyes"];

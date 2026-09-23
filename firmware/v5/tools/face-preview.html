@@ -19,14 +19,14 @@
   .row label { margin:0; gap:6px; color:var(--text); }
   select { background:var(--bg); color:var(--text); border:1px solid var(--line); border-radius:6px; padding:4px; }
   .grid { display:grid; grid-template-columns:repeat(3, 1fr); gap:8px; }
-  .grid figure { margin:0; } .grid canvas { width:100%; height:auto; cursor:pointer; }
+  .grid figure { margin:0; } .grid canvas { width:100%; height:auto; cursor:pointer; image-rendering:auto; }
   figcaption { color:var(--muted); font-size:12px; text-align:center; margin-top:2px; }
   .controls { width:320px; max-width:100%; }
 </style>
 </head>
 <body>
 <h1>Face v2 preview</h1>
-<p class="sub">A port of the firmware's face renderer (<code>blendPose</code>, <code>personaOver</code>,
+<p class="sub">A port of the firmware's face renderer (<code>blendPose</code>, <code>personaOver</code>, the <em>bot</em> LED look, the favourite heart,
 <code>drawEyeAt</code>, <code>drawMouthAt</code>, brows, pupils, tint), drawn at the pad's 320×240. Shows the
 <em>resting</em> pose for a mood point — no blinks, glances or emotes. Keep <code>MOOD_GRID</code> here and in
 <code>macropad_v5.ino</code> identical.</p>
@@ -35,6 +35,11 @@
   <div class="card controls">
     <label>Valence <span id="vOut"></span></label><input id="v" type="range" min="0" max="100" value="50">
     <label>Arousal <span id="aOut"></span></label><input id="a" type="range" min="0" max="100" value="50">
+    <label>Face style</label>
+    <select id="style"><option value="bot">bot (LED, new)</option><option value="classic">classic</option></select>
+    <label>Eye colour <span id="cOut"></span></label>
+    <input id="color" type="color" value="#ddf4ff">
+    <div class="row"><button id="fav" type="button">&#9829; favourite</button></div>
     <label>Persona</label>
     <select id="persona"><option>CALM</option><option>PLAYFUL</option><option>GRUMPY</option><option>SLEEPY</option><option value="-1">none</option></select>
     <div class="row">
@@ -98,6 +103,13 @@ function render(ctx, v, a, personaKey, flags){
   let col = CFG.color;
   if (flags.tint){ const t=(v-0.5)*2; if(t>0.05) col=mix565(col,TINT_WARM,t*0.15); else if(t<-0.05) col=mix565(col,TINT_COOL,-t*0.15); }
   ctx.fillStyle=rgb(C_BG); ctx.fillRect(0,0,320,240);
+  if (flags.heartT != null) { heart(ctx, heartScale(flags.heartT)); return; }
+  if (flags.style==='bot') {
+    botEye(ctx, 160-BOT_EYE_DX, BOT_EYE_CY, true, S, col);
+    botEye(ctx, 160+BOT_EYE_DX, BOT_EYE_CY, false, S, col);
+    botMouth(ctx, S, col);
+    return;
+  }
   const half = CFG.gap/2 + CFG.eyeW/2;
   eye(ctx, 160-half, 120, true, S, col, flags, a);
   eye(ctx, 160+half, 120, false, S, col, flags, a);
@@ -170,14 +182,114 @@ function mouth(g, S, col){
     const y=clamp(ymid+dy-Math.trunc(h/2),0,MOUTH_SPR_H-h); g.fillRect(ox+x0+i,oy+y,1,h); }
 }
 
+// ── "bot" style: round LED eyes, D mouth, dot-matrix texture ──
+const BOT_EYE_W=56, BOT_EYE_H=58, BOT_EYE_DX=76, BOT_EYE_CY=92, BOT_ESPR_W=100, BOT_ESPR_H=84;
+const BOT_MOUTH_W=160, BOT_MOUTH_H=64, BOT_MOUTH_CY=170, BOT_MOUTH_REST=96, BOT_THIN=7,
+      BOT_CURVE_PX=10, BOT_OPEN_PX=40, DOT=3, GLOW=3;
+const HEART_X=80, HEART_Y=54, HEART_W=160, HEART_H=144, HEART_CY=126, HEART_PX=56, C_HEART=0xF9CB;
+
+// Knock every third row and column of the sprite back to the background, on
+// the *screen's* grid so the eyes and mouth share one dot lattice.
+function dotGrid(ctx, W, H, sx0, sy0){
+  if(!DOTS_ON) return;
+  ctx.fillStyle=rgb(C_BG);
+  for(let y=0;y<H;y++) if(((sy0+y)%DOT+DOT)%DOT===DOT-1) ctx.fillRect(0,y,W,1);
+  for(let x=0;x<W;x++) if(((sx0+x)%DOT+DOT)%DOT===DOT-1) ctx.fillRect(x,0,1,H);
+}
+function botEye(g, cx, cy, isLeft, S, col){
+  const c=document.createElement('canvas'); c.width=BOT_ESPR_W; c.height=BOT_ESPR_H; const ctx=c.getContext('2d');
+  ctx.fillStyle=rgb(C_BG); ctx.fillRect(0,0,BOT_ESPR_W,BOT_ESPR_H);
+  let w=Math.min(Math.round(BOT_EYE_W*S.sw), BOT_ESPR_W-2*GLOW-4);
+  let h=Math.min(Math.max(4,Math.round(BOT_EYE_H*S.open*S.sh)), BOT_ESPR_H-2*GLOW-4);
+  let x=Math.round(BOT_ESPR_W/2+S.gx-w/2), y=Math.round(40+S.gy-h/2);
+  x=clamp(x,GLOW+2,BOT_ESPR_W-w-GLOW-2); y=clamp(y,GLOW+2,BOT_ESPR_H-h-GLOW-2);
+  const r=Math.min(w,h)>>1, glow=mix565(col,C_BG,0.72);
+  rr(ctx,x-GLOW,y-GLOW,w+2*GLOW,h+2*GLOW,r+GLOW,glow);
+  rr(ctx,x,y,w,h,r,col);
+  // Same lid language as the classic face, cutting the halo too
+  const flat=Math.trunc(S.lidTop*h);
+  if(flat>0){ ctx.fillStyle=rgb(C_BG); ctx.fillRect(x-GLOW,y-GLOW,w+2*GLOW,flat+GLOW); }
+  if(Math.abs(S.lidAngle)>0.02){
+    const wedge=Math.trunc(Math.abs(S.lidAngle)*h*0.55), top=y+flat-GLOW, deepOuter=S.lidAngle>0, deepLeft=isLeft?deepOuter:!deepOuter;
+    const L=x-GLOW, R=x+w+GLOW;
+    if(deepLeft) tri(ctx,[L,top,R,top,L,top+wedge+GLOW],C_BG); else tri(ctx,[L,top,R,top,R,top+wedge+GLOW],C_BG);
+  }
+  if(S.lidBot>0.02){ const rad=w+GLOW, cyc=y+h+rad-Math.trunc(S.lidBot*h*0.62); circ(ctx,x+w/2,cyc,rad,C_BG); }
+  dotGrid(ctx,BOT_ESPR_W,BOT_ESPR_H,cx-BOT_ESPR_W/2,cy-40);
+  g.drawImage(c,cx-BOT_ESPR_W/2,cy-40);
+}
+// D mouth: a smile opens downward into a grin, a frown stays a line or opens
+// upward, a neutral mouth that opens goes round (surprise).
+function botMouth(g, S, col){
+  const W=BOT_MOUTH_W, H=BOT_MOUTH_H, c=document.createElement('canvas'); c.width=W; c.height=H; const ctx=c.getContext('2d');
+  ctx.fillStyle=rgb(C_BG); ctx.fillRect(0,0,W,H);
+  const w=clamp(Math.round(BOT_MOUTH_REST*S.mWid),10,W-2*GLOW-4);
+  const open=clamp(S.mOpn+Math.max(0,S.mCrv)*0.55,0,1), openH=open*BOT_OPEN_PX;
+  const df=(1+clamp(S.mCrv*2.5,-1,1))/2;
+  const x0=Math.round(W/2-w/2+S.gx*0.5), ymid=H/2+S.gy*0.3-openH*(df-0.5);
+  const cols=[];
+  for(let i=0;i<w;i++){
+    const t=w>1?(i/(w-1))*2-1:0, at=Math.abs(t);
+    const e=Math.sqrt(Math.max(0,1-at*at*at)), taper=Math.sqrt(Math.max(0.35,1-Math.pow(at,8)));
+    const dy=-S.mCrv*BOT_CURVE_PX*t*t, th=BOT_THIN*taper;
+    // The grin's top lip flattens as it opens downward — the reference D has a
+    // near-straight top edge; only a closed smile keeps the full curve on top.
+    const dyTop=dy*(1-0.8*open*df);
+    cols.push([x0+i, ymid+dyTop-th/2-openH*e*(1-df), ymid+dy+th/2+openH*e*df]);
+  }
+  const glow=mix565(col,C_BG,0.72);
+  for(const [pass,grow,cc] of [[0,GLOW,glow],[1,0,col]]){
+    ctx.fillStyle=rgb(cc);
+    for(let k=-grow;k<cols.length+grow;k++){
+      const [xx,t,b]=cols[clamp(k,0,cols.length-1)], X=xx+(k<0?k:k>=cols.length?k-cols.length+1:0);
+      const top=clamp(Math.round(t-grow),2,H-3), bot=clamp(Math.round(b+grow),2,H-2);
+      if(bot>top) ctx.fillRect(X,top,1,bot-top);
+    }
+  }
+  dotGrid(ctx,W,H,160-W/2,BOT_MOUTH_CY-H/2);
+  g.drawImage(c,160-W/2,BOT_MOUTH_CY-H/2);
+}
+// Heart: the classic implicit curve, sampled once per LED dot.
+function heartF(x,y){ const a=x*x+y*y-1; return a*a*a-x*x*y*y*y; }
+function heart(g, s){
+  if(s<=0.01) return;
+  const S=HEART_PX*s, glow=mix565(C_HEART,C_BG,0.72);
+  for(let y=Math.ceil(HEART_Y/DOT)*DOT; y<HEART_Y+HEART_H; y+=DOT)
+    for(let x=Math.ceil(HEART_X/DOT)*DOT; x<HEART_X+HEART_W; x+=DOT){
+      const hx=(x+1-160)/S, hy=-(y+1-HEART_CY)/S+0.12;
+      let c=null;
+      if(heartF(hx,hy)<=0) c=C_HEART; else if(heartF(hx/1.08,hy/1.08)<=0) c=glow;
+      if(c!==null){ g.fillStyle=rgb(c); g.fillRect(x,y,DOT-1,DOT-1); }
+    }
+}
+// Pop in with overshoot, lub-dub twice, shrink away. ms since favourite.
+const HEART_MS=2400;
+function heartScale(t){
+  if(t<220) { const u=t/220; return 1.08*(1-Math.pow(1-u,3)); }
+  let s = t<350 ? 1.08-0.08*(t-220)/130 : 1.0;
+  for(const b of [600,820,1300,1520]) if(t>=b) s+=0.12*Math.exp(-(t-b)/90);
+  if(t>2150) s*=Math.max(0,1-(t-2150)/250);
+  return s;
+}
+
 const $=id=>document.getElementById(id);
-const flags=()=>({brows:$('brows').checked,pupils:$('pupils').checked,tint:$('tint').checked,browStyle:$('browStyle').value});
+let heartStart=null, DOTS_ON=true;
+const flags=()=>({brows:$('brows').checked,pupils:$('pupils').checked,tint:$('tint').checked,browStyle:$('browStyle').value,style:$('style').value});
+function hexTo565(h){ const n=parseInt(h.slice(1),16); return (((n>>16)>>3)<<11)|((((n>>8)&255)>>2)<<5)|((n&255)>>3); }
 function draw(){
+  CFG.color=hexTo565($('color').value); $('cOut').textContent=$('color').value;
   const v=$('v').value/100, a=$('a').value/100, p=$('persona').value;
   $('vOut').textContent=v.toFixed(2); $('aOut').textContent=a.toFixed(2);
-  render($('main').getContext('2d'), v, a, p, flags());
-  document.querySelectorAll('#grid canvas').forEach(c=>render(c.getContext('2d'),+c.dataset.v,+c.dataset.a,p,flags()));
+  const f=flags();
+  const t = heartStart===null ? null : performance.now()-heartStart;
+  render($('main').getContext('2d'), v, a, p, {...f, heartT: t!==null && t<HEART_MS ? t : null});
+  // thumbnails skip the dot lattice: a 3 px pitch shrunk ~2x is pure moire
+  DOTS_ON=false;
+  document.querySelectorAll('#grid canvas').forEach(c=>render(c.getContext('2d'),+c.dataset.v,+c.dataset.a,p,f));
+  DOTS_ON=true;
 }
+function tick(){ draw(); if(heartStart!==null && performance.now()-heartStart<HEART_MS) requestAnimationFrame(tick); else heartStart=null; }
+$('fav').onclick=()=>{ heartStart=performance.now(); tick(); };
 for(let r=2;r>=0;r--) for(let c=0;c<3;c++){
   const f=document.createElement('figure'), cv=document.createElement('canvas');
   cv.width=320; cv.height=240; cv.dataset.v=c/2; cv.dataset.a=r/2;
@@ -185,7 +297,7 @@ for(let r=2;r>=0;r--) for(let c=0;c<3;c++){
   const cap=document.createElement('figcaption'); cap.textContent=`${NAMES[r][c]}  (v ${c/2}, a ${r/2})`;
   f.append(cv,cap); $('grid').append(f);
 }
-['v','a','persona','brows','pupils','tint','browStyle'].forEach(id=>$(id).addEventListener('input',draw));
+['v','a','persona','brows','pupils','tint','browStyle','style','color'].forEach(id=>$(id).addEventListener('input',draw));
 draw();
 </script>
 </body>
