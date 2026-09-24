@@ -3178,6 +3178,10 @@ static float eyeSDF(float x, float y, const void* vctx) {
   x -= c.cx; y -= c.cy;
   float h = max(e.h, 1.5f);
   float d = sdRoundBox(x, y, e.w, h, e.r);
+  // Everything below except the heart only ever grows d (lid and crescent
+  // cuts are max(), the ring is the identity for d > 0), so a pixel already
+  // beyond the glow is done. Skips most of each eye's box for one sqrt.
+  if (e.heart <= 0.001f && d >= F_GLOW) return d;
   if (e.heart > 0.001f) {
     float s = max(e.w, h) * 1.9f;
     float dh = sdHeart(x / s, (h * 0.92f - y) / s - 0.02f) * s;
@@ -3291,8 +3295,11 @@ void faceRender(float blink) {
                    { &fCur.R, F_PIV_X + F_EYE_SEP + fCur.R.dx, F_EYE_Y + fCur.R.dy, -1, blink } };
   for (int i = 0; i < 2; i++) {
     const EyeP& e = *ec[i].e;
-    float r = max(e.w, e.h) * 1.25f + F_GLOW + 4;
-    fFeature(i, ec[i].cx - r, ec[i].cy - r, ec[i].cx + r, ec[i].cy + r, eyeSDF, &ec[i]);
+    // Box per axis: the shape never leaves w × h (cuts only remove), except
+    // the heart, which spills ~1.15 × max(w, h) either way.
+    float rx = e.w * 1.05f + F_GLOW + 3, ry = max(e.h, 1.5f) * 1.05f + F_GLOW + 3;
+    if (e.heart > 0.001f) rx = ry = max(e.w, e.h) * 1.3f + F_GLOW + 4;
+    fFeature(i, ec[i].cx - rx, ec[i].cy - ry, ec[i].cx + rx, ec[i].cy + ry, eyeSDF, &ec[i]);
   }
   if (faceCfg.mouthOn) {
     const MouthP& m = fCur.m;
@@ -3672,16 +3679,26 @@ void updateFace(unsigned long now) {
 
   faceColNow = faceTintedColor();
   if (faceColNow != facePalFor) faceBuildPalette(faceColNow);
+#if FACE_PROFILE
+  uint32_t profT1 = micros();
+#endif
   faceRender(blink);
+#if FACE_PROFILE
+  uint32_t profT2 = micros();
+#endif
   faceFlush();
 
 #if FACE_PROFILE
-  static uint32_t worstUs = 0; static unsigned long lastRep = 0;
-  worstUs = max(worstUs, (uint32_t)(micros() - profT0));
+  static uint32_t worstUs = 0, worstRender = 0, worstPush = 0; static unsigned long lastRep = 0;
+  uint32_t profT3 = micros();
+  worstUs = max(worstUs, profT3 - profT0);
+  worstRender = max(worstRender, profT2 - profT1);
+  worstPush = max(worstPush, profT3 - profT2);
   if (now - lastRep > 5000) {
-    Serial.printf("[face] worst frame %lu us  mood v=%.2f a=%.2f host=%.2f\n",
-                  (unsigned long)worstUs, faceMoodV, faceMoodA, hostMix);
-    worstUs = 0; lastRep = now;
+    Serial.printf("[face] worst frame %lu us (render %lu, push %lu)  mood v=%.2f a=%.2f host=%.2f heap %u\n",
+                  (unsigned long)worstUs, (unsigned long)worstRender, (unsigned long)worstPush,
+                  faceMoodV, faceMoodA, hostMix, (unsigned)ESP.getFreeHeap());
+    worstUs = worstRender = worstPush = 0; lastRep = now;
   }
 #endif
 }
