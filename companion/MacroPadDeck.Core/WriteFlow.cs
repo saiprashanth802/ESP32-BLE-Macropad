@@ -265,9 +265,16 @@ public sealed class WriteFlow : IDisposable
             return false;
         }
 
-        if (!await _llm.IsUp())
+        // Start Ollama rather than refuse: with a 5 min keepAlive the model is
+        // usually unloaded, and after a reboot or a manual quit the server may be
+        // gone too. The autoLoad path in RunGeneration then shows LOADING MODEL.
+        if (!await _llm.EnsureUp(async () =>
+            {
+                Status?.Invoke("Write: starting Ollama");
+                await Say("STARTING LLM");
+            }))
         {
-            Log("aborting — model server did not answer");
+            Log("aborting — model server did not answer and could not be started");
             Status?.Invoke("Write: Ollama is not running");
             await Say("LLM OFFLINE");
             _capture.Abandon();

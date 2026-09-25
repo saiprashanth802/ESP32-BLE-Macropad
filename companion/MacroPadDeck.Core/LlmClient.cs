@@ -73,6 +73,93 @@ public sealed class LlmClient : IDisposable
         return false;
     }
 
+    /// IsUp(), but if a *local* server isn't answering, start it and wait for it
+    /// (up to ~30 s — a cold start measured 10.7 s on 2026-09-26). onStarting
+    /// fires once, just before the launch, so the caller can put "starting" on
+    /// the pad. A remote endpoint is never started, only reported.
+    ///
+    /// The server inherits this process's environment. The tray app starts at
+    /// login, so it has the User-scope OLLAMA_CONTEXT_LENGTH etc.; an app launched
+    /// from a shell that predates those variables would start Ollama at 4096.
+    ///
+    /// Probes with QuickUp, not IsUp: against a *stopped* local server IsUp's two
+    /// generous attempts took 8.3 s to say no (measured 2026-09-26; Windows is slow
+    /// to refuse a closed loopback port), which was half the whole cold start.
+    /// Launching when the server is merely slow is harmless — the Ollama tray app
+    /// is single-instance, and the poll below then just waits for it.
+    public async Task<bool> EnsureUp(Func<Task>? onStarting = null)
+    {
+        if (await QuickUp()) return true;
+        if (!IsLocalEndpoint())
+        {
+            if (await IsUp()) return true;   // remote: give it the generous check, never start it
+            Log($"{Base} is not local — not starting it");
+            return false;
+        }
+        if (onStarting is not null) await onStarting();
+        if (!StartServer()) return false;
+
+        var deadline = DateTime.UtcNow + TimeSpan.FromSeconds(30);
+        while (DateTime.UtcNow < deadline)
+        {
+            await Task.Delay(1000);
+            if (await QuickUp()) { Log("server started"); return true; }
+        }
+        Log("server did not answer within 30 s of starting");
+        return false;
+    }
+
+    bool IsLocalEndpoint()
+    {
+        if (!Uri.TryCreate(Base, UriKind.Absolute, out var u)) return false;
+        return u.IsLoopback || u.Host.Equals("localhost", StringComparison.OrdinalIgnoreCase);
+    }
+
+    /// One short probe for the start-up poll; IsUp()'s generous retry would make
+    /// each poll step take up to 12 s against a half-started server.
+    async Task<bool> QuickUp()
+    {
+        try
+        {
+            using var cts = new CancellationTokenSource(TimeSpan.FromMilliseconds(1500));
+            return (await _http.GetAsync($"{Base}/api/tags", cts.Token)).IsSuccessStatusCode;
+        }
+        catch { return false; }
+    }
+
+    /// Windows: the tray app ("ollama app.exe"), which runs `ollama serve` itself
+    /// and is what the installer autostarts. Elsewhere: `ollama serve` from PATH.
+    static bool StartServer()
+    {
+        try
+        {
+            if (OperatingSystem.IsWindows())
+            {
+                string exe = Path.Combine(
+                    Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
+                    "Programs", "Ollama", "ollama app.exe");
+                if (!File.Exists(exe)) { Log($"cannot start: {exe} not found"); return false; }
+                System.Diagnostics.Process.Start(new System.Diagnostics.ProcessStartInfo(exe)
+                {
+                    UseShellExecute = true,
+                    WindowStyle = System.Diagnostics.ProcessWindowStyle.Hidden,
+                });
+            }
+            else
+            {
+                System.Diagnostics.Process.Start(new System.Diagnostics.ProcessStartInfo("ollama", "serve")
+                {
+                    UseShellExecute = false,
+                    RedirectStandardOutput = false,
+                    RedirectStandardError = false,
+                });
+            }
+            Log("starting server");
+            return true;
+        }
+        catch (Exception ex) { Log($"cannot start server: {ex.Message}"); return false; }
+    }
+
     /// Ollama serves its hosted models through the same local endpoint, marked
     /// by a "-cloud" tag. They occupy no VRAM here and never appear in /api/ps.
     public static bool IsCloud(string model) =>
