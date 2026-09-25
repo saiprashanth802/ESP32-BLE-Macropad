@@ -27,6 +27,99 @@ public static class Protocol
     public const byte CmdMedia  = 0x8A;
     public const byte CmdVolume  = 0x8B;
     public const byte CmdActions = 0x8C;
+    public const byte CmdMood    = 0x8D;
+    public const byte CmdBeat    = 0x8E;
+
+    public const byte CmdConfig  = 0x90;
+    public const byte CmdEmote    = 0x91;
+    public const byte CmdEmoteMap = 0x92;
+    public const byte CmdDance    = 0x93;
+
+    /// Hello byte 6 bit: the pad runs face v3 and understands 0x91-0x93.
+    public const byte FaceCapsV3 = 0x80;
+
+    /// Emote ids, in firmware order (EX_* in macropad_v5.ino). Index = wire id.
+    public static readonly string[] Emotes =
+    {
+        "neutral", "happy", "joy", "love", "surprised", "angry", "sad",
+        "tired", "sleepy", "focused", "wink", "skeptical", "vibing", "dizzy",
+    };
+    /// Map entry meaning "pick a flair emote at random" (EMOTE_RANDOM).
+    public const string EmoteRandom = "random";
+
+    /// Pad-side triggers, in firmware order (TRG_*). The pad fires these itself,
+    /// so they keep working with the companion closed.
+    public static readonly string[] PadTriggers =
+    {
+        "boot", "connect", "disconnect", "typing", "idle", "wake",
+        "preset", "slot", "track", "favourite", "paused", "flair",
+    };
+
+    public static int EmoteId(string name) =>
+        name.Equals(EmoteRandom, StringComparison.OrdinalIgnoreCase) ? 0xFF
+        : Array.FindIndex(Emotes, e => e.Equals(name, StringComparison.OrdinalIgnoreCase));
+
+    /// Play an emote now. intensity scales its motion; holdDs is ×100 ms, 0 = default.
+    public static byte[] PlayEmote(int id, int intensity = 100, int holdDs = 0) =>
+        new byte[] { CmdEmote, 3, (byte)id, (byte)Math.Clamp(intensity, 0, 100),
+                     (byte)Math.Clamp(holdDs, 0, 255) };
+
+    /// The pad-side trigger table as writes of ≤ 6 entries (the pad's queue
+    /// caps a payload at 26 bytes). Only the last chunk carries persist, so
+    /// NVS is written once with the whole table.
+    public static IEnumerable<byte[]> SetEmoteMap(
+        IReadOnlyList<(int trigger, int emote, int chance, int cooldownS)> map, bool persist)
+    {
+        for (int at = 0; at < map.Count; at += 6)
+        {
+            var chunk = map.Skip(at).Take(6).ToList();
+            bool last = at + 6 >= map.Count;
+            var b = new List<byte> { CmdEmoteMap, (byte)(2 + chunk.Count * 4),
+                                     (byte)(persist && last ? 1 : 0), (byte)chunk.Count };
+            foreach (var (t, e, c, cd) in chunk)
+                b.AddRange(new[] { (byte)t, (byte)e, (byte)Math.Clamp(c, 0, 100),
+                                   (byte)Math.Clamp(cd, 0, 255) });
+            yield return b.ToArray();
+        }
+    }
+
+    /// Dance level 0-100 (0 off, ~30 bob only, 100 full party) and how many
+    /// bars between flair chances (0 = never).
+    public static byte[] SetDance(int level, int flairBars, bool persist) =>
+        new byte[] { CmdDance, 3, (byte)Math.Clamp(level, 0, 100),
+                     (byte)Math.Clamp(flairBars, 0, 64), (byte)(persist ? 1 : 0) };
+
+    /// Put the pad into WiFi config mode (BLE drops, MacroPad-Setup hotspot
+    /// comes up) so an OTA can run unattended. 'C','F' are a guard: a stray
+    /// write can't knock the pad off Bluetooth. Ignored by pre-0x90 firmware.
+    public static byte[] EnterConfigMode() => new byte[] { CmdConfig, 2, (byte)'C', (byte)'F' };
+
+    public const byte MoodLate = 0x01, MoodFocused = 0x02;
+
+    /// The companion's opinion of the face's mood. Valence/arousal -100..100,
+    /// weight 0-100 is how far the pad leans toward it over its own mood, and
+    /// ttl is how long the opinion stays valid — when it lapses the pad fades
+    /// back to autonomous, so a dead companion never freezes the face.
+    /// Weight 0 releases the face immediately. Firmware without face v2
+    /// ignores the opcode.
+    public static byte[] SetMood(int valence, int arousal, int weight, int ttlSeconds, byte flags) =>
+        new byte[] { CmdMood, 5,
+                     (byte)(sbyte)Math.Clamp(valence, -100, 100),
+                     (byte)(sbyte)Math.Clamp(arousal, -100, 100),
+                     (byte)Math.Clamp(weight, 0, 100),
+                     (byte)Math.Clamp(ttlSeconds, 0, 255), flags };
+
+    /// Tempo + phase for the pad's own beat clock: [bpm×10][ms since last beat][confidence].
+    /// Sent on drift, never per beat — BLE write jitter (30-60 ms) is larger than
+    /// the accuracy a per-beat push would need. bpm 0 means "no beat".
+    public static byte[] SetBeat(double bpm, int msSinceBeat, int confidence)
+    {
+        ushort b10 = (ushort)Math.Clamp((int)Math.Round(bpm * 10), 0, 2400);
+        ushort ms = (ushort)Math.Clamp(msSinceBeat, 0, ushort.MaxValue);
+        return new byte[] { CmdBeat, 5, (byte)(b10 & 0xFF), (byte)(b10 >> 8),
+                            (byte)(ms & 0xFF), (byte)(ms >> 8),
+                            (byte)Math.Clamp(confidence, 0, 100) };
+    }
 
     /// Ask the pad for one page of its builtin action library.
     /// The list is deliberately not duplicated in C# — it lives in the

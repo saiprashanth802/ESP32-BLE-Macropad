@@ -175,7 +175,8 @@ bar and elapsed/total time, streamed from the host by the companion app.*
 - 3 host slots, each remembers one bonded device (NVS persisted across power cycles)
 - Hold **FN (K9) 1s** → tap **K1/K2/K3** to jump between paired devices
 - Hold the slot key 1.5s instead to (re-)pair that slot with a new device
-- Switching re-advertises **accept-list filtered** to the slot's bonded host, so only the selected device reconnects; a wrong bonded host that connects anyway is rejected in software
+- **Each slot advertises its own static-random BLE address**, so every host stores an independent bond. This is what makes the slots real: with one shared identity, two OSes dual-booting the same machine present the *same* controller MAC, collapse onto one slot, and each re-pair overwrites the other's link key — the endless forget-and-re-pair loop
+- Switching re-advertises **open** (no accept-list — whitelist filtering breaks reconnection from resolvable private addresses); a bonded host that belongs to a different slot is rejected in software
 - Status bar shows the three slots like Easy-Switch LEDs (green = connected, amber = waiting, magenta = pairing)
 - Firmware: `firmware/v5/macropad_v5.ino` (NimBLE 2.x API, single file)
 

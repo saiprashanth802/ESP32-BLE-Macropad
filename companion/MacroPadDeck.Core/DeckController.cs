@@ -52,6 +52,20 @@ public sealed class DeckController : IDisposable
 
     public int ActivePreset => _activePreset;
 
+    /// Face emotes + dance (the editor's Face view talks to the pad through it).
+    public EmoteDirector? Face { get; private set; }
+    public void AttachFace(EmoteDirector f) => Face = f;
+
+    /// Ask the pad to drop into WiFi config mode for an OTA. The link goes down
+    /// right after, so a successful write is the only confirmation there is.
+    public async Task<bool> RequestConfigMode()
+    {
+        if (!_ble.IsUp) return false;
+        bool ok = await _ble.Write(Protocol.EnterConfigMode());
+        Diag.Log($"config: requested config mode write={ok}");
+        return ok;
+    }
+
     void OnPadEvent(byte op, byte[] p)
     {
         switch (op)
@@ -62,6 +76,9 @@ public sealed class DeckController : IDisposable
                 // the face fields let the rewrite menu put back exactly what
                 // was there rather than guessing a default.
                 if (p.Length >= 6) _write?.NoteFace(p[4], p[5]);
+                // Byte 6 = face caps (0x80 = face v3); 6-byte hellos predate it
+                Diag.Log($"hello: fw v{p[0]} bytes={p.Length} preset={p[3]}"
+                       + (p.Length >= 7 ? $" faceCaps=0x{p[6]:X2}" : ""));
                 StatusChanged?.Invoke($"Pad online (fw v{p[0]}, preset {p[3]})");
                 _ = Push(async () =>
                 {

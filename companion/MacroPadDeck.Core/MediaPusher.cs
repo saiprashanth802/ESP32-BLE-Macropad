@@ -22,6 +22,10 @@ public sealed class MediaPusher : IDisposable, ICurrentTrack
     public string CurrentTitle => _currentTitle;
     public volatile bool Enabled = true;
 
+    /// A real music track is playing right now (not video, not paused) — the
+    /// mood engine only reads genre/BPM/beat into the face while this holds.
+    public volatile bool PlayingMusic;
+
     // The Feishin link is shared: a now-playing fallback here, and the control
     // channel for favoriting in DeckController. Owned by the front-end.
     // Passed as a delegate rather than a config snapshot so profiles.json
@@ -89,6 +93,7 @@ public sealed class MediaPusher : IDisposable, ICurrentTrack
         _lastPush = DateTime.UtcNow;
         _currentTitle = t.Title;
         bool music = _isMusic(t.SourceId);
+        PlayingMusic = music && t.Playing;
         bool ok = await _ble.Write(Protocol.SetMedia(t.Playing, t.PosSeconds, t.DurSeconds,
                                                      t.Title, fav, music));
         Log($"push '{t.Title}' {t.PosSeconds}/{t.DurSeconds}s playing={t.Playing} fav={fav} "
@@ -116,6 +121,7 @@ public sealed class MediaPusher : IDisposable, ICurrentTrack
         _lastPush = DateTime.UtcNow;
         _currentTitle = title;
         // Feishin is a music player by definition — no classification needed.
+        PlayingMusic = playing;
         bool w = await _ble.Write(Protocol.SetMedia(playing, pos, dur, title, fav, true));
         Log($"feishin push '{title}' {pos}/{dur}s playing={playing} fav={fav} write={w}");
         return true;
@@ -123,6 +129,7 @@ public sealed class MediaPusher : IDisposable, ICurrentTrack
 
     async Task SendClear()
     {
+        PlayingMusic = false;
         if (_lastSig.Length == 0) return;
         _lastSig = "";
         await _ble.Write(Protocol.SetMedia(false, 0, 0, ""));

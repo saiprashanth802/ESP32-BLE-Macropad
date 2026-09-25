@@ -1,6 +1,7 @@
 using System.IO;
 using Windows.Devices.Bluetooth;
 using Windows.Devices.Bluetooth.GenericAttributeProfile;
+using Windows.Devices.Enumeration;
 using Windows.Storage.Streams;
 
 namespace MacroPadDeck;
@@ -9,9 +10,17 @@ namespace MacroPadDeck;
 /// subscription and writes; raises plain .NET events for everyone else.
 /// Disconnects are normal life (sleep, Easy-Switch, out of range) — this
 /// class quietly re-acquires on a timer rather than treating them as errors.
+///
+/// The pad gives each Easy-Switch slot its OWN BLE address (so each host keeps
+/// a clean, independent bond), so a hardcoded address breaks the moment the
+/// active slot changes. We therefore DISCOVER the pad among paired devices by
+/// name on every acquire; the configured address, if any, is only a fallback
+/// pin. See [[macropad-per-slot-address]] in the handoff notes.
 public sealed class BleLink : IBleLink
 {
-    readonly ulong _address;
+    // Matches the pad's DEVICE_NAME / Windows FriendlyName ("ESP32 MacroPad").
+    const string PadNameFragment = "MacroPad";
+    readonly ulong _hint;   // optional pinned address from config; 0 = pure auto-discovery
     readonly System.Threading.Timer _retry;
     BluetoothLEDevice? _dev;
     GattDeviceService? _svc;
@@ -33,9 +42,9 @@ public sealed class BleLink : IBleLink
         catch { }
     }
 
-    public BleLink(ulong address)
+    public BleLink(ulong hintAddress = 0)
     {
-        _address = address;
+        _hint = hintAddress;
         _retry = new System.Threading.Timer(async _ => await TryAcquire(), null,
                                             TimeSpan.Zero, TimeSpan.FromSeconds(10));
     }
@@ -47,8 +56,8 @@ public sealed class BleLink : IBleLink
         try
         {
             Drop();
-            _dev = await BluetoothLEDevice.FromBluetoothAddressAsync(_address);
-            if (_dev is null) { Log("acquire: device null"); return; }
+            _dev = await ResolveDevice();
+            if (_dev is null) { Log("acquire: no paired MacroPad"); return; }
             _dev.ConnectionStatusChanged += OnConnChanged;
 
             // Full enumeration, not GetGattServicesForUuidAsync — the filtered
@@ -95,6 +104,54 @@ public sealed class BleLink : IBleLink
             Log($"acquire: EX {ex.GetType().Name} 0x{ex.HResult:X8} {ex.Message.Split('\r')[0]}");
         }
         finally { _gate.Release(); }
+    }
+
+    /// Find the pad among the machine's PAIRED devices by name, preferring one
+    /// that is currently connected (the pad's active slot). This tolerates the
+    /// per-slot address change: whichever slot the pad is on, its paired entry
+    /// still carries the "ESP32 MacroPad" name. The configured address is only
+    /// a last-resort pin — discovery wins so a slot switch needs no config edit.
+    /// The host-link service is still verified by the caller (it filters for
+    /// Protocol.Service), so a differently-named device can never be adopted.
+    async Task<BluetoothLEDevice?> ResolveDevice()
+    {
+        BluetoothLEDevice? fallback = null;
+        try
+        {
+            var paired = await DeviceInformation.FindAllAsync(
+                BluetoothLEDevice.GetDeviceSelectorFromPairingState(true));
+            foreach (var di in paired)
+            {
+                if (di.Name is null ||
+                    !di.Name.Contains(PadNameFragment, StringComparison.OrdinalIgnoreCase))
+                    continue;
+                BluetoothLEDevice? d = null;
+                try { d = await BluetoothLEDevice.FromIdAsync(di.Id); } catch { }
+                if (d is null) continue;
+                // The connected one is the pad's active slot — take it outright.
+                if (d.ConnectionStatus == BluetoothConnectionStatus.Connected)
+                {
+                    fallback?.Dispose();
+                    Log($"resolve: connected '{di.Name}' {d.BluetoothAddress:X12}");
+                    return d;
+                }
+                if (fallback is null) fallback = d; else d.Dispose();
+            }
+        }
+        catch (Exception ex) { Log($"resolve: EX {ex.GetType().Name} {ex.Message.Split('\r')[0]}"); }
+
+        if (fallback is not null)
+        {
+            Log($"resolve: paired '{fallback.Name}' {fallback.BluetoothAddress:X12}");
+            return fallback;
+        }
+        // No paired MacroPad discovered — fall back to a pinned config address.
+        if (_hint != 0)
+        {
+            Log($"resolve: hint {_hint:X12}");
+            return await BluetoothLEDevice.FromBluetoothAddressAsync(_hint);
+        }
+        return null;
     }
 
     void OnConnChanged(BluetoothLEDevice d, object? _)

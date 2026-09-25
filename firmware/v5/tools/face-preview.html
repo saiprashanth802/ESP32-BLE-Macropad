@@ -1,0 +1,513 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Visor Face Lab</title>
+<style>
+  :root { --bg:#0b0c10; --card:#14161d; --line:#262a36; --text:#ece9e2; --muted:#8d8a80; --accent:#5fd8f5; }
+  @media (prefers-color-scheme: light) { :root:not([data-theme="dark"]) { --bg:#0b0c10; } }
+  * { box-sizing: border-box; }
+  body { margin:0; background:var(--bg); color:var(--text); font:14px/1.45 system-ui, sans-serif; padding:16px; }
+  h1 { font-size:18px; margin:0 0 4px; } p.sub { color:var(--muted); margin:0 0 14px; max-width:78ch; }
+  h2 { font-size:12px; letter-spacing:.08em; color:var(--muted); margin:14px 0 6px; font-weight:600; }
+  .wrap { display:flex; flex-wrap:wrap; gap:16px; align-items:flex-start; }
+  .card { background:var(--card); border:1px solid var(--line); border-radius:10px; padding:12px; }
+  canvas { display:block; image-rendering:pixelated; border-radius:6px; }
+  #screen { width:640px; max-width:100%; height:auto; background:#000; }
+  .side { width:360px; max-width:100%; }
+  label { display:flex; justify-content:space-between; gap:12px; margin:8px 0 2px; color:var(--muted); font-size:13px; }
+  input[type=range] { width:100%; accent-color:var(--accent); }
+  button, select { background:var(--bg); color:var(--text); border:1px solid var(--line); border-radius:6px; padding:5px 9px; font:inherit; font-size:13px; cursor:pointer; }
+  button:hover { border-color:var(--accent); } button.on { border-color:var(--accent); color:var(--accent); }
+  .btns { display:flex; flex-wrap:wrap; gap:6px; }
+  .row { display:flex; gap:10px; align-items:center; flex-wrap:wrap; }
+  .stat { font:12px ui-monospace, monospace; color:var(--muted); margin-top:6px; }
+  #tune { display:grid; grid-template-columns: 1fr 1fr; gap:0 12px; }
+  #tune label { font-size:12px; margin-top:4px; }
+  textarea { width:100%; height:120px; background:var(--bg); color:var(--text); border:1px solid var(--line); border-radius:6px; font:11px ui-monospace, monospace; }
+</style>
+</head>
+<body>
+<h1>Visor face lab</h1>
+<p class="sub">Bit-for-bit reference for the pad renderer: one 240×150 4-bit sprite, 16-entry palette, signed-distance
+shapes, spring motion, beat dance. Every number here is ported verbatim to <code>macropad_v5.ino</code> — tune here,
+then <em>Copy as C</em>.</p>
+<div class="wrap">
+  <div class="card">
+    <canvas id="screen" width="320" height="240"></canvas>
+    <div class="stat" id="stat"></div>
+  </div>
+  <div class="card side">
+    <h2>EMOTES</h2>
+    <div class="btns" id="emotes"></div>
+    <h2>EVENTS (default mapping)</h2>
+    <div class="btns" id="events"></div>
+    <h2>MOOD (resting face)</h2>
+    <label>Valence <span id="vOut"></span></label><input id="v" type="range" min="-100" max="100" value="0">
+    <label>Arousal <span id="aOut"></span></label><input id="a" type="range" min="-100" max="100" value="0">
+    <h2>DANCE</h2>
+    <div class="row"><button id="music">♪ Music off</button>
+      <label style="margin:0">BPM <input id="bpm" type="number" min="60" max="200" value="120" style="width:64px"></label></div>
+    <label>Dance level <span id="lvOut"></span></label><input id="lv" type="range" min="0" max="100" value="60">
+    <label>Flair every <span id="flOut"></span></label><input id="fl" type="range" min="0" max="16" value="8">
+    <h2>LOOK</h2>
+    <div class="row"><label style="margin:0">Eye colour <input id="col" type="color" value="#5fd8f5"></label></div>
+  </div>
+  <div class="card side">
+    <h2>TUNE EXPRESSION · <span id="tuneName">neutral</span></h2>
+    <div class="row"><label style="margin:0"><input type="checkbox" id="asym"> edit right eye separately</label></div>
+    <div id="tune"></div>
+    <div class="row" style="margin-top:10px"><button id="copyC">Copy as C</button><button id="reset">Reset</button></div>
+    <textarea id="out" readonly></textarea>
+  </div>
+</div>
+<script>
+"use strict";
+// ─────────────────────────────────────────────────────────────────────────────
+// Geometry. Sprite 240×150 sits at screen (40,56). Everything below is in sprite px.
+const SW = 240, SH = 150, SX = 40, SY = 56;
+const EYE_SEP = 58, EYE_Y = 50, MOUTH_Y = 108, PIVOT_X = 120, PIVOT_Y = 80;
+const GLOW = 4.0;                       // halo reach outside the edge (px)
+
+// Eye params:  w h r  lidT lidA lidB  cres heart hollow  dx dy
+const EP = ["w","h","r","lidT","lidA","lidB","cres","heart","hollow","dx","dy"];
+// Mouth params: mw curve thick open depth wedge skew round rO my
+const MP = ["mw","curve","thick","open","depth","wedge","skew","round","rO","my"];
+const E = (w,h,r,lidT=0,lidA=0,lidB=0,cres=0,heart=0,hollow=0,dx=0,dy=0) => ({w,h,r,lidT,lidA,lidB,cres,heart,hollow,dx,dy});
+const M = (mw,curve,thick,open=0,depth=0,wedge=0,skew=0,round=0,rO=8,my=0) => ({mw,curve,thick,open,depth,wedge,skew,round,rO,my});
+
+// Expressions. L is the left eye (screen left); R defaults to L mirrored.
+// lidA > 0 drops the INNER corner (angry), < 0 the outer (sad).
+const EXPR = {
+  neutral:   { L:E(15,22,15),                        m:M(24, 7, 2.6) },
+  happy:     { L:E(19,17,17, 0,0,0, 1),              m:M(32, 3, 2.6, 1, 24) },
+  joy:       { L:E(20,18,18, 0,0,0, 1),              m:M(34, 4, 2.6, 1, 28) },
+  love:      { L:E(19,19,19, 0,0,0, 0,1),            m:M(22, 8, 2.6, 0.35, 10) },
+  surprised: { L:E(20,22,20, 0,0,0, 0,0,1),          m:M(8, 0, 2.4, 0, 0, 0, 0, 1, 8) },
+  angry:     { L:E(21,17,6, 0.42,0.62),              m:M(28, -2, 2.4, 1, 20, 1, -0.18) },
+  sad:       { L:E(16,21,16, 0.22,-0.38, 0, 0,0,0, 0,3), m:M(20, -8, 2.6) },
+  tired:     { L:E(19,3.5,3.5),                      m:M(22, -9, 2.6) },
+  sleepy:    { L:E(17,20,17, 0.62,-0.10),            m:M(10, 2, 2.4) },
+  focused:   { L:E(18,20,12, 0.34,0.18,0.24),        m:M(14, 0, 2.4) },
+  wink:      { L:E(15,22,15),  R:E(17,15,15, 0,0,0, 1), m:M(24, 9, 2.6, 0.25, 8, 0, 0.06) },
+  skeptical: { L:E(16,22,16),  R:E(17,20,12, 0.48,0), m:M(18, 1, 2.4, 0,0,0, 0.22) },
+  vibing:    { L:E(18,16,16, 0,0,0, 1),              m:M(22, 8, 2.6) },
+  dizzy:     { L:E(17,17,17, 0,0,0, 0,0,1),          m:M(20, 0, 2.4) },
+};
+const EXPR_DEFAULT = JSON.parse(JSON.stringify(EXPR));
+const NAMES = Object.keys(EXPR);          // index = emote id on the wire
+
+// Mood grid: arousal rows (low, mid, high) × valence cols (neg, 0, pos).
+// Each cell = [expression, strength] blended with neutral.
+const MOOD_GRID = [
+  [["sad",0.55],   ["sleepy",0.45],  ["vibing",0.55]],
+  [["angry",0.30], ["neutral",1.0],  ["happy",0.40]],
+  [["angry",0.75], ["surprised",0.30],["joy",0.85]],
+];
+
+// Emotes: expression + hold + motion. omega = spring speed (rad/s).
+const EMOTE = {
+  neutral:   { hold: 900,  omega: 14 },
+  happy:     { hold: 1400, omega: 16, motion: "hop" },
+  joy:       { hold: 1800, omega: 18, motion: "bounce" },
+  love:      { hold: 2200, omega: 12, motion: "pulse" },
+  surprised: { hold: 1100, omega: 30, motion: "jolt" },
+  angry:     { hold: 1500, omega: 22, motion: "shake" },
+  sad:       { hold: 2000, omega: 8,  motion: "droop" },
+  tired:     { hold: 2000, omega: 7,  motion: "droop" },
+  sleepy:    { hold: 3000, omega: 6,  motion: "zzz" },
+  focused:   { hold: 2000, omega: 12 },
+  wink:      { hold: 900,  omega: 24 },
+  skeptical: { hold: 1600, omega: 14, motion: "tilt" },
+  vibing:    { hold: 1600, omega: 12 },
+  dizzy:     { hold: 1800, omega: 14, motion: "orbit" },
+};
+
+// Default event → emote mapping (the companion's Face tab edits this).
+const EVENTS = [
+  ["Boot","happy"], ["Connect","happy"], ["Disconnect","sad"], ["Typing burst","focused"],
+  ["Idle → sleep","sleepy"], ["Wake","surprised"], ["Preset switch","wink"], ["Encoder spin","dizzy"],
+  ["Track change","surprised"], ["Favourite","love"], ["Drop","joy"], ["Paused","neutral"],
+  ["Game app","angry"], ["Code app","focused"], ["Late night","tired"],
+];
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Palette: 16 levels. 0 = visor black, 1..10 glow ramp, 11 = pure eye colour,
+// 12..15 eye → near-white core. RGB565-quantised like the panel.
+let pal = [];
+function q565(r,g,b){ r=(r>>3)<<3; g=(g>>2)<<2; b=(b>>3)<<3; return [r|r>>5, g|g>>6, b|b>>5]; }
+function buildPalette(hex){
+  const c = [parseInt(hex.slice(1,3),16), parseInt(hex.slice(3,5),16), parseInt(hex.slice(5,7),16)];
+  const bg = 8;                          // C_BG 0x0841 on the pad
+  pal = [q565(bg, bg, bg)];
+  for (let i = 1; i < 16; i++) {
+    let k, w = 0;
+    if (i <= 11) k = Math.pow(i / 11, 1.8); else { k = 1; w = (i - 11) / 4 * 0.62; }
+    pal.push(q565(...c.map(ch => Math.max(0, Math.min(255, Math.round(bg + (ch * (1 - w) + 255 * w - bg) * k))))));
+  }
+}
+
+// Distance (px, negative inside) → palette index. The pad uses the same curve as a LUT.
+function level(d){
+  if (d <= -2.5) return 15;
+  if (d <= 0)    return Math.round(11 + (-d / 2.5) * 4);          // edge → core
+  if (d >= GLOW) return 0;
+  const t = 1 - d / GLOW;                                         // AA edge + glow
+  return Math.round(11 * (d < 1 ? 0.55 + 0.45 * t * t : 0.55 * t * t * 1.5));
+}
+
+// ── SDF primitives ──────────────────────────────────────────────────────────
+function sdRoundBox(px, py, bw, bh, r){
+  r = Math.min(r, bw, bh);
+  const qx = Math.abs(px) - bw + r, qy = Math.abs(py) - bh + r;
+  const ox = Math.max(qx, 0), oy = Math.max(qy, 0);
+  return Math.hypot(ox, oy) + Math.min(Math.max(qx, qy), 0) - r;
+}
+function sdHeart(px, py){                  // Inigo Quilez, bottom tip at origin, y up, ~1.1 tall
+  px = Math.abs(px);
+  if (py + px > 1) return Math.hypot(px - 0.25, py - 0.75) - Math.SQRT2 / 4;
+  const a = (px) ** 2 + (py - 1) ** 2;
+  const m = 0.5 * Math.max(px + py, 0);
+  const b = (px - m) ** 2 + (py - m) ** 2;
+  return Math.sqrt(Math.min(a, b)) * Math.sign(px - py);
+}
+function sdSeg(px, py, ax, ay, bx, by){
+  const pax = px - ax, pay = py - ay, bax = bx - ax, bay = by - ay;
+  const h = Math.max(0, Math.min(1, (pax * bax + pay * bay) / (bax * bax + bay * bay)));
+  return Math.hypot(pax - bax * h, pay - bay * h);
+}
+
+// Eye SDF in eye-local px (origin = eye centre, y down). inner = +1 if +x points to the nose.
+function eyeSDF(x, y, e, inner, blink){
+  const h = Math.max(e.h, 1.5);
+  let d = sdRoundBox(x, y, e.w, h, e.r);
+  if (e.heart > 0.001) {
+    const s = Math.max(e.w, h) * 1.9;                   // heart ≈ 1.1 s tall
+    const dh = sdHeart(x / s, (h * 0.92 - y) / s - 0.02) * s;
+    d = d + (dh - d) * e.heart;
+  }
+  if (e.cres > 0.001) {                                 // ^ arc: subtract self shifted down
+    const arc = Math.max(5.5, h * 0.42);
+    const shift = (2 * h + 8) + (arc - (2 * h + 8)) * e.cres;
+    d = Math.max(d, -sdRoundBox(x, y - shift, e.w * 1.18, h, e.r * 1.18));
+  }
+  const lid = Math.min(1, e.lidT + (1 - e.lidT) * blink);
+  if (lid > 0.001) {                                    // top lid, tilted
+    const ly = -h + lid * 2 * h + e.lidA * x * inner;
+    d = Math.max(d, ly - y);
+  }
+  if (e.lidB > 0.001) d = Math.max(d, y - (h - e.lidB * 2 * h));
+  if (e.hollow > 0.001) {
+    const t = 2.6;
+    d = d + ((Math.abs(d + t) - t) - d) * e.hollow;
+  }
+  return d;
+}
+
+// Mouth SDF in mouth-local px.
+function mouthSDF(x, y, m){
+  const mw = Math.max(m.mw, 1);
+  const lineY = xx => m.curve * (0.5 - (xx / mw) ** 2) + m.skew * xx;
+  let dl;
+  if (Math.abs(x) <= mw) {
+    const slope = -2 * m.curve * x / (mw * mw) + m.skew;
+    dl = Math.abs(y - lineY(x)) / Math.sqrt(1 + slope * slope) - m.thick;
+  } else {
+    const ex = Math.sign(x) * mw;
+    dl = Math.hypot(x - ex, y - lineY(ex)) - m.thick;
+  }
+  let d = dl;
+  if (m.open > 0.01 && m.depth > 0.5) {                 // D-grin / wedge fill below the line
+    const u = Math.max(-1, Math.min(1, x / mw));
+    const ell = Math.sqrt(Math.max(0, 1 - u * u));
+    const wed = Math.max(0, Math.min(1, 0.5 + 0.5 * u * Math.sign(m.wedge || 1)));
+    const prof = ell + (wed - ell) * Math.abs(m.wedge);
+    const top = lineY(x), bot = top + m.open * m.depth * prof;
+    let df;
+    if (Math.abs(x) < mw && y > top && y < bot) df = -Math.min(y - top, bot - y, mw - Math.abs(x));
+    else df = Math.max(top - y, y - bot, Math.abs(x) - mw);
+    d = Math.min(d, df);
+  }
+  if (m.round > 0.001) {
+    const dO = Math.abs(Math.hypot(x, y) - m.rO) - m.thick;
+    d = d + (dO - d) * m.round;
+  }
+  return d;
+}
+
+// ── Springs ─────────────────────────────────────────────────────────────────
+// One spring per number. Semi-implicit Euler at a fixed 30 Hz step, ζ = 0.72.
+const ZETA = 0.72, DT = 1 / 30;
+function mkState(ex){ return { L:{...ex.L}, R:{...(ex.R || ex.L)}, m:{...ex.m} }; }
+const cur = mkState(EXPR.neutral), vel = { L:{}, R:{}, m:{} };
+for (const g of ["L","R"]) for (const k of EP) vel[g][k] = 0;
+for (const k of MP) vel.m[k] = 0;
+const xf = { tx:0, ty:0, sx:1, sy:1, rot:0 }, xv = { tx:0, ty:0, sx:0, sy:0, rot:0 };
+function spring(obj, v, key, target, omega){
+  const a = omega * omega * (target - obj[key]) - 2 * ZETA * omega * v[key];
+  v[key] += a * DT; obj[key] += v[key] * DT;
+}
+
+// ── Behaviour state ─────────────────────────────────────────────────────────
+let t = 0;                              // seconds
+let moodV = 0, moodA = 0;
+let emote = null, emoteT0 = 0;
+let blinkT0 = -9, nextBlink = 2, nextGlance = 3, glX = 0, glY = 0;
+let music = false, bpm = 120, danceLevel = 0.6, flairBars = 8;
+let moveIdx = 0, lastBar = -1, lastFlairBar = 0, fps = 0, renderMs = 0;
+const rnd = (a,b) => a + Math.random() * (b - a);
+
+function lerpE(a, b, k){ const o = {}; for (const p of EP) o[p] = a[p] + (b[p] - a[p]) * k; return o; }
+function lerpM(a, b, k){ const o = {}; for (const p of MP) o[p] = a[p] + (b[p] - a[p]) * k; return o; }
+function exprAt(name, k){
+  const n = EXPR.neutral, x = EXPR[name];
+  return { L: lerpE(n.L, x.L, k), R: lerpE(n.R || n.L, x.R || x.L, k), m: lerpM(n.m, x.m, k) };
+}
+function blendExpr(a, b, k){ return { L: lerpE(a.L, b.L, k), R: lerpE(a.R, b.R, k), m: lerpM(a.m, b.m, k) }; }
+function moodPose(v, a){                 // bilinear over MOOD_GRID, v/a in -1..1
+  const fx = (v + 1), fy = (a + 1);
+  const c0 = Math.min(1, Math.floor(fx)), r0 = Math.min(1, Math.floor(fy));
+  const u = fx - c0, w = fy - r0;
+  const cell = (r, c) => exprAt(MOOD_GRID[r][c][0], MOOD_GRID[r][c][1]);
+  return blendExpr(blendExpr(cell(r0, c0), cell(r0, c0 + 1), u),
+                   blendExpr(cell(r0 + 1, c0), cell(r0 + 1, c0 + 1), u), w);
+}
+
+function playEmote(name){ emote = name; emoteT0 = t; }
+
+// Dance moves → transform targets for beat phase ph (beats, float). amp 0..1.
+const MOVES = ["bob", "sway", "tilt", "step", "bounce", "bang"];
+function allowedMoves(){
+  if (danceLevel < 0.01) return [];
+  if (danceLevel < 0.35) return ["bob"];
+  if (danceLevel < 0.7)  return ["bob", "sway", "tilt"];
+  return (moodA > 0.3) ? ["bob","sway","tilt","step","bounce","bang"] : ["bob","sway","tilt","step","bounce"];
+}
+function danceXf(ph, move, amp){
+  const f = ph - Math.floor(ph), hit = Math.pow(1 - f, 3), even = Math.floor(ph) % 2 === 0;
+  const o = { tx:0, ty:0, sx:1, sy:1, rot:0 };
+  switch (move) {
+    case "bob":    o.ty = 7 * amp * hit; o.sy = 1 - 0.05 * amp * hit; o.sx = 1 + 0.03 * amp * hit; break;
+    case "sway":   o.tx = 12 * amp * Math.sin(Math.PI * ph); o.rot = 0.07 * amp * Math.sin(Math.PI * ph);
+                   o.ty = 3 * amp * hit; break;
+    case "tilt":   o.rot = (even ? 1 : -1) * 0.11 * amp * (1 - Math.pow(f, 2)) ; o.ty = 4 * amp * hit; break;
+    case "step":   { const s = even ? 1 : -1, e = f < 0.35 ? f / 0.35 : 1, ee = e * e * (3 - 2 * e);
+                     o.tx = 11 * amp * (s * (2 * ee - 1)); o.ty = -5 * amp * Math.sin(Math.PI * Math.min(1, f / 0.35)); break; }
+    case "bounce": { const up = Math.sin(Math.PI * f); o.ty = -9 * amp * up; o.sy = 1 + 0.07 * amp * up - 0.08 * amp * hit;
+                     o.sx = 1 - 0.03 * amp * up + 0.05 * amp * hit; break; }
+    case "bang":   o.ty = 10 * amp * hit; o.rot = 0.05 * amp * hit * (even ? 1 : -1); o.sy = 1 - 0.09 * amp * hit; break;
+  }
+  return o;
+}
+
+// ── Simulation step (30 Hz) ─────────────────────────────────────────────────
+let zzz = 0;
+function step(){
+  t += DT;
+  // Base = mood; an emote overrides while it runs, then springs carry back.
+  let target = moodPose(moodV, moodA), omega = 10, motion = null, et = 0;
+  if (emote) {
+    et = (t - emoteT0) * 1000;
+    const em = EMOTE[emote];
+    if (et < em.hold) { target = mkState(EXPR[emote]); omega = em.omega; motion = em.motion; }
+    else { emote = null; omega = 8; }
+  }
+
+  // Idle life: blinks + glances (both suppressed during closed-eye emotes)
+  if (t > nextBlink) { blinkT0 = t; nextBlink = t + rnd(2.2, 5.5) * (moodA < -0.3 ? 0.7 : 1); }
+  const bt = (t - blinkT0) * 1000;
+  const blink = bt < 70 ? bt / 70 : bt < 170 ? 1 - (bt - 70) / 100 : 0;
+  if (t > nextGlance) {
+    nextGlance = t + rnd(2.5, 6.5);
+    const back = Math.random() < 0.45;
+    glX = back ? 0 : rnd(-7, 7); glY = back ? 0 : rnd(-4, 3);
+  }
+
+  for (const g of ["L","R"]) {
+    const tg = target[g];
+    for (const k of EP) {
+      let tv = tg[k];
+      if (k === "dx") tv += glX; if (k === "dy") tv += glY;
+      spring(cur[g], vel[g], k, tv, omega);
+    }
+  }
+  const mt = target.m;
+  for (const k of MP) spring(cur.m, vel.m, k, mt[k], omega);
+
+  // Transform: dance + emote motion + breathing
+  let tt = { tx: glX * 0.35, ty: 0, sx: 1, sy: 1 + 0.012 * Math.sin(t * 1.6), rot: 0 };
+  if (music && danceLevel > 0.01) {
+    const ph = t * bpm / 60, bar = Math.floor(ph / 4);
+    if (bar !== lastBar) {
+      lastBar = bar;
+      const moves = allowedMoves();
+      if (bar % 4 === 0 && moves.length) moveIdx = Math.floor(Math.random() * moves.length);
+      if (flairBars > 0 && bar - lastFlairBar >= flairBars && !emote && danceLevel >= 0.35) {
+        lastFlairBar = bar;
+        playEmote(["vibing","wink","joy","happy"][Math.floor(Math.random() * 4)]);
+      }
+    }
+    const moves = allowedMoves();
+    if (moves.length) {
+      const d = danceXf(ph, moves[moveIdx % moves.length], danceLevel);
+      tt.tx += d.tx; tt.ty += d.ty; tt.sx *= d.sx; tt.sy *= d.sy; tt.rot += d.rot;
+    }
+  }
+  const s = et / 1000;
+  switch (motion) {
+    case "hop":    tt.ty -= 8 * Math.max(0, Math.sin(Math.PI * Math.min(1, s / 0.35))); break;
+    case "bounce": tt.ty -= 9 * Math.abs(Math.sin(Math.PI * s * 3.2)) * Math.max(0, 1 - s / 1.8); break;
+    case "pulse":  { const p = Math.pow(Math.max(0, Math.sin(Math.PI * s * 2.2)), 6); tt.sx *= 1 + 0.08 * p; tt.sy *= 1 + 0.08 * p; } break;
+    case "jolt":   tt.ty -= 6 * Math.exp(-s * 5); tt.sy *= 1 + 0.06 * Math.exp(-s * 5); break;
+    case "shake":  tt.tx += 4 * Math.sin(s * 55) * Math.exp(-s * 3); break;
+    case "droop":  tt.ty += 6 * Math.min(1, s / 0.8); tt.rot += 0.03; break;
+    case "tilt":   tt.rot += 0.09 * Math.min(1, s / 0.3); break;
+    case "orbit":  for (const [g, sg] of [["L", 1], ["R", -1]]) {
+                     cur[g].dx += (sg * 4 * Math.cos(s * 9) - cur[g].dx) * 0.5;
+                     cur[g].dy += (4 * Math.sin(s * 9 * sg) - cur[g].dy) * 0.5; } break;
+  }
+  zzz += ((motion === "zzz" ? 1 : 0) - zzz) * 0.08;
+  for (const k of ["tx","ty","sx","sy","rot"]) spring(xf, xv, k, tt[k], music ? 26 : 12);
+  return blink * (EXPR[emote]?.L.cres > 0.5 ? 0 : 1);
+}
+
+// ── Render into the 4-bit sprite ────────────────────────────────────────────
+const spr = new Uint8Array(SW * SH);
+function renderFeature(bx0, by0, bx1, by1, f){
+  // Local bbox → sprite AABB through the forward transform
+  const c = Math.cos(xf.rot), s = Math.sin(xf.rot);
+  let x0 = 1e9, y0 = 1e9, x1 = -1e9, y1 = -1e9;
+  for (const [px, py] of [[bx0,by0],[bx1,by0],[bx0,by1],[bx1,by1]]) {
+    const lx = px - PIVOT_X, ly = py - PIVOT_Y;
+    const qx = PIVOT_X + xf.tx + xf.sx * (c * lx - s * ly), qy = PIVOT_Y + xf.ty + xf.sy * (s * lx + c * ly);
+    x0 = Math.min(x0, qx); x1 = Math.max(x1, qx); y0 = Math.min(y0, qy); y1 = Math.max(y1, qy);
+  }
+  x0 = Math.max(0, Math.floor(x0)); y0 = Math.max(0, Math.floor(y0));
+  x1 = Math.min(SW - 1, Math.ceil(x1)); y1 = Math.min(SH - 1, Math.ceil(y1));
+  const isx = 1 / xf.sx, isy = 1 / xf.sy, ds = (xf.sx + xf.sy) * 0.5;
+  for (let y = y0; y <= y1; y++) for (let x = x0; x <= x1; x++) {
+    const ux = (x + 0.5 - PIVOT_X - xf.tx) * isx, uy = (y + 0.5 - PIVOT_Y - xf.ty) * isy;
+    const lx = PIVOT_X + c * ux + s * uy, ly = PIVOT_Y - s * ux + c * uy;   // inverse rotate
+    const l = level(f(lx, ly) * ds);
+    const i = y * SW + x; if (l > spr[i]) spr[i] = l;
+  }
+}
+function render(blink){
+  const t0 = performance.now();
+  spr.fill(0);
+  const eyes = [["L", PIVOT_X - EYE_SEP, 1], ["R", PIVOT_X + EYE_SEP, -1]];
+  for (const [g, cx, inner] of eyes) {
+    const e = cur[g], ex = cx + e.dx, ey = EYE_Y + e.dy;
+    const r = Math.max(e.w, e.h) * 1.25 + GLOW + 4;
+    renderFeature(ex - r, ey - r, ex + r, ey + r, (x, y) => eyeSDF(x - ex, y - ey, e, inner, blink));
+  }
+  const m = cur.m, mx = PIVOT_X + (cur.L.dx + cur.R.dx) * 0.18, my = MOUTH_Y + m.my;
+  const hw = Math.max(m.mw, m.rO) + m.thick + GLOW + 3;
+  const top = Math.abs(m.curve) + Math.abs(m.skew) * m.mw + m.thick + GLOW + 3 + m.rO * m.round;
+  const bot = top + m.open * m.depth;
+  renderFeature(mx - hw, my - top, mx + hw, my + bot, (x, y) => mouthSDF(x - mx, y - my, m));
+  if (zzz > 0.05) {                                    // Zzz drifting up-right of the right eye
+    const zx0 = PIVOT_X + EYE_SEP + 26, zy0 = EYE_Y - 16;
+    for (let i = 0; i < 3; i++) {
+      const ph = (t * 0.45 + i / 3) % 1, sz = 3 + i * 1.6 + ph * 2;
+      const zx = zx0 + i * 9 + ph * 6, zy = zy0 - ph * 26 - i * 4, a = zzz * Math.sin(Math.PI * ph);
+      if (a < 0.05) continue;
+      renderFeature(zx - sz - 6, zy - sz - 6, zx + sz + 6, zy + sz + 6, (x, y) => {
+        const px = x - zx, py = y - zy;
+        return (Math.min(sdSeg(px, py, -sz, -sz, sz, -sz), sdSeg(px, py, sz, -sz, -sz, sz),
+                         sdSeg(px, py, -sz, sz, sz, sz)) - 1.1) + (1 - a) * 5;
+      });
+    }
+  }
+  renderMs = performance.now() - t0;
+}
+
+// ── Screen mock ─────────────────────────────────────────────────────────────
+const cv = document.getElementById("screen"), ctx = cv.getContext("2d");
+const img = ctx.createImageData(320, 240);
+function blit(){
+  const d = img.data;
+  for (let y = 0; y < 240; y++) for (let x = 0; x < 320; x++) {
+    const o = (y * 320 + x) * 4;
+    let rgb = [0, 0, 0];
+    if (y < 26) rgb = [18, 20, 26];                                      // status bar area
+    const sx = x - SX, sy = y - SY;
+    if (sx >= 0 && sx < SW && sy >= 0 && sy < SH) rgb = pal[spr[sy * SW + sx]];
+    d[o] = rgb[0]; d[o + 1] = rgb[1]; d[o + 2] = rgb[2]; d[o + 3] = 255;
+  }
+  ctx.putImageData(img, 0, 0);
+  ctx.strokeStyle = "rgba(255,255,255,.08)"; ctx.strokeRect(SX + .5, SY + .5, SW - 1, SH - 1);
+}
+
+// ── UI ──────────────────────────────────────────────────────────────────────
+const $ = id => document.getElementById(id);
+let tuneName = "neutral";
+for (const n of NAMES) {
+  const b = document.createElement("button"); b.textContent = n;
+  b.onclick = () => { playEmote(n); tuneName = n; buildTune(); };
+  $("emotes").appendChild(b);
+}
+for (const [ev, em] of EVENTS) {
+  const b = document.createElement("button"); b.textContent = ev; b.title = "→ " + em;
+  b.onclick = () => playEmote(em); $("events").appendChild(b);
+}
+function syncOut(){
+  moodV = $("v").value / 100; moodA = $("a").value / 100;
+  $("vOut").textContent = $("v").value; $("aOut").textContent = $("a").value;
+  danceLevel = $("lv").value / 100; $("lvOut").textContent = $("lv").value;
+  flairBars = +$("fl").value; $("flOut").textContent = flairBars ? flairBars + " bars" : "never";
+  bpm = Math.max(60, Math.min(200, +$("bpm").value || 120));
+}
+for (const id of ["v","a","lv","fl","bpm"]) $(id).oninput = syncOut;
+$("music").onclick = () => { music = !music; $("music").textContent = music ? "♪ Music on" : "♪ Music off";
+                             $("music").classList.toggle("on", music); };
+$("col").oninput = () => buildPalette($("col").value);
+
+const RANGES = { w:[1,30,.5], h:[1,30,.5], r:[0,30,.5], lidT:[0,1,.01], lidA:[-1,1,.01], lidB:[0,1,.01],
+  cres:[0,1,.01], heart:[0,1,.01], hollow:[0,1,.01], dx:[-15,15,.5], dy:[-15,15,.5],
+  mw:[1,45,.5], curve:[-20,20,.5], thick:[1,6,.1], open:[0,1,.01], depth:[0,40,.5], wedge:[-1,1,.01],
+  skew:[-.6,.6,.01], round:[0,1,.01], rO:[2,20,.5], my:[-15,15,.5] };
+function buildTune(){
+  $("tuneName").textContent = tuneName;
+  const box = $("tune"); box.innerHTML = "";
+  const ex = EXPR[tuneName], asym = $("asym").checked;
+  const add = (obj, k, tag) => {
+    const [lo, hi, st] = RANGES[k];
+    const lab = document.createElement("label"); lab.innerHTML = `${tag}${k} <span>${(+obj[k]).toFixed(2)}</span>`;
+    const inp = document.createElement("input"); Object.assign(inp, { type:"range", min:lo, max:hi, step:st, value:obj[k] });
+    inp.oninput = () => { obj[k] = +inp.value; lab.querySelector("span").textContent = (+inp.value).toFixed(2);
+                          if (!asym && obj === ex.L && ex.R) ex.R[k] = obj[k]; playEmote(tuneName); emoteT0 = t; };
+    const wrap = document.createElement("div"); wrap.append(lab, inp); box.appendChild(wrap);
+  };
+  for (const k of EP) add(ex.L, k, asym ? "L." : "eye.");
+  if (asym) { if (!ex.R) ex.R = { ...ex.L }; for (const k of EP) add(ex.R, k, "R."); }
+  for (const k of MP) add(ex.m, k, "mouth.");
+}
+$("asym").onchange = buildTune;
+$("reset").onclick = () => { EXPR[tuneName] = JSON.parse(JSON.stringify(EXPR_DEFAULT[tuneName])); buildTune(); };
+$("copyC").onclick = () => {
+  const f = v => (Math.round(v * 100) / 100).toString().replace(/^(-?)0\./, "$1.");
+  const eye = e => `{${EP.map(k => f(e[k])).join(",")}}`;
+  const lines = NAMES.map(n => { const x = EXPR[n];
+    return `  /* ${n.padEnd(9)} */ { ${eye(x.L)}, ${eye(x.R || x.L)}, {${MP.map(k => f(x.m[k])).join(",")}} },`; });
+  $("out").value = "const FaceExpr EXPR[EX_COUNT] = {\n" + lines.join("\n") + "\n};";
+  $("out").select(); try { navigator.clipboard.writeText($("out").value); } catch (e) {}
+};
+
+buildPalette($("col").value); syncOut(); buildTune();
+let acc = 0, last = performance.now(), frames = 0, fpsT = last;
+function loop(now){
+  acc += Math.min(0.25, (now - last) / 1000); last = now;
+  let blink = 0, stepped = false;
+  while (acc >= DT) { blink = step(); acc -= DT; stepped = true; }
+  if (stepped) { render(blink); blit(); frames++; }
+  if (now - fpsT > 1000) { fps = frames; frames = 0; fpsT = now;
+    $("stat").textContent = `${fps} fps · render ${renderMs.toFixed(1)} ms (JS) · ${emote || "mood"}` +
+      (music ? ` · ${allowedMoves()[moveIdx % Math.max(1, allowedMoves().length)] || "still"} @ ${bpm} bpm` : ""); }
+  requestAnimationFrame(loop);
+}
+requestAnimationFrame(loop);
+</script>
+</body>
+</html>

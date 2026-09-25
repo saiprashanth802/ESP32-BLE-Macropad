@@ -46,6 +46,7 @@
 #include <WiFi.h>
 #include <esp_now.h>       // encoder puck link — see docs/PUCK_PROTOCOL.md
 #include <esp_wifi.h>      // esp_wifi_set_channel, to pin the ESP-NOW channel
+#include <esp_mac.h>       // esp_read_mac — base for the per-slot BLE addresses
 #include <FS.h>
 #include <SPIFFS.h>
 #include <WebServer.h>
@@ -204,13 +205,65 @@ struct EyePose {
   uint8_t mouthWPct;    // width scale; 0 means "default" (=100), not "hidden"
   int8_t  mouthCurve;   // -100 frown … 0 flat … +100 smile
   uint8_t mouthOpenPct; // 0 = closed line, 100 = fully open (yawn, gasp)
+  // ── Brows ── appended after the mouth for the same reason: rows written
+  // before brows existed zero-fill to a level brow at rest height.
+  int8_t  browY;        // -100 lowered … 0 rest … +100 raised (surprise)
+  int8_t  browTilt;     // + inner end down (angry), − inner end up (worried)
 };
-const EyePose POSE_NEUTRAL = { 100, 0, 0, 0, 100, 100, 0, 0, 100, 0, 0 };
+const EyePose POSE_NEUTRAL = { 100, 0, 0, 0, 100, 100, 0, 0, 100, 0, 0, 0, 0 };
 
-// A keyframe holds a pose from tMs until the next frame's tMs.
-// winkMask: bit0 = left eye closed, bit1 = right eye closed.
-struct EmoteKey { uint16_t tMs; EyePose pose; uint8_t winkMask; };
-struct Emote    { const EmoteKey* keys; uint8_t n; uint16_t durMs; };
+// ── Face v3 types ───────────────────────────────
+// Declared up here, before any function, so the Arduino prototype generator
+// never emits a prototype that names a type it hasn't seen yet.
+//
+// One visor face. Eyes and mouth are signed-distance shapes whose every
+// number is spring-driven, so any expression morphs into any other. The
+// browser reference firmware/v5/tools/face-preview.html runs the same maths:
+// tune there, and keep EXPR / EMOTES / MOOD_GRID here identical to it.
+struct EyeP   { float w, h, r, lidT, lidA, lidB, cres, heart, hollow, dx, dy; };
+struct MouthP { float mw, curve, thick, open, depth, wedge, skew, round, rO, my; };
+struct FaceP  { EyeP L, R; MouthP m; };          // floats only: springs walk it as an array
+struct FaceXf { float tx, ty, sx, sy, rot; };    // whole-face transform (dance, emote motion)
+struct FRect  { int16_t x0, y0, x1, y1; };       // sprite-space dirty rect, x1 < x0 = empty
+typedef float (*SdfFn)(float x, float y, const void* ctx);
+struct EyeCtx   { const EyeP* e; float cx, cy, inner, blink; };
+struct MouthCtx { const MouthP* m; float cx, cy; };
+struct ZCtx     { float zx, zy, sz, a; };
+
+// Expression ids — also the emote ids on the wire (HCMD_EMOTE, emote map)
+enum : uint8_t { EX_NEUTRAL, EX_HAPPY, EX_JOY, EX_LOVE, EX_SURPRISED, EX_ANGRY, EX_SAD,
+                 EX_TIRED, EX_SLEEPY, EX_FOCUSED, EX_WINK, EX_SKEPTICAL, EX_VIBING,
+                 EX_DIZZY, EX_COUNT };
+#define EMOTE_RANDOM 0xFF                 // map entry: pick a flair emote at random
+
+// Pad-side triggers: events the pad sees itself, so they work with no PC.
+// Host-side ones (drop, game/code app, late night) live in the companion and
+// arrive as HCMD_EMOTE. Order is wire format — append only.
+enum : uint8_t { TRG_BOOT, TRG_CONNECT, TRG_DISCONNECT, TRG_TYPING, TRG_IDLE, TRG_WAKE,
+                 TRG_PRESET, TRG_SLOT, TRG_TRACK, TRG_FAVE, TRG_PAUSE, TRG_FLAIR,
+                 TRG_PAD_N };
+struct EmoteMapE { uint8_t ex, chance, cooldownS; };   // chance 0 = off
+// NVS "emap" (whole table), written only when the companion's editor saves
+EmoteMapE emoteMap[TRG_PAD_N] = {
+  { EX_HAPPY,     100,   0 },   // boot
+  { EX_HAPPY,     100,   5 },   // connect
+  { EX_SAD,       100,   5 },   // disconnect
+  { EX_FOCUSED,    60,  20 },   // typing burst
+  { EX_SLEEPY,     60, 120 },   // idle (≥ 60 s untouched)
+  { EX_SURPRISED, 100,   0 },   // wake press
+  { EX_WINK,       70,  10 },   // preset picked on the pad
+  { EX_WINK,      100,   0 },   // host slot switch
+  { EX_SURPRISED,  80,  20 },   // new track
+  { EX_LOVE,      100,   0 },   // favourited
+  { EX_NEUTRAL,     0,  30 },   // paused
+  { EMOTE_RANDOM,  70,   0 },   // dance flair
+};
+uint8_t danceLevel = 60;          // NVS "dlvl": 0 off, ~30 bob only, 100 full party
+uint8_t flairBars  = 8;           // NVS "dflr": bars between flair chances, 0 = never
+#define FACE_CAPS 0x80            // hello byte 6: face v3 engine (emote/map/dance cmds)
+#ifndef FACE_PROFILE              // -DFACE_PROFILE=1: log worst updateFace time + mood every 5 s
+#define FACE_PROFILE 0
+#endif
 
 // Persona = a tuning table. Percentages scale the faceCfg intervals and the
 // emote amplitudes, so one enum changes how the whole face carries itself.
@@ -225,13 +278,13 @@ struct Personality {
   EyePose rest;                             // posture with nothing happening
 };
 const Personality PERSONAS[] = {
-  // The last three of each rest pose are the mouth: width%, curve, open%.
+  // After the eye fields: mouth width%, curve, open%; then brow height, tilt.
   // timePct stretches emote playback per persona, on top of EMOTE_TIME_PCT.
   // name      blink glance emote time sacc dbl yawn sqnt  eBias vBias  rest pose
-  { "CALM",     120,  110,   70, 105,   30,  10,  15,  20,   -10,   10, { 100,  8,   0,  0, 100, 100, 0, 0, 100,  18, 0 } },
-  { "PLAYFUL",   70,   60,  130,  85,  100,  40,  10,  25,    25,   25, { 100,  0,   0,  8, 100, 100, 0, 0, 106,  46, 0 } },
-  { "GRUMPY",   140,  130,   60, 115,   20,   5,   5,  50,   -15,  -30, {  92, 18, -35,  0, 100, 100, 0, 0,  88, -40, 0 } },
-  { "SLEEPY",   170,  150,   50, 145,   15,  10,  60,  30,   -40,    0, {  80, 35,  20,  0, 100,  96, 0, 2,  84,  -8, 0 } },
+  { "CALM",     120,  110,   70, 105,   30,  10,  15,  20,   -10,   10, { 100,  8,   0,  0, 100, 100, 0, 0, 100,  18, 0,   0,   0 } },
+  { "PLAYFUL",   70,   60,  130,  85,  100,  40,  10,  25,    25,   25, { 100,  0,   0,  8, 100, 100, 0, 0, 106,  46, 0,  12,   0 } },
+  { "GRUMPY",   140,  130,   60, 115,   20,   5,   5,  50,   -15,  -30, {  92, 18, -35,  0, 100, 100, 0, 0,  88, -40, 0, -10,  45 } },
+  { "SLEEPY",   170,  150,   50, 145,   15,  10,  60,  30,   -40,    0, {  80, 35,  20,  0, 100,  96, 0, 2,  84,  -8, 0, -15,   0 } },
 };
 const uint8_t NUM_PERSONAS = sizeof(PERSONAS) / sizeof(PERSONAS[0]);
 uint8_t facePersona = 0;
@@ -374,9 +427,167 @@ HostSlot hostSlots[NUM_SLOTS] = {};
 int  activeSlot = 0;
 volatile bool pairingMode = false;
 
+// ── Per-slot BLE identity ────────────────────────────────────
+// Every slot advertises from its OWN static-random address, so each host keeps
+// an INDEPENDENT bond.
+//
+// Why this exists: under the old single-identity scheme all three slots shared
+// one address, and two OSes dual-booting a single machine hand the pad the
+// SAME peer address (the controller MAC is burned into the adapter). So
+// the pad's peer-address→slot lookup collapsed them onto one slot, and (a)
+// the second OS was kicked as a "wrong host" and could never claim a slot of
+// its own, while (b) each re-pair overwrote the single stored LTK and staled
+// the other OS's key — the endless forget-and-re-pair loop. Distinct
+// advertised addresses make the pad look like three separate keyboards,
+// which is how commercial Easy-Switch keyboards do it — that is the host
+// side of the fix. The pad side (no peer-address slot lookup, and per-slot
+// copies of the bond keys) is the "Per-slot bond keys" block below.
+#define ADDR_SCHEME_VER 3            // bump = wipe bonds once on next boot
+                                     // 2: per-slot addresses  3: per-slot bond keys
+
+static ble_addr_t slotAddr[NUM_SLOTS];
+static int        ownAddrSlot = -1;  // slot whose address is live in the stack
+
+void buildSlotAddresses() {
+  uint8_t base[6];                   // esp_read_mac yields MSB-first...
+  esp_read_mac(base, ESP_MAC_BT);
+  for (int i = 0; i < NUM_SLOTS; i++) {
+    for (int b = 0; b < 6; b++) slotAddr[i].val[b] = base[5 - b];  // ...NimBLE is LE
+    slotAddr[i].val[0] ^= (uint8_t)(0x10 + i);   // distinct per slot
+    slotAddr[i].val[5] |= 0xC0;                  // static-random: top 2 bits set
+    slotAddr[i].type    = BLE_ADDR_RANDOM;
+  }
+}
+
+// Swap the stack's identity to slot n. ble_hs_id_set_rnd() returns EBUSY while
+// advertising or connected, so this may only be called from
+// startAdvertisingForSlot() — after the link is down and advertising stopped.
+bool applySlotAddress(int n) {
+  if (n < 0 || n >= NUM_SLOTS) return false;
+  if (n == ownAddrSlot) return true;
+  for (int attempt = 0; attempt < 2; attempt++) {
+    if (NimBLEDevice::setOwnAddr(slotAddr[n].val)) {
+      NimBLEDevice::setOwnAddrType(BLE_OWN_ADDR_RANDOM);
+      ownAddrSlot = n;
+      const uint8_t* a = slotAddr[n].val;
+      Serial.printf("[BLE] slot %d identity %02X:%02X:%02X:%02X:%02X:%02X\n",
+                    n + 1, a[5], a[4], a[3], a[2], a[1], a[0]);
+      return true;
+    }
+    delay(150);   // EBUSY — the old link may still be tearing down
+  }
+  Serial.printf("[BLE] own-addr set FAILED for slot %d (still on slot %d)\n",
+                n + 1, ownAddrSlot + 1);
+  return false;
+}
+
+// ── Per-slot bond keys ───────────────────────────────────────
+// NimBLE's bond store is keyed by PEER address only, and a re-pair from the
+// same peer REPLACES the entry. A dual-boot machine is one peer (same adapter
+// MAC under both OSes), so two OSes bonded on two slots would keep
+// overwriting each other's LTK on the pad — the other OS then fails
+// encryption on its next connect and has to forget + re-pair. Per-slot
+// addresses fixed the HOST side of that collision; this fixes the PAD side.
+//
+// Each slot keeps its own copy of the security material NimBLE persisted for
+// its host. On a slot switch the live store entry for that peer is swapped
+// for the slot's copy before advertising, so whichever OS connects finds the
+// key it actually holds.
+struct SlotBond {                    // POD — one NVS blob per slot ("bond0".."bond2")
+  uint8_t  valid;
+  uint8_t  hasPeer;                  // peer_sec present (host distributed keys)
+  struct ble_store_value_sec ours;   // what the host uses to encrypt to us
+  struct ble_store_value_sec peer;   // what we'd use to initiate security
+};
+extern Preferences prefs;            // declared with the other NVS state below
+static SlotBond slotBond[NUM_SLOTS] = {};
+static int      bondLoadedSlot = -1; // slot whose keys are live in NimBLE's store
+volatile int8_t pendingBondSnap = -1;// onAuthenticationComplete → loop: snapshot this slot
+
+static void slotBondKey(char* out, int n) { snprintf(out, 8, "bond%d", n); }
+
+static void slotPeerKey(int n, struct ble_store_key_sec* key) {
+  memset(key, 0, sizeof(*key));
+  memcpy(key->peer_addr.val, hostSlots[n].addr, 6);
+  key->peer_addr.type = hostSlots[n].type;
+}
+
+void loadSlotBonds() {
+  char k[8];
+  for (int i = 0; i < NUM_SLOTS; i++) {
+    slotBondKey(k, i);
+    if (prefs.getBytesLength(k) == sizeof(SlotBond))
+      prefs.getBytes(k, &slotBond[i], sizeof(SlotBond));
+    else
+      memset(&slotBond[i], 0, sizeof(SlotBond));
+  }
+}
+
+// Copy the keys NimBLE just persisted for slot n's host into that slot's own
+// blob. Called from loop() (not the BLE callback): NimBLE persists keys AFTER
+// it raises the enc-change event, so reading them inside
+// onAuthenticationComplete would see the previous pairing's material.
+void snapshotSlotBond(int n) {
+  if (n < 0 || n >= NUM_SLOTS || !hostSlots[n].bonded) return;
+  struct ble_store_key_sec key; slotPeerKey(n, &key);
+  SlotBond sb = {};
+  if (ble_store_read_our_sec(&key, &sb.ours) != 0) {
+    Serial.printf("[BLE] slot %d: no our_sec in store to snapshot\n", n + 1);
+    return;
+  }
+  sb.hasPeer = (ble_store_read_peer_sec(&key, &sb.peer) == 0);
+  sb.valid   = 1;
+  bondLoadedSlot = n;                // the live entry IS this slot's now
+  if (slotBond[n].valid && memcmp(&slotBond[n], &sb, sizeof(SlotBond)) == 0) return;
+  slotBond[n] = sb;
+  char k[8]; slotBondKey(k, n);
+  prefs.putBytes(k, &slotBond[n], sizeof(SlotBond));
+  Serial.printf("[BLE] slot %d bond keys snapshotted (ltk=%d peer=%d)\n",
+                n + 1, sb.ours.ltk_present, sb.hasPeer);
+}
+
+// Make slot n's keys the live ones in NimBLE's store. Safe any time the link
+// is down; startAdvertisingForSlot() is the one caller.
+void restoreSlotBond(int n) {
+  if (n < 0 || n >= NUM_SLOTS) return;
+  if (n == bondLoadedSlot) return;
+  if (!hostSlots[n].bonded || !slotBond[n].valid) {
+    // Nothing to load: leave whatever is live alone. A fresh pairing on this
+    // slot overwrites it; the slot it belonged to keeps its own copy.
+    return;
+  }
+  struct ble_store_key_sec key; slotPeerKey(n, &key);
+  ble_store_delete_our_sec(&key);    // drop the other slot's copy for this peer
+  ble_store_delete_peer_sec(&key);   // (CCCDs are left alone — hosts re-subscribe)
+  int rc = ble_store_write_our_sec(&slotBond[n].ours);
+  if (slotBond[n].hasPeer) ble_store_write_peer_sec(&slotBond[n].peer);
+  bondLoadedSlot = n;
+  Serial.printf("[BLE] slot %d bond keys restored (rc=%d)\n", n + 1, rc);
+}
+
+// Forget slot n's host. Only touch NimBLE's live entry when it is really this
+// slot's: another slot bonded to the SAME peer (the dual-boot case) owns the
+// live entry whenever it is the active slot, and its copy must survive.
+void dropSlotBond(int n) {
+  if (n < 0 || n >= NUM_SLOTS) return;
+  if (hostSlots[n].bonded) {
+    bool sharedPeer = false;
+    for (int i = 0; i < NUM_SLOTS; i++)
+      if (i != n && hostSlots[i].bonded &&
+          memcmp(hostSlots[i].addr, hostSlots[n].addr, 6) == 0) sharedPeer = true;
+    if (!sharedPeer || n == activeSlot)
+      NimBLEDevice::deleteBond(NimBLEAddress(hostSlots[n].addr, hostSlots[n].type));
+    if (n == bondLoadedSlot) bondLoadedSlot = -1;
+  }
+  hostSlots[n].bonded = 0;
+  memset(&slotBond[n], 0, sizeof(SlotBond));
+  char k[8]; slotBondKey(k, n);
+  prefs.remove(k);
+}
+
 // BLE→loop event mailbox — NimBLE callbacks must never draw on the TFT,
 // the loop task owns the display
-enum BleEvent : uint8_t { EVT_NONE=0, EVT_PAIRED, EVT_WRONG_HOST };
+enum BleEvent : uint8_t { EVT_NONE=0, EVT_PAIRED };
 volatile uint8_t pendingBleEvent = EVT_NONE;
 
 // ════════════════════════════════════════════════
@@ -403,7 +614,8 @@ volatile uint16_t bleConnHandle = 0;
 #define HOSTLINK_CMD_UUID "6d616372-6f70-6164-0000-000000000003"
 
 enum : uint8_t {  // device → host
-  HEV_HELLO  = 0x01,   // [fwMajor][keys][presets][activePreset][faceMode][persona]
+  HEV_HELLO  = 0x01,   // [fwMajor][keys][presets][activePreset][faceMode][persona][faceCaps]
+                       // faceCaps 0x80 = face v3 (0x91-0x93); older builds sent face v2 bits
   HEV_KEY    = 0x02,   // [preset][keyIdx] — a KA_HOST key was tapped
   HEV_PRESET = 0x03,   // [preset] — active preset changed (either side)
   HEV_ACTIONS= 0x04,   // [page][totalPages][count] + count × [id lo][id hi][label 9]
@@ -415,14 +627,16 @@ enum : uint8_t {  // device → host
 // 8 entries × 11 bytes + 3 header = 91, comfortably inside the 185-byte MTU
 #define ACTIONS_PER_PAGE 8
 enum : uint8_t {  // host → device
-  HCMD_LABEL  = 0x81,  // [preset][key][utf8 ≤8] — live label override
-  HCMD_STATUS = 0x82,  // [utf8 ≤23] — status-bar line; empty clears
+  HCMD_LABEL  = 0x81,  // [preset][key][ascii ≤8] — live label override
+  HCMD_STATUS = 0x82,  // [ascii ≤23] — status-bar line; empty clears
   HCMD_PRESET = 0x83,  // [preset] — foreground-follow switches the pad
   HCMD_FACE   = 0x84,  // [mode 0-2][persona 0-3]
   HCMD_COLOR  = 0x85,  // [preset][rgb565 hi][rgb565 lo] — preset accent + eye color
   HCMD_KEY    = 0x86,  // [preset][key][kaType][mod][hid][cons lo][cons hi][label…]
   HCMD_COMMIT = 0x87,  // persist presets to NVS (send once after a setKey burst)
-  HCMD_TEXT   = 0x88,  // [preset][key][utf8 ≤23] — text payload for a KA_TEXT key
+  HCMD_TEXT   = 0x88,  // [preset][key][ascii ≤23] — text payload for a KA_TEXT key
+                       // ASCII only: the companion's Sanitize() maps anything
+                       // outside 0x20-0x7E to '?' before it reaches the wire.
   HCMD_EYES   = 0x89,  // [rgb565 hi][rgb565 lo][persist] — eye color, 0 = follow preset
   HCMD_MEDIA  = 0x8A,  // [flags][pos lo][hi][dur lo][hi][title ≤20]
                        // flags: bit0 = playing, bit1 = favorited,
@@ -435,6 +649,24 @@ enum : uint8_t {  // host → device
                        // encoder puck. flags: bit0 = muted.
                        // BLE HID volume is relative, so this is the only path
                        // by which the pad or puck can know the real level.
+  HCMD_MOOD   = 0x8D,  // [valence i8 ±100][arousal i8 ±100][weight 0-100][ttl s][flags]
+                       // The companion's opinion of the mood. Blended over the
+                       // pad's own by weight and dropped when ttl lapses, so a
+                       // dead companion fades the face back to autonomous.
+                       // flags: bit0 = late-night context, bit1 = focused (IDE)
+  HCMD_BEAT   = 0x8E,  // [bpm×10 lo][hi][ms since last beat lo][hi][confidence 0-100]
+                       // Tempo + phase only — the pad keeps time itself. Sent on
+                       // drift, never per beat: BLE jitter exceeds the accuracy.
+                       // 0x8F (face v2 feature bits) is retired: face v3 has one look.
+  HCMD_CONFIG = 0x90,  // ['C']['F'] — enter WiFi config mode (BLE drops, SoftAP up)
+                       // so the companion can OTA a new build unattended.
+                       // The two magic bytes keep a stray write from triggering it.
+  HCMD_EMOTE  = 0x91,  // [emote id][intensity 0-100][hold ×100 ms, 0 = default]
+                       // Plays now: host-side events (drop, app context, ...).
+  HCMD_EMOTEMAP = 0x92,// [persist][n] + n × [trigger][emote|0xFF random][chance %][cooldown s]
+                       // Pad-side trigger table, ≤ 6 entries per write (26-byte
+                       // payload cap); persist on the last chunk writes NVS "emap".
+  HCMD_DANCE  = 0x93,  // [level 0-100][flair every N bars, 0 = never][persist]
 };
 
 NimBLECharacteristic* pEvtChar = nullptr;
@@ -468,6 +700,20 @@ volatile bool mediaNewSong = false, mediaJustFaved = false;
 // is not an "ooh, new track" moment.
 bool mediaIsMusic = false;
 
+// Companion mood (HCMD_MOOD). 0..1 on both axes like the pad's own mood; the
+// face blends toward it by hostMoodW until the ttl lapses, then eases back.
+float    hostMoodV = 0.5f, hostMoodA = 0.5f, hostMoodW = 0.0f;
+unsigned long hostMoodRxMs = 0, hostMoodTtlMs = 0;
+uint8_t  hostMoodFlags = 0;
+#define HMOOD_LATE    0x01
+#define HMOOD_FOCUSED 0x02
+
+// Beat clock (HCMD_BEAT). The pad keeps time from the anchor; the companion
+// only corrects drift. Stale after 8 s, and then the plain bob takes over.
+float    beatPeriodMs = 0;
+unsigned long beatAnchorMs = 0, beatRxMs = 0;
+uint8_t  beatConf = 0;
+
 class EvtCB : public NimBLECharacteristicCallbacks {
   void onSubscribe(NimBLECharacteristic* c, NimBLEConnInfo& info,
                    uint16_t subValue) override {
@@ -496,12 +742,6 @@ void faceSlotGlance(int slot);    // fwd
 void enterConfigMode();           // fwd
 void clampFaceCfg();              // fwd
 
-int slotForAddress(const uint8_t addr[6]) {
-  for (int i = 0; i < NUM_SLOTS; i++)
-    if (hostSlots[i].bonded && memcmp(hostSlots[i].addr, addr, 6) == 0) return i;
-  return -1;
-}
-
 class ServerCB : public NimBLEServerCallbacks {
   void onConnect(NimBLEServer* s, NimBLEConnInfo& info) override {
     Serial.printf("[BLE] connect h=%u peer=%s\n",
@@ -526,32 +766,32 @@ class ServerCB : public NimBLEServerCallbacks {
     }
     NimBLEAddress id = info.getIdAddress();
     const uint8_t* idBytes = id.getBase()->val;
-    int knownSlot = slotForAddress(idBytes);
 
+    // Slot ownership is decided by the ADDRESS the host connected to — each
+    // slot advertises its own, so whoever bonded through it is that slot's
+    // host by construction. The peer address must NOT be used to claim
+    // "this host belongs to another slot": a dual-boot machine presents the
+    // same peer address under both OSes, and keying on it locked the whole
+    // machine to whichever slot it bonded first (slots 1/3 dead, only 2 alive).
     if (pairingMode) {
-      if (knownSlot >= 0 && knownSlot != activeSlot) {
-        // A host already bonded to a DIFFERENT slot grabbed the open
-        // advertising — kick it, keep waiting for a genuinely new device
-        pendingBleEvent = EVT_WRONG_HOST;
-        pServer->disconnect(info.getConnHandle());
-        return;
-      }
       memcpy(hostSlots[activeSlot].addr, idBytes, 6);
       hostSlots[activeSlot].type   = id.getBase()->type;
       hostSlots[activeSlot].bonded = 1;
       pairingMode = false;
       saveSlots();
       pendingBleEvent = EVT_PAIRED;
-    } else {
-      // Enforce Easy-Switch in software: only kick a host we POSITIVELY know
-      // belongs to a different slot. A host that resolves to knownSlot == -1
-      // (address didn't map cleanly) is kept — better than wrongly rejecting
-      // the legitimate active host and breaking reconnection.
-      if (knownSlot >= 0 && knownSlot != activeSlot) {
-        pendingBleEvent = EVT_WRONG_HOST;
-        pServer->disconnect(info.getConnHandle());
-      }
+    } else if (!hostSlots[activeSlot].bonded ||
+               memcmp(hostSlots[activeSlot].addr, idBytes, 6) != 0) {
+      // Bonded outside pairing mode (host forgot us and re-paired to this
+      // slot's address, or a stale record) — adopt it as this slot's host.
+      memcpy(hostSlots[activeSlot].addr, idBytes, 6);
+      hostSlots[activeSlot].type   = id.getBase()->type;
+      hostSlots[activeSlot].bonded = 1;
+      saveSlots();
     }
+    // Keys are persisted by NimBLE only after this callback returns — the
+    // loop task takes the per-slot copy (no-op if nothing changed).
+    pendingBondSnap = (int8_t)activeSlot;
   }
   void onDisconnect(NimBLEServer* s, NimBLEConnInfo& info, int reason) override {
     Serial.printf("[BLE] disconnect reason=%d\n", reason);
@@ -601,6 +841,11 @@ void startAdvertisingForSlot() {
   while (NimBLEDevice::getWhiteListCount() > 0)
     NimBLEDevice::whiteListRemove(NimBLEDevice::getWhiteListAddress(0));
 
+  // Only safe point to change identity: advertising is stopped and any link
+  // is already down (onDisconnect routes here after its 200 ms settle).
+  applySlotAddress(activeSlot);
+  restoreSlotBond(activeSlot);
+
   pAdv->setScanFilter(false, false);   // open — bonded hosts resolve via bond DB
   configureAdvertising();
   pAdv->start();
@@ -612,10 +857,7 @@ void startAdvertisingForSlot() {
 // opens pairing (Pebble Keys long-press behaviour).
 void switchToSlot(int n, bool forcePair) {
   if (n < 0 || n >= NUM_SLOTS) return;
-  if (forcePair && hostSlots[n].bonded) {
-    NimBLEDevice::deleteBond(NimBLEAddress(hostSlots[n].addr, hostSlots[n].type));
-    hostSlots[n].bonded = 0;
-  }
+  if (forcePair && hostSlots[n].bonded) dropSlotBond(n);
   activeSlot  = n;
   pairingMode = forcePair || !hostSlots[n].bonded;
   faceSlotGlance(n);          // face glances toward the new slot if visible soon
@@ -629,8 +871,7 @@ void switchToSlot(int n, bool forcePair) {
 
 void clearSlotBond(int n) {
   if (n < 0 || n >= NUM_SLOTS || !hostSlots[n].bonded) return;
-  NimBLEDevice::deleteBond(NimBLEAddress(hostSlots[n].addr, hostSlots[n].type));
-  hostSlots[n].bonded = 0;
+  dropSlotBond(n);
   saveSlots();
   if (n == activeSlot) {
     pairingMode = true;
@@ -641,7 +882,8 @@ void clearSlotBond(int n) {
 
 void clearAllBonds() {
   NimBLEDevice::deleteAllBonds();
-  for (int i = 0; i < NUM_SLOTS; i++) hostSlots[i].bonded = 0;
+  for (int i = 0; i < NUM_SLOTS; i++) dropSlotBond(i);
+  bondLoadedSlot = -1;
   pairingMode = true;
   saveSlots();
   if (bleConnected) pServer->disconnect(bleConnHandle);
@@ -1269,19 +1511,9 @@ Preferences prefs;
 TFT_eSPI    tft    = TFT_eSPI();
 TFT_eSprite sprBar = TFT_eSprite(&tft);   // 320×26 status bar
 TFT_eSprite sprCell= TFT_eSprite(&tft);   // 78×68 reusable key cell
-TFT_eSprite sprEye = TFT_eSprite(&tft);   // 92×110 reusable eye canvas (face)
-#define EYE_SPR_W 92
-#define EYE_SPR_H 110
-
-// Mouth lives in the band between the eye sprites (which end at y=175) and
-// the now-playing strip (y=214). 36px tall keeps it clear of both, so the
-// three never overlap and no sprite can leave trails on another.
-TFT_eSprite sprMouth = TFT_eSprite(&tft);
-#define MOUTH_SPR_W 116           // wide enough to slide with a glance
-#define MOUTH_SPR_H 36
-#define MOUTH_CY    194           // sprite centre — spans y 176..212
-#define MOUTH_CURVE_PX 12         // max corner rise/fall at |curve| = 100
-#define MOUTH_OPEN_PX  18         // max gap at openPct = 100
+TFT_eSprite sprFace = TFT_eSprite(&tft);  // 240×150 4-bit face canvas (18 KB), allocated once
+// Allocated in setup() and never resized: runtime resizing fragmented the
+// heap, and a second set of face sprites crash-looped the pad (2026-09-23).
 
 // Landscape cell grid: 4 cols × 3 rows below the 26px status bar
 static inline int cellX(int i){ return 1 + (i % 4) * 80; }
@@ -1318,6 +1550,9 @@ void faceEnter(); void faceWake(); void faceSleepClose();
 void puckLabelReset(); bool puckLinked();
 void updateFace(unsigned long now); void faceGifTick(unsigned long now);
 void faceSlotGlance(int slot); void faceKeyReact(int i);
+void faceTrigger(uint8_t trg);
+void faceEmoteEx(uint8_t ex, float amp, uint16_t holdMs, uint16_t waitMs);
+void faceBuildPalette(uint16_t c); uint16_t faceEyeColor();
 
 // ════════════════════════════════════════════════
 //  PERSISTENCE (NVS)
@@ -1332,6 +1567,7 @@ void loadState() {
   activeSlot          = constrain(prefs.getInt("slot", 0), 0, NUM_SLOTS-1);
   if (prefs.getBytesLength("slots") == sizeof(hostSlots))
     prefs.getBytes("slots", hostSlots, sizeof(hostSlots));
+  loadSlotBonds();
   if (prefs.getInt("pver", 0) == PRESETS_VER &&
       prefs.getBytesLength("presets") == sizeof(presets))
     prefs.getBytes("presets", presets, sizeof(presets));
@@ -1343,6 +1579,11 @@ void loadState() {
   // Persona is its own key, so an old "fcfg" blob still loads unchanged
   facePersona = min((uint8_t)(NUM_PERSONAS - 1), (uint8_t)prefs.getUChar("fpers", 0));
   mediaShow   = prefs.getUChar("media", 1) ? 1 : 0;
+  // Face v3 emote map + dance: own keys, written only by the companion editor
+  if (prefs.getBytesLength("emap") == sizeof(emoteMap))
+    prefs.getBytes("emap", emoteMap, sizeof(emoteMap));
+  danceLevel  = min((uint8_t)100, (uint8_t)prefs.getUChar("dlvl", danceLevel));
+  flairBars   = min((uint8_t)64,  (uint8_t)prefs.getUChar("dflr", flairBars));
   // Off by default: a pad with no puck should never bring up the WiFi stack
   puckEnabled = prefs.getBool("puck", false);
   puckSpeed   = constrain((int)prefs.getUChar("pspd", PUCK_SPEED_DEF),
@@ -1365,7 +1606,7 @@ void clampFaceCfg() {
   faceCfg.pairScalePct = constrain(faceCfg.pairScalePct, 100, 130);
   faceCfg.idleS = constrain(faceCfg.idleS, 3, 120);
   // Keep the mouth inside its sprite — a wider one would be clipped, not scaled
-  faceCfg.mouthW     = constrain(faceCfg.mouthW, 20, MOUTH_SPR_W - 8);
+  faceCfg.mouthW     = constrain(faceCfg.mouthW, 20, 108);
   faceCfg.mouthThick = constrain(faceCfg.mouthThick, 2, 12);
   if (faceCfg.mouthOn > 1) faceCfg.mouthOn = 1;
 }
@@ -1738,8 +1979,15 @@ void drawDevices() {
     tft.setCursor(14, y + 32);
     if (hostSlots[i].bonded) {
       const uint8_t* a = hostSlots[i].addr;
-      tft.printf("%02X:%02X:%02X:%02X:%02X:%02X", a[5], a[4], a[3], a[2], a[1], a[0]);
+      tft.printf("host %02X:%02X:%02X:%02X:%02X:%02X", a[5], a[4], a[3], a[2], a[1], a[0]);
     } else tft.print("empty — hold key to pair");
+    // The address this slot ADVERTISES: what the host sees when pairing, and
+    // what the companion's DeviceAddress must be set to for that slot.
+    { const uint8_t* s = slotAddr[i].val;
+      tft.setTextColor(C_BORDER, C_SURF);
+      tft.setCursor(14, y + 41);
+      tft.printf("pad  %02X:%02X:%02X:%02X:%02X:%02X",
+                 s[5], s[4], s[3], s[2], s[1], s[0]); }
     if (act) {
       tft.setTextColor(col, C_SURF);
       tft.setCursor(230, y + 8);
@@ -1899,8 +2147,9 @@ void hostNotifyActions(uint8_t page) {
 void hostLinkTick() {
   if (hostHelloPending) {
     hostHelloPending = false;
-    uint8_t ev[8] = { HEV_HELLO, 6, 5 /*fw major*/, NUM_KEYS, NUM_PRESETS,
-                      (uint8_t)activePreset, faceMode, facePersona };
+    // faceCaps appended last: a companion that reads 6 bytes never notices it
+    uint8_t ev[9] = { HEV_HELLO, 7, 5 /*fw major*/, NUM_KEYS, NUM_PRESETS,
+                      (uint8_t)activePreset, faceMode, facePersona, FACE_CAPS };
     hostNotify(ev, sizeof(ev));
   }
   while (hostCmdTail != hostCmdHead) {
@@ -1909,7 +2158,7 @@ void hostLinkTick() {
     const uint8_t* p = q.data + 2;
     if ((size_t)(2 + n) <= q.len) switch (op) {
 
-      case HCMD_LABEL:                     // [preset][key][utf8 ≤8]
+      case HCMD_LABEL:                     // [preset][key][ascii ≤8]
         if (n >= 2 && p[0] < NUM_PRESETS && p[1] < NUM_KEYS) {
           KeyAction& ka = presets[p[0]].keys[p[1]];
           int L = min((int)n - 2, 8);
@@ -1918,7 +2167,7 @@ void hostLinkTick() {
         }
         break;
 
-      case HCMD_STATUS: {                  // [utf8 ≤23]; empty clears
+      case HCMD_STATUS: {                  // [ascii ≤23]; empty clears
         int L = min((int)n, (int)sizeof(hostStatus) - 1);
         memcpy(hostStatus, p, L); hostStatus[L] = '\0';
         if (currentScreen == SCR_MAIN)
@@ -1985,7 +2234,7 @@ void hostLinkTick() {
         }
         break;
 
-      case HCMD_TEXT:                      // [preset][key][utf8 ≤23]
+      case HCMD_TEXT:                      // [preset][key][ascii ≤23]
         if (n >= 2 && p[0] < NUM_PRESETS && p[1] < NUM_KEYS) {
           KeyAction& ka = presets[p[0]].keys[p[1]];
           int L = min((int)n - 2, 23);
@@ -2027,6 +2276,65 @@ void hostLinkTick() {
 
       case HCMD_ACTIONS:                   // [page]
         if (n >= 1) hostNotifyActions(p[0]);
+        break;
+
+      case HCMD_MOOD:                      // [v i8][a i8][weight][ttl s][flags]
+        if (n >= 4) {
+          hostMoodV     = constrain(((int8_t)p[0] + 100) / 200.0f, 0.0f, 1.0f);
+          hostMoodA     = constrain(((int8_t)p[1] + 100) / 200.0f, 0.0f, 1.0f);
+          hostMoodW     = min(p[2], (uint8_t)100) / 100.0f;
+          hostMoodTtlMs = (unsigned long)p[3] * 1000UL;
+          hostMoodFlags = (n >= 5) ? p[4] : 0;
+          hostMoodRxMs  = millis();
+        }
+        break;
+
+      case HCMD_EMOTE:                     // [emote][intensity][hold ×100 ms]
+        if (n >= 1 && p[0] < EX_COUNT)
+          faceEmoteEx(p[0], (n >= 2 && p[1]) ? min(p[1], (uint8_t)100) / 100.0f : 1.0f,
+                      (n >= 3) ? (uint16_t)p[2] * 100 : 0, 1500);
+        break;
+
+      case HCMD_EMOTEMAP:                  // [persist][n] + n × [trg][emote][chance][cooldown]
+        if (n >= 2) {
+          for (uint8_t i = 0; i < p[1] && 2 + i * 4 + 3 < n; i++) {
+            const uint8_t* e = p + 2 + i * 4;
+            if (e[0] >= TRG_PAD_N) continue;
+            if (e[1] >= EX_COUNT && e[1] != EMOTE_RANDOM) continue;
+            emoteMap[e[0]] = { e[1], min(e[2], (uint8_t)100), e[3] };
+          }
+          if (p[0]) prefs.putBytes("emap", emoteMap, sizeof(emoteMap));
+        }
+        break;
+
+      case HCMD_DANCE:                     // [level][flairBars][persist]
+        if (n >= 2) {
+          danceLevel = min(p[0], (uint8_t)100);
+          flairBars  = min(p[1], (uint8_t)64);
+          if (n >= 3 && p[2]) { prefs.putUChar("dlvl", danceLevel); prefs.putUChar("dflr", flairBars); }
+        }
+        break;
+
+      case HCMD_CONFIG:                    // ['C']['F'] — no return: reboots on exit
+        if (n >= 2 && p[0] == 'C' && p[1] == 'F') {
+          saveSettings();
+          enterConfigMode();                 // BLE is torn down from here on,
+          hostCmdTail = hostCmdHead;         // so drop anything still queued
+          return;
+        }
+        break;
+
+      case HCMD_BEAT:                      // [bpm×10 lo][hi][phase ms lo][hi][conf]
+        if (n >= 5) {
+          uint16_t bpm10 = (uint16_t)(p[0] | (p[1] << 8));
+          uint16_t since = (uint16_t)(p[2] | (p[3] << 8));
+          if (bpm10 >= 400 && bpm10 <= 2400) {     // 40..240 BPM; else "no beat"
+            beatPeriodMs = 600000.0f / bpm10;
+            beatAnchorMs = millis() - since;
+            beatConf     = min(p[4], (uint8_t)100);
+            beatRxMs     = millis();
+          } else beatConf = 0;
+        }
         break;
 
       case HCMD_VOLUME:                    // [level][flags]
@@ -2469,6 +2777,7 @@ void onKeyTap(int i) {
         hostStatus[0] = '\0';        // app status belongs to the old context
         saveSettings();
         hostNotifyPreset();          // manual switch — tell the companion
+        faceTrigger(TRG_PRESET);
         currentScreen = SCR_MAIN; drawMain();
       } else if (i == 11 || i == KEY_FN) {
         currentScreen = SCR_MAIN; drawMain();
@@ -2637,34 +2946,114 @@ void onKeyUp(int i, unsigned long heldMs) {
 }
 
 // ════════════════════════════════════════════════
-//  FACE — state-reactive robot eyes + optional GIF loop
-//  Procedural: every visual parameter comes from faceCfg (the uploadable
-//  "expression pack"), state from live BLE globals. Renders both eyes
-//  through one reused sprite — no full-screen clears while animating.
+//  FACE v3 — one visor face + optional GIF loop
+//  Eyes and mouth are signed-distance shapes rendered into sprFace (240×150,
+//  4-bit, 16-level glow palette). Every shape number is a spring, so any
+//  expression glides into any other and nothing ever swaps renderers.
+//  Reference + tuning tool: firmware/v5/tools/face-preview.html.
 // ════════════════════════════════════════════════
-float eyeOpen = 1.0f, eyeOpenTarget = 1.0f;
-float eyeGlanceX = 0, eyeGlanceY = 0, eyeGlanceTX = 0, eyeGlanceTY = 0;
-bool  faceBlinking = false;
-unsigned long faceNextBlink = 0, faceBlinkEnd = 0;
-unsigned long faceNextGlance = 0, faceGlanceEnd = 0;
-unsigned long faceDartNext = 0;
-unsigned long faceFrameMs = 0;
+#define FACE_SW 240
+#define FACE_SH 150
+#define FACE_SX 40                // screen origin: under the puck label (y 34..50),
+#define FACE_SY 56                // over the now-playing strip (y 214)
+#define F_EYE_SEP  58.0f
+#define F_EYE_Y    50.0f
+#define F_MOUTH_Y 108.0f
+#define F_PIV_X   120.0f          // transform pivot (dance tilt / squash)
+#define F_PIV_Y    80.0f
+#define F_GLOW      4.0f          // halo reach outside an edge (px)
+#define F_ZETA      0.72f         // spring damping: a touch of overshoot
+#define F_DT       (1.0f / 30.0f) // fixed sim step, identical to the preview
 
-// Expression state — everything below eases toward its *T target each frame,
-// so callers only ever set targets and never animate anything by hand.
-float lidTop = 0, lidTopT = 0;          // 0..1 top lid coverage
-float lidAngle = 0, lidAngleT = 0;      // -1..1 (+ sad / - angry)
-float lidBot = 0, lidBotT = 0;          // 0..1 happy crescent
-float mouthWid = 1,  mouthWidT = 1;     // width scale, 1 = faceCfg.mouthW
-float mouthCrv = 0,  mouthCrvT = 0;     // -1 frown .. +1 smile
-float mouthOpn = 0,  mouthOpnT = 0;     // 0 closed line .. 1 fully open
-float eyeScaleW = 1, eyeScaleWT = 1;    // size multipliers on top of faceCfg
-float eyeScaleH = 1, eyeScaleHT = 1;
-uint8_t eyeWinkMask = 0;                // bit0 left eye shut, bit1 right
+// Expressions — eye: w h r lidT lidA lidB cres heart hollow dx dy
+//                mouth: mw curve thick open depth wedge skew round rO my
+// lidA > 0 drops the INNER lid corner (angry), < 0 the outer (sad).
+// R is written out in full; mirroring is done by the renderer.
+#define EY(...) { __VA_ARGS__ }
+const FaceP EXPR[EX_COUNT] = {
+  /* neutral   */ { EY(15,22,15, 0,0,0, 0,0,0, 0,0),     EY(15,22,15, 0,0,0, 0,0,0, 0,0),     { 24, 7,2.6f, 0,   0, 0, 0,    0,8,0 } },
+  /* happy     */ { EY(19,17,17, 0,0,0, 1,0,0, 0,0),     EY(19,17,17, 0,0,0, 1,0,0, 0,0),     { 32, 3,2.6f, 1,  24, 0, 0,    0,8,0 } },
+  /* joy       */ { EY(20,18,18, 0,0,0, 1,0,0, 0,0),     EY(20,18,18, 0,0,0, 1,0,0, 0,0),     { 34, 4,2.6f, 1,  28, 0, 0,    0,8,0 } },
+  /* love      */ { EY(19,19,19, 0,0,0, 0,1,0, 0,0),     EY(19,19,19, 0,0,0, 0,1,0, 0,0),     { 22, 8,2.6f, .35f,10, 0, 0,   0,8,0 } },
+  /* surprised */ { EY(20,22,20, 0,0,0, 0,0,1, 0,0),     EY(20,22,20, 0,0,0, 0,0,1, 0,0),     {  8, 0,2.4f, 0,   0, 0, 0,    1,8,0 } },
+  /* angry     */ { EY(21,17,6, .42f,.62f,0, 0,0,0, 0,0), EY(21,17,6, .42f,.62f,0, 0,0,0, 0,0), { 28,-2,2.4f, 1,  20, 1,-.18f, 0,8,0 } },
+  /* sad       */ { EY(16,21,16, .22f,-.38f,0, 0,0,0, 0,3), EY(16,21,16, .22f,-.38f,0, 0,0,0, 0,3), { 20,-8,2.6f, 0, 0, 0, 0,  0,8,0 } },
+  /* tired     */ { EY(19,3.5f,3.5f, 0,0,0, 0,0,0, 0,0), EY(19,3.5f,3.5f, 0,0,0, 0,0,0, 0,0), { 22,-9,2.6f, 0,   0, 0, 0,    0,8,0 } },
+  /* sleepy    */ { EY(17,20,17, .62f,-.1f,0, 0,0,0, 0,0), EY(17,20,17, .62f,-.1f,0, 0,0,0, 0,0), { 10, 2,2.4f, 0, 0, 0, 0,    0,8,0 } },
+  /* focused   */ { EY(18,20,12, .34f,.18f,.24f, 0,0,0, 0,0), EY(18,20,12, .34f,.18f,.24f, 0,0,0, 0,0), { 14, 0,2.4f, 0, 0, 0, 0, 0,8,0 } },
+  /* wink      */ { EY(15,22,15, 0,0,0, 0,0,0, 0,0),     EY(17,15,15, 0,0,0, 1,0,0, 0,0),     { 24, 9,2.6f, .25f, 8, 0,.06f, 0,8,0 } },
+  /* skeptical */ { EY(16,22,16, 0,0,0, 0,0,0, 0,0),     EY(17,20,12, .48f,0,0, 0,0,0, 0,0),  { 18, 1,2.4f, 0,   0, 0,.22f, 0,8,0 } },
+  /* vibing    */ { EY(18,16,16, 0,0,0, 1,0,0, 0,0),     EY(18,16,16, 0,0,0, 1,0,0, 0,0),     { 22, 8,2.6f, 0,   0, 0, 0,    0,8,0 } },
+  /* dizzy     */ { EY(17,17,17, 0,0,0, 0,0,1, 0,0),     EY(17,17,17, 0,0,0, 0,0,1, 0,0),     { 20, 0,2.4f, 0,   0, 0, 0,    0,8,0 } },
+};
+#undef EY
+
+// Emotes: expression + hold + motion. omega = spring speed (rad/s): a
+// surprise snaps, a sad face sags.
+enum : uint8_t { MO_NONE, MO_HOP, MO_BOUNCE, MO_PULSE, MO_JOLT, MO_SHAKE, MO_DROOP,
+                 MO_TILT, MO_ORBIT, MO_ZZZ };
+struct EmoteDef { uint16_t holdMs; uint8_t omega; uint8_t motion; };
+const EmoteDef EMOTES[EX_COUNT] = {
+  {  900, 14, MO_NONE  }, { 1400, 16, MO_HOP   }, { 1800, 18, MO_BOUNCE }, { 2200, 12, MO_PULSE },
+  { 1100, 30, MO_JOLT  }, { 1500, 22, MO_SHAKE }, { 2000,  8, MO_DROOP  }, { 2000,  7, MO_DROOP },
+  { 3000,  6, MO_ZZZ   }, { 2000, 12, MO_NONE  }, {  900, 24, MO_NONE   }, { 1600, 14, MO_TILT  },
+  { 1600, 12, MO_NONE  }, { 1800, 14, MO_ORBIT },
+};
+const uint8_t FLAIR_POOL[] = { EX_VIBING, EX_WINK, EX_JOY, EX_HAPPY };
+
+// Resting face = a point on valence × arousal, blended bilinearly over nine
+// cells. Rows arousal (low → high), columns valence (neg → pos). Each cell is
+// an expression at a strength, blended from neutral.
+struct MoodCell { uint8_t ex, pct; };
+const MoodCell MOOD_GRID[3][3] = {
+  { { EX_SAD,   55 }, { EX_SLEEPY,    45 }, { EX_VIBING, 55 } },
+  { { EX_ANGRY, 30 }, { EX_NEUTRAL,  100 }, { EX_HAPPY,  40 } },
+  { { EX_ANGRY, 75 }, { EX_SURPRISED, 30 }, { EX_JOY,    85 } },
+};
+
+// ── State ───────────────────────────────────────
+FaceP  fCur, fVel;                      // spring positions / velocities
+FaceXf fX = { 0, 0, 1, 1, 0 }, fXv = { 0, 0, 0, 0, 0 };
+float  fAcc = 0, fT = 0;                // sim accumulator + clock (s)
+float  fZzz = 0;                        // Zzz glyph fade 0..1
+uint8_t* fBuf = nullptr;                // sprFace pixels, 2 px per byte
+FRect  fRect[4], fRectPrev[4];          // L eye, R eye, mouth, Zzz
+bool   fFullPush = true;
+uint16_t facePal[16];
+uint16_t facePalFor = 1;                // colour the palette was built for (1 = never)
+uint16_t faceColNow = 0x3DFF;
+
+unsigned long faceFrameMs = 0;
+unsigned long faceNextBlink = 0, faceBlinkStart = 0;
+bool          faceDblBlink = false;
+unsigned long faceNextGlance = 0, faceNextSaccade = 0, faceNextSquint = 0, faceDartNext = 0;
+unsigned long faceKeyGlanceUntil = 0;
+float glX = 0, glY = 0;                 // glance target (eye px)
+float keyGX = 0, keyGY = 0;             // short glance toward a pressed key
+
+int8_t        emoteEx = -1;             // playing emote, -1 = none
+unsigned long emoteStart = 0;
+uint16_t      emoteHold = 0;
+float         emoteAmp = 1.0f;          // motion amplitude
+int8_t        emotePendEx = -1;         // queued while the face is off-screen
+unsigned long emotePendingUntil = 0;
+float         emotePendAmp = 1.0f;
+uint16_t      emotePendHold = 0;
+bool          faceBootPending = true;   // first face entry after power-on
+unsigned long emoteMapLast[TRG_PAD_N];  // last attempt per trigger (cooldown)
+bool          faceIdleFired = false, faceWasPlaying = false;
+
+int8_t  danceMove = 0;
+int32_t danceLastBar = -1, danceFlairBar = 0;
+
+// What the face actually shows: the pad's own mood blended with the
+// companion's, eased so a new host opinion glides in rather than snapping.
+float faceMoodV = 0.5f, faceMoodA = 0.5f;
+float hostMix = 0.0f;                   // eased hostMoodW actually applied
+bool  ctxFocused = false, ctxLate = false;
 
 // Mood: two slow scalars in 0..1. Energy tracks how much you have been using
-// the pad, valence how well things are going (BLE up/down). They bias the
-// resting pose so the face has a baseline mood, not just reactions.
+// the pad, valence how well things are going (BLE up/down).
 float moodEnergy = 0.5f, moodValence = 0.5f;
 unsigned long moodTickMs = 0;
 uint8_t  typeBurstCount = 0;      // presses in the current 4s burst window
@@ -2672,41 +3061,14 @@ unsigned long typeBurstStart = 0;
 uint8_t  moodKeyCount = 0;        // presses since the last 5s mood sample
 float    typeRateEma = 0;
 
-// Emote player — one transient animation at a time, always time-boxed
-// Global emote playback stretch. 100 = keyframe tables exactly as written;
-// higher = slower and longer. One knob rather than rewriting every table, so
-// the tMs columns stay readable as relative beats.
-#define EMOTE_TIME_PCT 165
-
-// Global stretch × the persona's own. Clamped so a bad persona edit can't
-// stall an emote forever — they are time-boxed for a reason.
-static inline uint16_t emoteTimePct(const Personality& P) {
-  uint32_t v = ((uint32_t)EMOTE_TIME_PCT * (P.timePct ? P.timePct : 100)) / 100UL;
-  if (v < 50)  v = 50;
-  if (v > 400) v = 400;
-  return (uint16_t)v;
-}
-
-const Emote*  emoteCur = nullptr;
-unsigned long emoteStart = 0;
-int8_t        emoteGx = 0, emoteGy = 0;   // direction supplied by the trigger
-const Emote*  emotePending = nullptr;     // queued while the face is off-screen
-unsigned long emotePendingUntil = 0;
-int8_t        emotePendGx = 0, emotePendGy = 0;
-bool          faceBootPending = true;     // first face entry after power-on
-
-// Micro-behaviours
-unsigned long faceNextSaccade = 0;
-unsigned long faceLastYawn = 0;
-unsigned long faceNextSquint = 0;
-bool          faceDblBlink = false;
-
-static inline uint32_t frnd(uint32_t lo, uint32_t hi) {   // [lo, hi] ms
+static inline uint32_t frnd(uint32_t lo, uint32_t hi) {   // [lo, hi]
   return lo + (esp_random() % (hi - lo + 1));
 }
+static inline float frndf(float lo, float hi) {
+  return lo + (esp_random() / 4294967295.0f) * (hi - lo);
+}
 
-// Scale a faceCfg interval by a persona percentage, never below 1s —
-// frnd(lo, hi) needs hi >= lo and a degenerate range would spin.
+// Scale a faceCfg interval by a persona percentage, never below 1s
 static unsigned long personaMs(uint8_t seconds, uint8_t pct) {
   unsigned long ms = (unsigned long)seconds * 1000UL * pct / 100UL;
   return ms < 1000UL ? 1000UL : ms;
@@ -2716,260 +3078,525 @@ uint16_t faceEyeColor() {
   return faceCfg.color ? faceCfg.color : PRESET_COLORS[activePreset];
 }
 
-// Draw one eye into sprEye and push at center (cx, cy).
-// The eye itself is one rounded rect; expression comes from painting lids
-// back over it in the background colour, which costs 2-3 primitives and
-// keeps every shape inside the sprite the frame already had to clear.
-void drawEyeAt(int cx, int cy, float open, float wScale, bool isLeft) {
-  sprEye.fillSprite(C_BG);
-  if (eyeWinkMask & (isLeft ? 1 : 2)) open = 0.04f;   // this eye is winking
-  int w = (int)(faceCfg.eyeW * wScale * eyeScaleW);
-  int h = max(6, (int)(faceCfg.eyeH * open * eyeScaleH));
-  w = min(w, EYE_SPR_W - 4); h = min(h, EYE_SPR_H - 4);
-  int gx = (int)eyeGlanceX, gy = (int)eyeGlanceY;
-  int x = (EYE_SPR_W - w) / 2 + gx;
-  int y = (EYE_SPR_H - h) / 2 + gy;
-  x = constrain(x, 0, EYE_SPR_W - w);
-  y = constrain(y, 0, EYE_SPR_H - h);
-  int r = min((int)faceCfg.rnd, h / 2);
-  r = min(r, w / 2);
-  sprEye.fillRoundRect(x, y, w, h, r, faceEyeColor());
-
-  // Top lid: a flat band plus a wedge. The wedge is deeper on the outer
-  // edge for sadness and on the inner edge for anger — mirrored per eye,
-  // which is what makes a pair of rectangles read as a facial expression.
-  int flat = (int)(lidTop * h);
-  if (flat > 0) sprEye.fillRect(x, y, w, min(flat, h), C_BG);
-  if (lidAngle > 0.02f || lidAngle < -0.02f) {
-    int wedge = (int)(fabsf(lidAngle) * h * 0.55f);
-    int top   = y + flat;
-    bool deepOuter = (lidAngle > 0);                  // sad droops outward
-    bool deepLeft  = isLeft ? deepOuter : !deepOuter; // outer edge flips
-    if (deepLeft) sprEye.fillTriangle(x, top, x + w, top, x, top + wedge, C_BG);
-    else          sprEye.fillTriangle(x, top, x + w, top, x + w, top + wedge, C_BG);
-  }
-
-  // Bottom crescent: a circle rising into the eye from below carves the
-  // convex "^ ^" happy squint that a straight lid can't produce.
-  if (lidBot > 0.02f) {
-    int rad = w;
-    int cyc = y + h + rad - (int)(lidBot * h * 0.62f);
-    sprEye.fillCircle(x + w / 2, cyc, rad, C_BG);
-  }
-  sprEye.pushSprite(cx - EYE_SPR_W / 2, cy - EYE_SPR_H / 2);
+// Lerp two RGB565 colours per channel, t in 0..1.
+static uint16_t mix565(uint16_t a, uint16_t b, float t) {
+  int r = ((a >> 11) & 31), g = ((a >> 5) & 63), bl = (a & 31);
+  r  += (int)((((b >> 11) & 31) - r)  * t);
+  g  += (int)((((b >> 5)  & 63) - g)  * t);
+  bl += (int)(((b & 31)         - bl) * t);
+  return (uint16_t)((r << 11) | (g << 5) | bl);
 }
 
-// Mouth: a parabolic band. Corners rise for a smile, fall for a frown, and
-// the band thickens to open. Drawn column by column because a parabola gives
-// a far softer read than any combination of TFT_eSPI's arc primitives, and
-// at 76px wide that is 76 fillRects — trivial next to the eye sprites.
-void drawMouthAt(int cx, int cy) {
-  sprMouth.fillSprite(C_BG);
+// The user's eye colour, leaning at most 15 % warm (happy) or cool (low).
+// The media strip keeps the untinted colour — it is UI, not expression.
+#define TINT_WARM 0xFD89                // #FFB24D
+#define TINT_COOL 0x5BDF                // #5A7BFF
+uint16_t faceTintedColor() {
+  uint16_t base = faceEyeColor();
+  float t = (faceMoodV - 0.5f) * 2.0f;  // -1..1
+  if (t >  0.05f) return mix565(base, TINT_WARM,  t * 0.15f);
+  if (t < -0.05f) return mix565(base, TINT_COOL, -t * 0.15f);
+  return base;
+}
 
-  int w = (int)(faceCfg.mouthW * mouthWid);
-  w = constrain(w, 8, MOUTH_SPR_W - 4);
-  int th    = max(2, (int)faceCfg.mouthThick);
-  int curve = (int)(mouthCrv * MOUTH_CURVE_PX);
-  int openH = (int)(mouthOpn * MOUTH_OPEN_PX);
-
-  // Follow the glance so the face travels as one piece. Damped: a mouth moves
-  // less than the eyes, and the vertical band is only 36px so full follow
-  // would clip a wide-open mouth. This is also what makes the music bob read
-  // as the whole head nodding rather than the eyes sliding off the mouth.
-  int mgx = (int)(eyeGlanceX * 0.50f);
-  int mgy = (int)(eyeGlanceY * 0.30f);
-
-  int x0   = constrain((MOUTH_SPR_W - w) / 2 + mgx, 0, MOUTH_SPR_W - w);
-  int ymid = MOUTH_SPR_H / 2 + mgy;
-  uint16_t col = faceEyeColor();
-
-  for (int i = 0; i < w; i++) {
-    // t runs -1..1 across the mouth; t² is 0 at the centre and 1 at the
-    // corners, so the centre stays put and only the corners travel.
-    float t  = (w > 1) ? ((float)i / (w - 1)) * 2.0f - 1.0f : 0.0f;
-    int   dy = (int)(-curve * t * t);
-    int   h  = th + openH;
-    int   y  = ymid + dy - h / 2;
-    y = constrain(y, 0, MOUTH_SPR_H - h);
-    sprMouth.fillRect(x0 + i, y, 1, h, col);
+// 16 levels: 0 = background, 1..10 glow ramp, 11 = the eye colour,
+// 12..15 eye colour → near-white core. Only these 16 words change when the
+// colour or tint does, so recolouring costs nothing per pixel.
+void faceBuildPalette(uint16_t c) {
+  const float bg = 8.0f;                // C_BG 0x0841 ≈ (8,8,8)
+  float ch[3] = { ((c >> 11) & 31) * 255.0f / 31.0f, ((c >> 5) & 63) * 255.0f / 63.0f,
+                  (c & 31) * 255.0f / 31.0f };
+  facePal[0] = C_BG;
+  for (int i = 1; i < 16; i++) {
+    float k, w = 0;
+    if (i <= 11) k = powf(i / 11.0f, 1.8f); else { k = 1; w = (i - 11) / 4.0f * 0.62f; }
+    int o[3];
+    for (int j = 0; j < 3; j++) {
+      float v = ch[j] * (1 - w) + 255.0f * w;
+      o[j] = constrain((int)lroundf(bg + (v - bg) * k), 0, 255);
+    }
+    facePal[i] = (uint16_t)(((o[0] >> 3) << 11) | ((o[1] >> 2) << 5) | (o[2] >> 3));
   }
-
-  sprMouth.pushSprite(cx - MOUTH_SPR_W / 2, cy - MOUTH_SPR_H / 2);
+  sprFace.createPalette(facePal, 16);
+  facePalFor = c;
 }
 
-void drawFaceFrame(float open, float wScale) {
-  // Eye *positions* stay fixed while scale changes: the two 92px sprites sit
-  // shoulder to shoulder, so moving them would overlap and leave trails.
-  int half = faceCfg.gap / 2 + faceCfg.eyeW / 2;
-  drawEyeAt(160 - half, 120, open, wScale, true);
-  drawEyeAt(160 + half, 120, open, wScale, false);
-  if (faceCfg.mouthOn) drawMouthAt(160, MOUTH_CY);
+// ── Pose maths ──────────────────────────────────
+static void fLerp(FaceP& o, const FaceP& a, const FaceP& b, float k) {
+  const float* pa = (const float*)&a; const float* pb = (const float*)&b; float* po = (float*)&o;
+  for (unsigned i = 0; i < sizeof(FaceP) / sizeof(float); i++) po[i] = pa[i] + (pb[i] - pa[i]) * k;
+}
+static void exprAt(FaceP& o, uint8_t ex, float k) { fLerp(o, EXPR[EX_NEUTRAL], EXPR[ex], k); }
+
+static void moodPose(FaceP& o, float v, float a) {       // v, a in -1..1
+  float fx = constrain(v, -1.0f, 1.0f) + 1, fy = constrain(a, -1.0f, 1.0f) + 1;
+  int c0 = min(1, (int)floorf(fx)), r0 = min(1, (int)floorf(fy));
+  float u = fx - c0, w = fy - r0;
+  FaceP p00, p01, p10, p11, top, bot;
+  exprAt(p00, MOOD_GRID[r0][c0].ex,         MOOD_GRID[r0][c0].pct / 100.0f);
+  exprAt(p01, MOOD_GRID[r0][c0 + 1].ex,     MOOD_GRID[r0][c0 + 1].pct / 100.0f);
+  exprAt(p10, MOOD_GRID[r0 + 1][c0].ex,     MOOD_GRID[r0 + 1][c0].pct / 100.0f);
+  exprAt(p11, MOOD_GRID[r0 + 1][c0 + 1].ex, MOOD_GRID[r0 + 1][c0 + 1].pct / 100.0f);
+  fLerp(top, p00, p01, u); fLerp(bot, p10, p11, u); fLerp(o, top, bot, w);
 }
 
-// Push a pose into the eased targets. Emotes, personas and the mood engine
-// all land here, so they can never disagree about what a pose means.
-// withGlance is off for the resting pose: glance targets are event-driven and
-// persist between frames, so a per-frame rewrite would cancel every glance
-// the moment it started. Only a full override (an emote, pairing) sets them.
-void applyPose(const EyePose& p, float amp, bool withGlance = false) {
-  eyeOpenTarget = p.openPct / 100.0f;
-  lidTopT   = (p.lidTopPct / 100.0f) * amp;
-  lidAngleT = (p.lidTopAngle / 100.0f) * amp;
-  lidBotT   = (p.lidBotPct / 100.0f) * amp;
-  eyeScaleWT = 1.0f + ((p.wPct / 100.0f) - 1.0f) * amp;
-  eyeScaleHT = 1.0f + ((p.hPct / 100.0f) - 1.0f) * amp;
-  // mouthWPct 0 means "unset" rather than "zero width", so old keyframe
-  // tables that predate the mouth still render a normal one.
-  uint8_t mw = p.mouthWPct ? p.mouthWPct : 100;
-  mouthWidT = 1.0f + ((mw / 100.0f) - 1.0f) * amp;
-  mouthCrvT = (p.mouthCurve / 100.0f) * amp;
-  mouthOpnT = (p.mouthOpenPct / 100.0f) * amp;
-  if (withGlance) {
-    eyeGlanceTX = p.gx * amp;
-    eyeGlanceTY = p.gy * amp;
+// Semi-implicit Euler, one F_DT step, over n floats
+static void fSpring(float* x, float* v, const float* t, int n, float om) {
+  const float k = om * om, c = 2 * F_ZETA * om;
+  for (int i = 0; i < n; i++) {
+    v[i] += (k * (t[i] - x[i]) - c * v[i]) * F_DT;
+    x[i] += v[i] * F_DT;
   }
 }
 
-// ── Emotes ──────────────────────────────────────
-// Stepped keyframes: the frame loop's easing does the interpolation, so a
-// four-row table is enough to read as a fluid animation.
-//                          open lidT angle lidB   w    h  gx gy
-// The trailing three numbers are the mouth: width%, curve (− frown / + smile),
-// open%. They ease a little slower than the lids, so a keyframe that opens the
-// mouth and widens the eyes together still reads as one gesture.
-//                          open lidT angle lidB   w    h  gx gy  mW  mCrv mOpn
-const EmoteKey EK_BOOT[] = {
-  {   0, {   4, 90,   0,  0, 100, 100, 0, 0,  60,   0,  0 }, 0 },
-  { 380, {  55, 30,   0,  0, 100, 100, 0, 0,  80,  10,  0 }, 0 },
-  { 700, {  15, 70,   0,  0, 100, 100, 0, 0,  70,   0,  0 }, 0 },
-  { 950, { 100,  0,   0,  0, 106, 106, 0,-2, 106,  55, 15 }, 0 },
-};
-const EmoteKey EK_HAPPY[] = {
-  {   0, { 100,  0,   0, 25, 106, 106, 0,-6, 108,  70, 20 }, 0 },
-  { 220, {  70,  0,   0, 55, 100, 100, 0, 2, 112,  95, 34 }, 0 },
-  { 430, { 100,  0,   0, 25, 106, 106, 0,-5, 108,  75, 18 }, 0 },
-  { 650, {  85,  0,   0, 45, 100, 100, 0, 0, 105,  80,  8 }, 0 },
-};
-const EmoteKey EK_SAD[] = {
-  {   0, {  70, 20,  70,  0, 100,  96,-8, 4,  84, -70,  0 }, 0 },
-  { 450, {  62, 28,  80,  0, 100,  94, 8, 5,  80, -85,  0 }, 0 },
-  { 950, {  66, 24,  75,  0, 100,  95,-6, 5,  82, -78,  0 }, 0 },
-};
-const EmoteKey EK_WINK[] = {
-  {   0, { 100,  0,   0, 30, 100, 100, 0, 0, 104,  85, 10 }, 2 },   // right eye shut
-  { 260, { 100,  0,   0, 20, 100, 100, 0, 0, 100,  55,  0 }, 0 },
-};
-const EmoteKey EK_EXCITED[] = {
-  {   0, { 100,  0, -10,  0, 108, 108,-4,-4, 100,  60, 45 }, 0 },
-  { 160, { 100,  0,   0, 15, 108, 108, 4,-4, 110,  85, 60 }, 0 },
-  { 320, { 100,  0, -10,  0, 108, 108,-4,-4, 100,  60, 45 }, 0 },
-  { 480, { 100,  0,   0, 20, 104, 104, 0,-2, 106,  75, 20 }, 0 },
-};
-const EmoteKey EK_GLANCE[] = {
-  {   0, {  62,  0,   0, 10, 100, 100, 0, 0,   0,   0,  0 }, 0 },   // gx/gy from the trigger
-  { 190, { 100,  0,   0,  0, 100, 100, 0, 0,   0,   0,  0 }, 0 },
-};
-// The mouth earns its keep here: a yawn without one never really read as a yawn.
-const EmoteKey EK_YAWN[] = {
-  {   0, {  90,  5,   0,  0, 100, 106, 0, 0,  90,   0, 20 }, 0 },
-  { 260, { 100,  0,   0,  0, 104, 114, 0,-3,  84, -20, 75 }, 0 },
-  { 620, {   6, 80,   0,  0,  96, 100, 0, 3,  78, -30,100 }, 0 },
-  { 980, {  85, 12,  15,  0, 100, 100, 0, 1,  92,   5, 15 }, 0 },
-};
-const EmoteKey EK_SQUINT[] = {              // thoughtful squint — narrows, holds
-  {   0, {  62, 22,   0, 26, 103,  96, 0, 0,  70, -15,  0 }, 0 },
-  { 480, {  48, 32,   0, 36, 105,  92, 2, 1,  62, -25,  0 }, 0 },
-  {1050, {  56, 26,   0, 30, 104,  94,-2, 0,  66, -18,  0 }, 0 },
-  {1500, {  85,  8,   0, 10, 100, 100, 0, 0,  96,  15,  0 }, 0 },
-};
-#define EM_DEF(tbl, dur) { tbl, sizeof(tbl)/sizeof(EmoteKey), dur }
-const Emote EM_BOOT    = EM_DEF(EK_BOOT,    1400);
-const Emote EM_HAPPY   = EM_DEF(EK_HAPPY,    900);
-const Emote EM_SAD     = EM_DEF(EK_SAD,     1500);
-const Emote EM_WINK    = EM_DEF(EK_WINK,     520);
-const Emote EM_EXCITED = EM_DEF(EK_EXCITED,  800);
-const Emote EM_GLANCE  = EM_DEF(EK_GLANCE,   380);
-const Emote EM_YAWN    = EM_DEF(EK_YAWN,    1300);
-const Emote EM_SQUINT  = EM_DEF(EK_SQUINT,  1900);
-// Loved a track: a big warm squint with the bottom crescent right up.
-const EmoteKey EK_LOVE[] = {
-  {   0, { 100,  0,   0, 20, 110, 110, 0,-4, 110,  70, 25 }, 0 },
-  { 200, {  55,  0,   0, 62, 104, 100, 0, 3, 118, 100, 40 }, 0 },
-  { 620, {  62,  0,   0, 55, 106, 102, 0, 2, 116,  95, 30 }, 0 },
-  { 980, {  95,  0,   0, 22, 100, 100, 0, 0, 106,  70,  8 }, 0 },
-};
-const Emote EM_LOVE = EM_DEF(EK_LOVE, 1300);
+// ── Signed distances (px, negative inside) ──────
+static float sdRoundBox(float px, float py, float bw, float bh, float r) {
+  r = min(r, min(bw, bh));
+  float qx = fabsf(px) - bw + r, qy = fabsf(py) - bh + r;
+  float ox = max(qx, 0.0f), oy = max(qy, 0.0f);
+  return sqrtf(ox * ox + oy * oy) + min(max(qx, qy), 0.0f) - r;
+}
+static float sdHeart(float px, float py) {     // Inigo Quilez; tip at origin, y up, ~1.1 tall
+  px = fabsf(px);
+  if (py + px > 1) { float dx = px - 0.25f, dy = py - 0.75f; return sqrtf(dx * dx + dy * dy) - 0.35355339f; }
+  float a = px * px + (py - 1) * (py - 1);
+  float m = 0.5f * max(px + py, 0.0f);
+  float b = (px - m) * (px - m) + (py - m) * (py - m);
+  float s = (px > py) ? 1.0f : (px < py ? -1.0f : 0.0f);
+  return sqrtf(min(a, b)) * s;
+}
+static float sdSeg(float px, float py, float ax, float ay, float bx, float by) {
+  float pax = px - ax, pay = py - ay, bax = bx - ax, bay = by - ay;
+  float h = constrain((pax * bax + pay * bay) / (bax * bax + bay * bay), 0.0f, 1.0f);
+  float dx = pax - bax * h, dy = pay - bay * h;
+  return sqrtf(dx * dx + dy * dy);
+}
 
-// Queue an emote. If the face is on screen it starts now; otherwise it waits
-// (briefly) so an event that happens on the grid still gets acknowledged
-// when the face comes back.
-void faceEmote(const Emote* e, int8_t gx = 0, int8_t gy = 0, uint16_t waitMs = 2500) {
-  if (pairingMode) return;                // pairing wide-eyes own the face
-  if (currentScreen == SCR_FACE && faceStyle == 0) {
-    emoteCur = e; emoteStart = millis(); emoteGx = gx; emoteGy = gy;
-    emotePending = nullptr;
+static float eyeSDF(float x, float y, const void* vctx) {
+  const EyeCtx& c = *(const EyeCtx*)vctx;
+  const EyeP& e = *c.e;
+  x -= c.cx; y -= c.cy;
+  float h = max(e.h, 1.5f);
+  float d = sdRoundBox(x, y, e.w, h, e.r);
+  // Everything below except the heart only ever grows d (lid and crescent
+  // cuts are max(), the ring is the identity for d > 0), so a pixel already
+  // beyond the glow is done. Skips most of each eye's box for one sqrt.
+  if (e.heart <= 0.001f && d >= F_GLOW) return d;
+  if (e.heart > 0.001f) {
+    float s = max(e.w, h) * 1.9f;
+    float dh = sdHeart(x / s, (h * 0.92f - y) / s - 0.02f) * s;
+    d += (dh - d) * e.heart;
+  }
+  if (e.cres > 0.001f) {                         // ^ arc: subtract itself, shifted down
+    float arc = max(5.5f, h * 0.42f);
+    float shift = (2 * h + 8) + (arc - (2 * h + 8)) * e.cres;
+    d = max(d, -sdRoundBox(x, y - shift, e.w * 1.18f, h, e.r * 1.18f));
+  }
+  float lid = min(1.0f, e.lidT + (1 - e.lidT) * c.blink);
+  if (lid > 0.001f) d = max(d, (-h + lid * 2 * h + e.lidA * x * c.inner) - y);
+  if (e.lidB > 0.001f) d = max(d, y - (h - e.lidB * 2 * h));
+  if (e.hollow > 0.001f) { const float t = 2.6f; d += ((fabsf(d + t) - t) - d) * e.hollow; }
+  return d;
+}
+
+static float mouthSDF(float x, float y, const void* vctx) {
+  const MouthCtx& c = *(const MouthCtx*)vctx;
+  const MouthP& m = *c.m;
+  x -= c.cx; y -= c.cy;
+  float mw = max(m.mw, 1.0f);
+  float u2 = (x / mw) * (x / mw);
+  float lineY = m.curve * (0.5f - u2) + m.skew * x;
+  float d;
+  if (fabsf(x) <= mw) {
+    float slope = -2 * m.curve * x / (mw * mw) + m.skew;
+    d = fabsf(y - lineY) / sqrtf(1 + slope * slope) - m.thick;
   } else {
-    emotePending = e; emotePendGx = gx; emotePendGy = gy;
+    float ex = x > 0 ? mw : -mw;
+    float ey = m.curve * (0.5f - 1.0f) + m.skew * ex;
+    d = sqrtf((x - ex) * (x - ex) + (y - ey) * (y - ey)) - m.thick;
+  }
+  if (m.open > 0.01f && m.depth > 0.5f) {        // D-grin / wedge fill below the line
+    float u = constrain(x / mw, -1.0f, 1.0f);
+    float ell = sqrtf(max(0.0f, 1 - u * u));
+    float sg = (m.wedge < 0) ? -1.0f : 1.0f;
+    float wed = constrain(0.5f + 0.5f * u * sg, 0.0f, 1.0f);
+    float prof = ell + (wed - ell) * fabsf(m.wedge);
+    float top = lineY, bot = top + m.open * m.depth * prof;
+    float df;
+    if (fabsf(x) < mw && y > top && y < bot) df = -min(min(y - top, bot - y), mw - fabsf(x));
+    else df = max(max(top - y, y - bot), fabsf(x) - mw);
+    d = min(d, df);
+  }
+  if (m.round > 0.001f) {
+    float dO = fabsf(sqrtf(x * x + y * y) - m.rO) - m.thick;
+    d += (dO - d) * m.round;
+  }
+  return d;
+}
+
+static float zSDF(float x, float y, const void* vctx) {  // one "z", faded by a
+  const ZCtx& c = *(const ZCtx*)vctx;
+  float px = x - c.zx, py = y - c.zy, s = c.sz;
+  float d = min(min(sdSeg(px, py, -s, -s, s, -s), sdSeg(px, py, s, -s, -s, s)),
+                sdSeg(px, py, -s, s, s, s));
+  return d - 1.1f + (1 - c.a) * 5;
+}
+
+// Distance → palette level; the preview's level() exactly.
+static inline uint8_t fLevel(float d) {
+  if (d <= -2.5f) return 15;
+  if (d <= 0) return (uint8_t)lroundf(11 + (-d / 2.5f) * 4);
+  if (d >= F_GLOW) return 0;
+  float t = 1 - d / F_GLOW;
+  return (uint8_t)lroundf(11 * (d < 1 ? 0.55f + 0.45f * t * t : 0.55f * t * t * 1.5f));
+}
+
+// Evaluate one shape over its (transformed) bounding box, max-blending into
+// the sprite. Records the box so only it gets pushed.
+static void fFeature(uint8_t slot, float bx0, float by0, float bx1, float by1,
+                     SdfFn f, const void* ctx) {
+  float c = cosf(fX.rot), s = sinf(fX.rot);
+  float x0 = 1e9f, y0 = 1e9f, x1 = -1e9f, y1 = -1e9f;
+  const float cx[4] = { bx0, bx1, bx0, bx1 }, cy[4] = { by0, by0, by1, by1 };
+  for (int i = 0; i < 4; i++) {
+    float lx = cx[i] - F_PIV_X, ly = cy[i] - F_PIV_Y;
+    float qx = F_PIV_X + fX.tx + fX.sx * (c * lx - s * ly);
+    float qy = F_PIV_Y + fX.ty + fX.sy * (s * lx + c * ly);
+    x0 = min(x0, qx); x1 = max(x1, qx); y0 = min(y0, qy); y1 = max(y1, qy);
+  }
+  int ix0 = max(0, (int)floorf(x0)), iy0 = max(0, (int)floorf(y0));
+  int ix1 = min(FACE_SW - 1, (int)ceilf(x1)), iy1 = min(FACE_SH - 1, (int)ceilf(y1));
+  if (ix1 < ix0 || iy1 < iy0) return;
+  FRect& r = fRect[slot];
+  if (r.x1 < r.x0) r = { (int16_t)ix0, (int16_t)iy0, (int16_t)ix1, (int16_t)iy1 };
+  else { r.x0 = min((int)r.x0, ix0); r.y0 = min((int)r.y0, iy0);
+         r.x1 = max((int)r.x1, ix1); r.y1 = max((int)r.y1, iy1); }
+  const float isx = 1 / fX.sx, isy = 1 / fX.sy, ds = (fX.sx + fX.sy) * 0.5f;
+  for (int y = iy0; y <= iy1; y++) {
+    float uy = (y + 0.5f - F_PIV_Y - fX.ty) * isy;
+    uint8_t* row = fBuf + y * (FACE_SW / 2);
+    for (int x = ix0; x <= ix1; x++) {
+      float ux = (x + 0.5f - F_PIV_X - fX.tx) * isx;
+      float lx = F_PIV_X + c * ux + s * uy, ly = F_PIV_Y - s * ux + c * uy;
+      uint8_t l = fLevel(f(lx, ly, ctx) * ds);
+      if (!l) continue;
+      uint8_t* p = row + (x >> 1);
+      if (x & 1) { if ((*p & 0x0F) < l) *p = (uint8_t)((*p & 0xF0) | l); }
+      else       { if ((*p >> 4)   < l) *p = (uint8_t)((*p & 0x0F) | (l << 4)); }
+    }
+  }
+}
+
+void faceRender(float blink) {
+  if (!fBuf) return;
+  memset(fBuf, 0, FACE_SW * FACE_SH / 2);
+  for (auto& r : fRect) r = { 0, 0, -1, -1 };
+  EyeCtx ec[2] = { { &fCur.L, F_PIV_X - F_EYE_SEP + fCur.L.dx, F_EYE_Y + fCur.L.dy,  1, blink },
+                   { &fCur.R, F_PIV_X + F_EYE_SEP + fCur.R.dx, F_EYE_Y + fCur.R.dy, -1, blink } };
+  for (int i = 0; i < 2; i++) {
+    const EyeP& e = *ec[i].e;
+    // Box per axis: the shape never leaves w × h (cuts only remove), except
+    // the heart, which spills ~1.15 × max(w, h) either way.
+    float rx = e.w * 1.05f + F_GLOW + 3, ry = max(e.h, 1.5f) * 1.05f + F_GLOW + 3;
+    if (e.heart > 0.001f) rx = ry = max(e.w, e.h) * 1.3f + F_GLOW + 4;
+    fFeature(i, ec[i].cx - rx, ec[i].cy - ry, ec[i].cx + rx, ec[i].cy + ry, eyeSDF, &ec[i]);
+  }
+  if (faceCfg.mouthOn) {
+    const MouthP& m = fCur.m;
+    MouthCtx mc = { &m, F_PIV_X + (fCur.L.dx + fCur.R.dx) * 0.18f, F_MOUTH_Y + m.my };
+    float hw  = max(m.mw, m.rO) + m.thick + F_GLOW + 3;
+    float top = fabsf(m.curve) + fabsf(m.skew) * m.mw + m.thick + F_GLOW + 3 + m.rO * m.round;
+    float bot = top + m.open * m.depth;
+    fFeature(2, mc.cx - hw, mc.cy - top, mc.cx + hw, mc.cy + bot, mouthSDF, &mc);
+  }
+  if (fZzz > 0.05f) {                    // Zzz drifting up-right of the right eye
+    float zx0 = F_PIV_X + F_EYE_SEP + 26, zy0 = F_EYE_Y - 16;
+    for (int i = 0; i < 3; i++) {
+      float ph = fmodf(fT * 0.45f + i / 3.0f, 1.0f), sz = 3 + i * 1.6f + ph * 2;
+      ZCtx z = { zx0 + i * 9 + ph * 6, zy0 - ph * 26 - i * 4, sz, fZzz * sinf(PI * ph) };
+      if (z.a < 0.05f) continue;
+      fFeature(3, z.zx - sz - 6, z.zy - sz - 6, z.zx + sz + 6, z.zy + sz + 6, zSDF, &z);
+    }
+  }
+}
+
+// Push what changed: per slot, this frame's box ∪ last frame's. A full push
+// only after the screen was wiped (faceEnter).
+void faceFlush() {
+  if (fFullPush) {
+    sprFace.pushSprite(FACE_SX, FACE_SY);
+    fFullPush = false;
+  } else {
+    for (int i = 0; i < 4; i++) {
+      FRect a = fRect[i], b = fRectPrev[i];
+      bool ha = a.x1 >= a.x0, hb = b.x1 >= b.x0;
+      if (!ha && !hb) continue;
+      if (!ha) a = b;
+      else if (hb) { a.x0 = min(a.x0, b.x0); a.y0 = min(a.y0, b.y0);
+                     a.x1 = max(a.x1, b.x1); a.y1 = max(a.y1, b.y1); }
+      int x0 = a.x0 & ~1;                // byte-aligned start: the fast 4-bit path
+      sprFace.pushSprite(FACE_SX + x0, FACE_SY + a.y0, x0, a.y0, a.x1 - x0 + 1, a.y1 - a.y0 + 1);
+    }
+  }
+  memcpy(fRectPrev, fRect, sizeof(fRect));
+}
+
+// ── Emotes + triggers ───────────────────────────
+// Queue an emote. If the face is on screen it starts now; otherwise it waits
+// (briefly) so an event on the grid still gets acknowledged on return.
+void faceEmoteEx(uint8_t ex, float amp, uint16_t holdMs, uint16_t waitMs) {
+  if (ex >= EX_COUNT || pairingMode) return;   // pairing wide-eyes own the face
+  const Personality& P = PERSONAS[facePersona];
+  amp *= P.emotePct / 100.0f;
+  if (!holdMs) holdMs = (uint16_t)min(8000UL, (unsigned long)EMOTES[ex].holdMs * (P.timePct ? P.timePct : 100) / 100UL);
+  if (currentScreen == SCR_FACE && faceStyle == 0) {
+    emoteEx = ex; emoteStart = millis(); emoteHold = holdMs; emoteAmp = amp;
+    emotePendEx = -1;
+  } else {
+    emotePendEx = ex; emotePendAmp = amp; emotePendHold = holdMs;
     emotePendingUntil = millis() + waitMs;
   }
 }
 
-// ALWAYS mode: acknowledge a keystroke without leaving the face.
-// Targets only — the frame loop eases toward them, so this never blocks
-// the key path (a delay here would stall the very keystroke it reacts to).
+// One attempt per cooldown: a failed chance roll still spends it, so a
+// continuous condition (idle) rolls once per period rather than every frame.
+void faceTrigger(uint8_t trg) {
+  if (trg >= TRG_PAD_N) return;
+  const EmoteMapE& m = emoteMap[trg];
+  unsigned long now = millis();
+  unsigned long cd = (unsigned long)m.cooldownS * 1000UL;
+  if (emoteMapLast[trg] && now - emoteMapLast[trg] < cd) return;
+  emoteMapLast[trg] = now ? now : 1;
+  if (!m.chance || (int)frnd(0, 99) >= m.chance) return;
+  uint8_t ex = (m.ex == EMOTE_RANDOM) ? FLAIR_POOL[frnd(0, sizeof(FLAIR_POOL) - 1)] : m.ex;
+  faceEmoteEx(ex, 1.0f, 0, 2500);
+}
+
+// A glance toward the pressed key — targets only, never blocks the key path
 void faceKeyReact(int i) {
-  if (emoteCur == &EM_EXCITED) return;    // mid-burst: don't stomp the wobble
-  faceEmote(&EM_GLANCE, (int8_t)(((i % 4) - 1.5f) * 9.0f),   // key's column
-                        (int8_t)(((i / 4) - 1.0f) * 7.0f));  // ...and row
+  keyGX = ((i % 4) - 1.5f) * 5.0f;
+  keyGY = ((i / 4) - 1.0f) * 4.0f;
+  faceKeyGlanceUntil = millis() + 450;
 }
 
 void faceSlotGlance(int slot) {           // called from switchToSlot
-  int8_t dir = (slot == 0) ? -14 : (slot == 1 ? 0 : 14);
-  faceEmote(&EM_WINK, dir, (slot == 1) ? -6 : 0, 3000);
+  keyGX = (slot == 0) ? -10.0f : (slot == 1 ? 0.0f : 10.0f);
+  keyGY = (slot == 1) ? -4.0f : 0.0f;
+  faceKeyGlanceUntil = millis() + 900;
+  faceTrigger(TRG_SLOT);
 }
 
+// ── Dance ───────────────────────────────────────
+enum : uint8_t { DM_BOB, DM_SWAY, DM_TILT, DM_STEP, DM_BOUNCE, DM_BANG };
+static uint8_t danceMoves(uint8_t* out) {          // moves the level allows
+  if (danceLevel < 1) return 0;
+  if (danceLevel < 35) { out[0] = DM_BOB; return 1; }
+  if (danceLevel < 70) { out[0] = DM_BOB; out[1] = DM_SWAY; out[2] = DM_TILT; return 3; }
+  uint8_t n = 0;
+  for (uint8_t m = DM_BOB; m <= DM_BOUNCE; m++) out[n++] = m;
+  if (faceMoodA > 0.65f) out[n++] = DM_BANG;       // headbang only when it's lively
+  return n;
+}
+
+// Transform for beat phase ph (beats), amplitude amp 0..1
+static void danceXf(FaceXf& o, float ph, uint8_t move, float amp) {
+  float f = ph - floorf(ph), hit = (1 - f) * (1 - f) * (1 - f);
+  bool even = ((long)floorf(ph) & 1) == 0;
+  o = { 0, 0, 1, 1, 0 };
+  switch (move) {
+    case DM_BOB:   o.ty = 7 * amp * hit; o.sy = 1 - 0.05f * amp * hit; o.sx = 1 + 0.03f * amp * hit; break;
+    case DM_SWAY:  o.tx = 12 * amp * sinf(PI * ph); o.rot = 0.07f * amp * sinf(PI * ph);
+                   o.ty = 3 * amp * hit; break;
+    case DM_TILT:  o.rot = (even ? 1 : -1) * 0.11f * amp * (1 - f * f); o.ty = 4 * amp * hit; break;
+    case DM_STEP: { float sgn = even ? 1 : -1, e = f < 0.35f ? f / 0.35f : 1, ee = e * e * (3 - 2 * e);
+                    o.tx = 11 * amp * (sgn * (2 * ee - 1));
+                    o.ty = -5 * amp * sinf(PI * min(1.0f, f / 0.35f)); break; }
+    case DM_BOUNCE: { float up = sinf(PI * f);
+                      o.ty = -9 * amp * up; o.sy = 1 + 0.07f * amp * up - 0.08f * amp * hit;
+                      o.sx = 1 - 0.03f * amp * up + 0.05f * amp * hit; break; }
+    case DM_BANG:  o.ty = 10 * amp * hit; o.rot = 0.05f * amp * hit * (even ? 1 : -1);
+                   o.sy = 1 - 0.09f * amp * hit; break;
+  }
+}
+
+// ── One 1/30 s simulation step. Returns the blink amount (0..1). ──
+float faceSimStep(unsigned long now, bool music, bool beatLive) {
+  const Personality& P = PERSONAS[facePersona];
+  fT += F_DT;
+
+  // L0: base = mood (−1..1 on both axes)
+  FaceP target;
+  moodPose(target, faceMoodV * 2 - 1, faceMoodA * 2 - 1);
+  float omega = 10;
+  uint8_t motion = MO_NONE;
+  float es = 0;
+  bool allowBlink = true;
+
+  // L1: link state
+  if (pairingMode) {                    // wide + curious, functional UI outranks mood
+    emoteEx = emotePendEx = -1;
+    exprAt(target, EX_NEUTRAL, 1);
+    float k = faceCfg.pairScalePct / 100.0f;
+    target.L.w *= k; target.R.w *= k; target.L.h *= k; target.R.h *= k;
+    glX = 0; glY = -3; allowBlink = false;
+  } else if (!bleConnected) {           // searching — eyes dart around
+    if (now >= faceDartNext) {
+      faceDartNext = now + frnd(400, 800);
+      glX = frndf(-10, 10); glY = frndf(-5, 5);
+    }
+    allowBlink = false;
+  } else if (now >= faceNextGlance) {   // connected, idle — calm glances
+    uint8_t gp = ctxFocused ? (uint8_t)min(255, P.glancePct * 8 / 5) : P.glancePct;
+    faceNextGlance = now + frnd(personaMs(faceCfg.glanceMinS, gp), personaMs(faceCfg.glanceMaxS, gp));
+    bool back = frnd(0, 99) < 45;
+    glX = back ? 0 : frndf(-7, 7); glY = back ? 0 : frndf(-4, 3);
+  } else if (now >= faceNextSaccade) {  // eyes are never perfectly still
+    faceNextSaccade = now + frnd(300, 900);
+    if ((int)frnd(0, 99) < P.saccadePct) {
+      glX = constrain(glX + frndf(-1.5f, 1.5f), -9.0f, 9.0f);
+      glY = constrain(glY + frndf(-1.0f, 1.0f), -5.0f, 5.0f);
+    }
+  }
+
+  // L3: an emote overrides for its hold, then springs carry back to mood
+  if (emoteEx >= 0) {
+    unsigned long et = now - emoteStart;
+    if (et < emoteHold) {
+      exprAt(target, (uint8_t)emoteEx, 1);
+      omega = EMOTES[emoteEx].omega; motion = EMOTES[emoteEx].motion;
+      es = et / 1000.0f;
+      if (EXPR[emoteEx].L.cres > 0.5f || emoteEx == EX_WINK) allowBlink = false;
+    } else { emoteEx = -1; omega = 8; }
+  }
+
+  // Pre-sleep droop always wins: it reports a real state
+  if (sleepTimeoutMs > 0) {
+    unsigned long idle = millis() - lastActivityMs;
+    if (idle + 10000 > sleepTimeoutMs) {
+      unsigned long left = (sleepTimeoutMs > idle) ? sleepTimeoutMs - idle : 0;
+      float lid = 0.82f * (1 - (float)left / 10000.0f);
+      target.L.lidT = max(target.L.lidT, lid); target.R.lidT = max(target.R.lidT, lid);
+      allowBlink = false; emoteEx = -1;
+    }
+  }
+
+  // Blinks (sometimes double)
+  if (allowBlink && now >= faceNextBlink) {
+    faceBlinkStart = now;
+    if (!faceDblBlink && (int)frnd(0, 99) < P.dblBlinkPct) {
+      faceDblBlink = true;                // ...and sometimes straight back down
+      faceNextBlink = now + 260;
+    } else {
+      faceDblBlink = false;               // drowsy faces blink more often
+      faceNextBlink = now + frnd(personaMs(faceCfg.blinkMinS, P.blinkPct),
+                                 personaMs(faceCfg.blinkMaxS, P.blinkPct)) * (faceMoodA < 0.35f ? 7 : 10) / 10;
+    }
+  }
+  unsigned long bt = now - faceBlinkStart;
+  float blink = !allowBlink ? 0 : bt < 70 ? bt / 70.0f : bt < 170 ? 1 - (bt - 70) / 100.0f : 0;
+
+  // Springs: eyes (+ glance), mouth
+  float gx = glX, gy = glY;
+  if (now < faceKeyGlanceUntil) { gx = keyGX; gy = keyGY; }
+  target.L.dx += gx; target.R.dx += gx; target.L.dy += gy; target.R.dy += gy;
+  fSpring((float*)&fCur, (float*)&fVel, (const float*)&target, (int)(sizeof(FaceP) / sizeof(float)), omega);
+
+  // Transform: glance parallax + breathing + dance + emote motion
+  FaceXf tt = { gx * 0.35f, 0, 1, 1 + 0.012f * sinf(fT * 1.6f), 0 };
+  if (music && danceLevel > 0) {
+    float ph; uint8_t moves[6]; uint8_t nm;
+    if (beatLive) ph = (float)(now - beatAnchorMs) / beatPeriodMs;
+    else          ph = now / 600.0f;    // no beat clock: a slow free-running sway
+    int32_t bar = (int32_t)floorf(ph / 4);
+    nm = beatLive ? danceMoves(moves) : 1;
+    if (!beatLive) moves[0] = DM_SWAY;
+    if (bar != danceLastBar) {
+      danceLastBar = bar;
+      if ((bar & 3) == 0 && nm) danceMove = (int8_t)frnd(0, nm - 1);
+      if (beatLive && flairBars && bar - danceFlairBar >= flairBars && emoteEx < 0 && danceLevel >= 35) {
+        danceFlairBar = bar;
+        faceTrigger(TRG_FLAIR);
+      }
+    }
+    if (nm) {
+      FaceXf d;
+      danceXf(d, ph, moves[danceMove % nm], (danceLevel / 100.0f) * (beatLive ? 1.0f : 0.4f));
+      tt.tx += d.tx; tt.ty += d.ty; tt.sx *= d.sx; tt.sy *= d.sy; tt.rot += d.rot;
+    }
+  }
+  float a = emoteAmp;
+  switch (motion) {
+    case MO_HOP:    tt.ty -= 8 * a * max(0.0f, sinf(PI * min(1.0f, es / 0.35f))); break;
+    case MO_BOUNCE: tt.ty -= 9 * a * fabsf(sinf(PI * es * 3.2f)) * max(0.0f, 1 - es / 1.8f); break;
+    case MO_PULSE: { float p = powf(max(0.0f, sinf(PI * es * 2.2f)), 6);
+                     tt.sx *= 1 + 0.08f * a * p; tt.sy *= 1 + 0.08f * a * p; break; }
+    case MO_JOLT:   tt.ty -= 6 * a * expf(-es * 5); tt.sy *= 1 + 0.06f * a * expf(-es * 5); break;
+    case MO_SHAKE:  tt.tx += 4 * a * sinf(es * 55) * expf(-es * 3); break;
+    case MO_DROOP:  tt.ty += 6 * a * min(1.0f, es / 0.8f); tt.rot += 0.03f * a; break;
+    case MO_TILT:   tt.rot += 0.09f * a * min(1.0f, es / 0.3f); break;
+    case MO_ORBIT:
+      fCur.L.dx += ( 4 * cosf(es * 9) - fCur.L.dx) * 0.5f; fCur.L.dy += (4 * sinf(es * 9)  - fCur.L.dy) * 0.5f;
+      fCur.R.dx += (-4 * cosf(es * 9) - fCur.R.dx) * 0.5f; fCur.R.dy += (4 * sinf(-es * 9) - fCur.R.dy) * 0.5f;
+      break;
+  }
+  fZzz += ((motion == MO_ZZZ ? 1.0f : 0.0f) - fZzz) * 0.08f;
+  fSpring((float*)&fX, (float*)&fXv, (const float*)&tt, 5, music ? 26 : 12);
+  return blink;
+}
+
+// ── Entry / exit ────────────────────────────────
 void faceEnter() {
   const Personality& P = PERSONAS[facePersona];
   beginDraw(SCR_FACE);
   puckLabelReset();                       // beginDraw may have wiped the label
-  eyeOpen = 0.0f; eyeOpenTarget = 1.0f;   // eyes open on arrival
-  eyeGlanceX = eyeGlanceY = eyeGlanceTX = eyeGlanceTY = 0;
-  lidTop = lidTopT = lidAngle = lidAngleT = lidBot = lidBotT = 0;
-  eyeScaleW = eyeScaleWT = eyeScaleH = eyeScaleHT = 1.0f;
-  // Mouth starts at the persona's resting curve rather than flat, so arriving
-  // on the face doesn't show a neutral line snapping into a smile.
-  mouthWid = mouthWidT = 1.0f;
-  mouthCrv = mouthCrvT = P.rest.mouthCurve / 100.0f;
-  mouthOpn = mouthOpnT = 0.0f;
-  eyeWinkMask = 0;
-  faceBlinking = false; faceDblBlink = false;
+  // Arrive from the resting mood with the lids shut, so the eyes open into it
+  moodPose(fCur, faceMoodV * 2 - 1, faceMoodA * 2 - 1);
+  fCur.L.lidT = fCur.R.lidT = 1;
+  memset(&fVel, 0, sizeof(fVel));
+  fX = { 0, 0, 1, 1, 0 }; memset(&fXv, 0, sizeof(fXv));
+  fAcc = 0; fZzz = 0; glX = glY = 0;
+  if (fBuf) memset(fBuf, 0, FACE_SW * FACE_SH / 2);
+  for (auto& r : fRectPrev) r = { 0, 0, -1, -1 };
+  fFullPush = true;
+  facePalFor = 1;                         // rebuild on the first frame
   unsigned long now = millis();
-  faceNextBlink  = now + frnd(personaMs(faceCfg.blinkMinS, P.blinkPct),
-                              personaMs(faceCfg.blinkMaxS, P.blinkPct));
-  faceNextGlance = now + frnd(personaMs(faceCfg.glanceMinS, P.glancePct),
-                              personaMs(faceCfg.glanceMaxS, P.glancePct));
-  faceGlanceEnd = 0; faceDartNext = 0; faceFrameMs = 0; faceNextSaccade = 0;
+  faceNextBlink  = now + frnd(personaMs(faceCfg.blinkMinS, P.blinkPct), personaMs(faceCfg.blinkMaxS, P.blinkPct));
+  faceNextGlance = now + frnd(personaMs(faceCfg.glanceMinS, P.glancePct), personaMs(faceCfg.glanceMaxS, P.glancePct));
+  faceBlinkStart = 0; faceFrameMs = 0; faceNextSaccade = 0; faceKeyGlanceUntil = 0;
   faceNextSquint = now + frnd(6000, 15000);   // no squint the moment we appear
-  // The very first face of the session gets a proper waking-up animation
-  if (faceBootPending) { faceBootPending = false; faceEmote(&EM_BOOT); }
+  danceLastBar = -1;
+  if (faceBootPending) { faceBootPending = false; faceTrigger(TRG_BOOT); }
 }
 
-// Happy squint flash on the wake press, then caller returns to the grid
+// Draw the current pose once, immediately (wake flash, sleep close)
+static void faceDrawNow(float blink) {
+  uint16_t col = faceTintedColor();
+  if (col != facePalFor) faceBuildPalette(col);
+  faceRender(blink);
+  faceFlush();
+}
+
+// Wake press: a flash of the wake emote, then the caller returns to the grid
 void faceWake() {
-  lidBot = 0.5f; lidTop = 0;              // squint reads as pleased, not startled
-  drawFaceFrame(0.32f, 1.05f);
+  const EmoteMapE& m = emoteMap[TRG_WAKE];
+  uint8_t ex = (m.chance && m.ex < EX_COUNT) ? m.ex : EX_HAPPY;
+  FaceP p; exprAt(p, ex, 1);
+  fCur = p;
+  faceDrawNow(0);
   delay(160);
-  lidBot = 0;
   screenDirty = true;                     // grid must fully repaint over us
 }
 
-// Lids close animation right before light sleep (eyes style only)
+// Lids close right before light sleep
 void faceSleepClose() {
-  for (float o = eyeOpen; o > 0.02f; o *= 0.72f) {
-    drawFaceFrame(o, 1.0f);
+  for (int i = 0; i < 8; i++) {
+    fCur.L.lidT += (1 - fCur.L.lidT) * 0.35f;
+    fCur.R.lidT += (1 - fCur.R.lidT) * 0.35f;
+    faceDrawNow(0);
     delay(30);
   }
-  drawFaceFrame(0.02f, 1.0f);
+  fCur.L.lidT = fCur.R.lidT = 1;
+  faceDrawNow(0);
   delay(120);
 }
 
@@ -2990,176 +3617,90 @@ void faceMoodTick(unsigned long now) {
 
 void updateFace(unsigned long now) {
   if (now - faceFrameMs < 33) return;     // ~30 fps
+  unsigned long dtMs = faceFrameMs ? now - faceFrameMs : 33;
   faceFrameMs = now;
+#if FACE_PROFILE
+  uint32_t profT0 = micros();
+#endif
   const Personality& P = PERSONAS[facePersona];
   faceMoodTick(now);
 
-  float wScale = 1.0f;
-  bool allowBlink = true;
-  bool calm = false;
-  eyeWinkMask = 0;
+  // The pad's own mood, with the companion's blended in by its weight while
+  // its ttl is live. The weight eases back to zero once the ttl lapses, so a
+  // dead companion fades the face home rather than freezing it.
+  bool hostLive = hostMoodTtlMs && (now - hostMoodRxMs < hostMoodTtlMs);
+  hostMix += ((hostLive ? hostMoodW : 0.0f) - hostMix) * 0.006f;
+  float tv = moodValence + hostMix * (hostMoodV - moodValence);
+  float ta = moodEnergy  + hostMix * (hostMoodA - moodEnergy);
+  faceMoodV += (tv - faceMoodV) * 0.03f;
+  faceMoodA += (ta - faceMoodA) * 0.03f;
+  ctxFocused = hostLive && (hostMoodFlags & HMOOD_FOCUSED);
+  ctxLate    = hostLive && (hostMoodFlags & HMOOD_LATE);
 
-  // ── L0: resting posture from persona + mood ──
-  // Low energy adds lid weight, low valence tips the lids into a sad angle,
-  // high valence lifts a hint of the happy crescent.
-  EyePose rest = P.rest;
-  rest.lidTopPct   = min(90, rest.lidTopPct + (int)((1.0f - moodEnergy) * 22.0f));
-  rest.lidTopAngle = constrain(rest.lidTopAngle + (int)((0.5f - moodValence) * 60.0f), -100, 100);
-  rest.lidBotPct   = min(60, rest.lidBotPct + (int)(max(0.0f, moodValence - 0.6f) * 40.0f));
-  applyPose(rest, 1.0f);
+  // Media edges, set by the host-link handler, consumed on the loop task.
+  // Only real music gets track/pause reactions — a video changing chapter
+  // would otherwise fire them every few minutes.
+  if (mediaJustFaved) { mediaJustFaved = false; mediaNewSong = false; faceTrigger(TRG_FAVE); }
+  if (mediaNewSong)   { mediaNewSong = false; if (mediaShow && mediaIsMusic) faceTrigger(TRG_TRACK); }
+  bool music = mediaShow && mediaIsMusic && mediaPlaying && (now - mediaRxMs < 30000UL);
+  if (faceWasPlaying && !music && mediaIsMusic) faceTrigger(TRG_PAUSE);
+  faceWasPlaying = music;
+  bool beatLive = music && beatConf > 40 && beatPeriodMs > 0 && (now - beatRxMs < 8000UL);
 
-  // ── L1: what the pad is actually doing right now ──
-  if (pairingMode) {                      // wide + curious
-    emoteCur = emotePending = nullptr;    // functional UI outranks personality
-    applyPose(POSE_NEUTRAL, 1.0f, true);
-    wScale = faceCfg.pairScalePct / 100.0f;
-    allowBlink = false;
-    eyeGlanceTX = 0; eyeGlanceTY = -3;
-    faceGlanceEnd = 0;
-  } else if (!bleConnected) {             // searching — eyes dart around
-    if (now >= faceDartNext) {
-      faceDartNext = now + frnd(400, 800);
-      eyeGlanceTX = (float)((int)frnd(0, 24)) - 12.0f;
-      eyeGlanceTY = (float)((int)frnd(0, 10)) - 5.0f;
-    }
-    eyeOpenTarget = 0.85f;
-    allowBlink = false;
-  } else {                                // connected, idle — calm
-    calm = true;
-    if (faceGlanceEnd != 0 && now >= faceGlanceEnd) {
-      eyeGlanceTX = eyeGlanceTY = 0;
-      faceGlanceEnd = 0;
-    } else if (faceGlanceEnd == 0 && now >= faceNextGlance) {
-      eyeGlanceTX = (frnd(0, 1) ? 10.0f : -10.0f);
-      eyeGlanceTY = (float)((int)frnd(0, 6)) - 3.0f;
-      faceGlanceEnd  = now + frnd(500, 900);
-      faceNextGlance = now + frnd(personaMs(faceCfg.glanceMinS, P.glancePct),
-                                  personaMs(faceCfg.glanceMaxS, P.glancePct));
-    }
-  }
-
-  // ── L2: micro-behaviours — the small motions that sell "alive" ──
-  if (calm && !emoteCur) {
-    if (now >= faceNextSaccade) {         // eyes are never perfectly still
-      faceNextSaccade = now + frnd(300, 900);
-      if ((int)frnd(0, 99) < P.saccadePct) {
-        // Bounded: these accumulate between glances, and an unclamped
-        // random walk would slowly drag the eyes into a corner
-        eyeGlanceTX = constrain(eyeGlanceTX + ((int)frnd(0, 4) - 2.0f), -14.0f, 14.0f);
-        eyeGlanceTY = constrain(eyeGlanceTY + ((int)frnd(0, 4) - 2.0f), -8.0f, 8.0f);
-      }
-    }
+  // Idle: one roll per cooldown (min 30 s) once untouched for a minute; late
+  // at night the sleepy face comes three times as readily.
+  if (bleConnected && !pairingMode && emoteEx < 0) {
     unsigned long idle = millis() - lastActivityMs;
-    if (idle > 60000UL && now - faceLastYawn > 120000UL &&
-        (int)frnd(0, 999) < P.yawnPct) {
-      faceLastYawn = now;
-      faceEmote(&EM_YAWN);
-    }
-    // Thoughtful squint — a "hmm" while watching you. Unlike the yawn it
-    // needs no long idle; it's the face concentrating, not getting bored.
+    if (idle > 60000UL && !music) {
+      if (!faceIdleFired || now - emoteMapLast[TRG_IDLE] >
+          max(30000UL, (unsigned long)emoteMap[TRG_IDLE].cooldownS * 1000UL / (ctxLate ? 3 : 1))) {
+        faceIdleFired = true;
+        emoteMapLast[TRG_IDLE] = 0;       // cooldown handled here
+        faceTrigger(TRG_IDLE);
+      }
+    } else if (idle < 1000) faceIdleFired = false;
+    // Thoughtful squint — the face concentrating while you work
     if (now >= faceNextSquint) {
       faceNextSquint = now + frnd(9000, 22000);
-      if ((int)frnd(0, 99) < P.squintPct) faceEmote(&EM_SQUINT);
+      if ((int)frnd(0, 99) < P.squintPct + (ctxFocused ? 25 : 0)) faceEmoteEx(EX_FOCUSED, 1.0f, 1500, 0);
     }
   }
 
-  // ── Music reactions ──────────────────────────
-  // Edge events set by the host-link handler; consumed here so the drawing
-  // always happens on the loop task.
-  if (mediaJustFaved) { mediaJustFaved = false; mediaNewSong = false;
-                        faceEmote(&EM_LOVE); }
-  // Only real music gets the "ooh, new track" reaction. A video or audiobook
-  // changing chapter would otherwise fire this every few minutes.
-  if (mediaNewSong)   { mediaNewSong = false;
-                        if (mediaShow && mediaIsMusic) faceEmote(&EM_EXCITED); }
+  if (emoteEx < 0 && emotePendEx >= 0 && now < emotePendingUntil) {
+    emoteEx = emotePendEx; emoteStart = now; emoteAmp = emotePendAmp; emoteHold = emotePendHold;
+    emotePendEx = -1;
+  } else if (emotePendEx >= 0 && now >= emotePendingUntil) emotePendEx = -1;
 
-  // Gentle bob while a track plays — the pad quietly vibing. Applied after
-  // the branches (which rewrite the glance targets every frame) but before
-  // emotes, so any emote still wins outright. Music only: bobbing along to a
-  // YouTube video reads as broken rather than charming.
-  if (mediaShow && mediaIsMusic && mediaPlaying && !emoteCur
-      && (now - mediaRxMs < 30000UL)) {
-    float ph = (float)(now % 2400) / 2400.0f * 6.2832f;
-    eyeGlanceTY += sinf(ph) * 2.0f;
-    eyeGlanceTX += sinf(ph * 0.5f) * 1.2f;
+  // Fixed-step sim, like the preview: identical motion at any frame rate
+  fAcc += dtMs / 1000.0f;
+  if (fAcc > 0.1f) fAcc = 0.1f;           // after a stall, don't fast-forward
+  float blink = 0;
+  while (fAcc >= F_DT) { blink = faceSimStep(now, music, beatLive); fAcc -= F_DT; }
+
+  faceColNow = faceTintedColor();
+  if (faceColNow != facePalFor) faceBuildPalette(faceColNow);
+#if FACE_PROFILE
+  uint32_t profT1 = micros();
+#endif
+  faceRender(blink);
+#if FACE_PROFILE
+  uint32_t profT2 = micros();
+#endif
+  faceFlush();
+
+#if FACE_PROFILE
+  static uint32_t worstUs = 0, worstRender = 0, worstPush = 0; static unsigned long lastRep = 0;
+  uint32_t profT3 = micros();
+  worstUs = max(worstUs, profT3 - profT0);
+  worstRender = max(worstRender, profT2 - profT1);
+  worstPush = max(worstPush, profT3 - profT2);
+  if (now - lastRep > 5000) {
+    Serial.printf("[face] worst frame %lu us (render %lu, push %lu)  mood v=%.2f a=%.2f host=%.2f heap %u\n",
+                  (unsigned long)worstUs, (unsigned long)worstRender, (unsigned long)worstPush,
+                  faceMoodV, faceMoodA, hostMix, (unsigned)ESP.getFreeHeap());
+    worstUs = worstRender = worstPush = 0; lastRep = now;
   }
-
-  // ── L3: transient emote overrides everything above ──
-  if (!emoteCur && emotePending && now < emotePendingUntil) {
-    emoteCur = emotePending; emoteStart = now;
-    emoteGx = emotePendGx; emoteGy = emotePendGy;
-    emotePending = nullptr;
-  } else if (emotePending && now >= emotePendingUntil) emotePending = nullptr;
-
-  if (emoteCur) {
-    // Play the timeline back scaled. Dividing elapsed time by the scale
-    // stretches keyframe spacing *and* duration together — extending only
-    // durMs would just hold the last pose longer instead of slowing the
-    // animation. SLEEPY drags, PLAYFUL is brisk, via the persona's timePct.
-    // GLANCE is exempt: it fires on every keypress, so stretching it would
-    // make the face feel laggy under fast typing. Expressive emotes stretch;
-    // per-key reactions stay snappy.
-    unsigned long raw = now - emoteStart;
-    uint16_t      tp  = (emoteCur == &EM_GLANCE) ? 100 : emoteTimePct(P);
-    unsigned long t   = (raw * 100UL) / tp;
-    if (t >= emoteCur->durMs) emoteCur = nullptr;   // always time-boxed
-    else {
-      const EmoteKey* k = &emoteCur->keys[0];
-      for (uint8_t n = 0; n < emoteCur->n; n++)
-        if (t >= emoteCur->keys[n].tMs) k = &emoteCur->keys[n];
-      applyPose(k->pose, P.emotePct / 100.0f, true);
-      eyeGlanceTX += emoteGx; eyeGlanceTY += emoteGy;
-      eyeWinkMask = k->winkMask;
-      allowBlink = false;                 // the emote owns the lids
-      faceGlanceEnd = 0;                  // and cancels any idle glance
-    }
-  }
-
-  // ── Final: pre-sleep droop always wins, it reports a real state ──
-  if (sleepTimeoutMs > 0) {
-    unsigned long idle = millis() - lastActivityMs;
-    if (idle + 10000 > sleepTimeoutMs) {
-      unsigned long left = (sleepTimeoutMs > idle) ? sleepTimeoutMs - idle : 0;
-      float droop = 0.18f + 0.82f * ((float)left / 10000.0f);
-      if (droop < eyeOpenTarget) eyeOpenTarget = droop;
-      allowBlink = false;
-      emoteCur = nullptr;
-    }
-  }
-
-  // Blink scheduling
-  if (faceBlinking) {
-    if (now < faceBlinkEnd) eyeOpenTarget = 0.0f;
-    else {
-      faceBlinking = false;
-      if (faceDblBlink) {                 // ...and sometimes twice
-        faceDblBlink = false;
-        faceNextBlink = now + 150;        // reopen, then straight back down
-      }
-    }
-  } else if (allowBlink && now >= faceNextBlink) {
-    faceBlinking = true;
-    faceBlinkEnd  = now + 110;
-    faceDblBlink  = ((int)frnd(0, 99) < P.dblBlinkPct);
-    faceNextBlink = now + frnd(personaMs(faceCfg.blinkMinS, P.blinkPct),
-                               personaMs(faceCfg.blinkMaxS, P.blinkPct));
-  }
-
-  // Ease current values toward targets, then render
-  eyeOpen    += (eyeOpenTarget - eyeOpen) * 0.38f;
-  eyeGlanceX += (eyeGlanceTX - eyeGlanceX) * 0.30f;
-  eyeGlanceY += (eyeGlanceTY - eyeGlanceY) * 0.30f;
-  lidTop     += (lidTopT   - lidTop)   * 0.30f;
-  lidAngle   += (lidAngleT - lidAngle) * 0.30f;
-  lidBot     += (lidBotT   - lidBot)   * 0.30f;
-  eyeScaleW  += (eyeScaleWT - eyeScaleW) * 0.30f;
-  eyeScaleH  += (eyeScaleHT - eyeScaleH) * 0.30f;
-  // Mouth eases a touch slower than the lids — a mouth that snaps reads as
-  // twitchy, while trailing the eyes slightly looks like one connected face.
-  mouthWid   += (mouthWidT - mouthWid) * 0.26f;
-  mouthCrv   += (mouthCrvT - mouthCrv) * 0.26f;
-  mouthOpn   += (mouthOpnT - mouthOpn) * 0.26f;
-  drawFaceFrame(eyeOpen, wScale);
+#endif
 }
 
 // ── GIF playback (faceStyle == 1) ───────────────
@@ -3457,6 +3998,8 @@ void handleGetConfig() {
   f["style"] = (faceStyle == 0) ? "eyes" : "gif";
   f["gif"]   = faceGif;
   f["personality"] = personaName(facePersona);
+  f["dance"] = danceLevel;
+  f["flairBars"] = flairBars;
   JsonObject e = f["eyes"].to<JsonObject>();
   e["color"] = faceCfg.color;   e["eyeW"] = faceCfg.eyeW;
   e["eyeH"] = faceCfg.eyeH;     e["gap"] = faceCfg.gap;
@@ -3509,6 +4052,14 @@ void handlePostConfig() {
       if (p >= 0) facePersona = p;       // unknown names leave it alone
     } else if (f["personality"].is<int>())
       facePersona = constrain((int)f["personality"], 0, NUM_PERSONAS - 1);
+    if (f["dance"].is<int>()) {
+      danceLevel = constrain((int)f["dance"], 0, 100);
+      prefs.putUChar("dlvl", danceLevel);
+    }
+    if (f["flairBars"].is<int>()) {
+      flairBars = constrain((int)f["flairBars"], 0, 64);
+      prefs.putUChar("dflr", flairBars);
+    }
     JsonObjectConst e = f["eyes"];
     if (!e.isNull()) {
       if (e["color"].is<int>())        faceCfg.color = e["color"];
@@ -3867,13 +4418,36 @@ void setup() {
                                  // flips this only around its own pushImage
   sprBar.setColorDepth(16);  sprBar.createSprite(320, 26);
   sprCell.setColorDepth(16); sprCell.createSprite(CELL_W, CELL_H);
-  sprEye.setColorDepth(16);  sprEye.createSprite(EYE_SPR_W, EYE_SPR_H);
-  sprMouth.setColorDepth(16); sprMouth.createSprite(MOUTH_SPR_W, MOUTH_SPR_H);
+  // The face's only canvas: 4-bit, 18 KB, created here once and never resized
+  sprFace.setColorDepth(4);
+  fBuf = (uint8_t*)sprFace.createSprite(FACE_SW, FACE_SH);
+  if (fBuf) faceBuildPalette(faceEyeColor());
+  else Serial.println("[face] sprite alloc FAILED — face disabled");
+  Serial.printf("[face] heap free %u, largest block %u\n",
+                (unsigned)ESP.getFreeHeap(),
+                (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_8BIT));
   gifDec.begin(GIF_PALETTE_RGB565_BE);
 
   // ── NimBLE init ──────────────────────────────
   // Must happen BEFORE ledcAttach — radio init resets LEDC state
   NimBLEDevice::init(DEVICE_NAME);
+  buildSlotAddresses();
+
+  // One-time migration to per-slot addresses. Under the old scheme every host
+  // bonded to the public address, which we no longer advertise — those bonds
+  // are dead on both sides. Wipe them once, so the pad never reports a slot as
+  // "linked" to a host that can never come back.
+  if (prefs.getInt("addrver", 1) < ADDR_SCHEME_VER) {
+    NimBLEDevice::deleteAllBonds();
+    for (int i = 0; i < NUM_SLOTS; i++) dropSlotBond(i);
+    memset(hostSlots, 0, sizeof(hostSlots));
+    activeSlot  = 0;
+    pairingMode = true;
+    prefs.putInt("addrver", ADDR_SCHEME_VER);
+    saveSlots();
+    Serial.println("[BLE] bond scheme migrated — all bonds cleared, re-pair every host");
+  }
+
   NimBLEDevice::setPower(ESP_PWR_LVL_P9);
   NimBLEDevice::setMTU(185);   // host-link writes exceed the 23-byte default
 
@@ -3976,10 +4550,12 @@ void loop() {
       snprintf(msg, sizeof(msg), "PAIRED SLOT %d", activeSlot + 1);
       redraw();
       showToast(msg, C_GREEN, 1500);
-    } else if (evt == EVT_WRONG_HOST) {
-      redraw();
-      showToast("WRONG DEVICE", C_RED, 1200);
     }
+  }
+  if (pendingBondSnap >= 0) {
+    int n = pendingBondSnap;
+    pendingBondSnap = -1;
+    snapshotSlotBond(n);
   }
 
   // Connection state change → redraw (+ fire buffered wake-key)
@@ -3987,8 +4563,8 @@ void loop() {
     lastBleConn = bleConnected;
     // The face reacts to the link coming and going — queued, so it plays
     // whether the event lands on the grid or with the eyes already up
-    if (bleConnected) { faceEmote(&EM_HAPPY); moodValence = min(1.0f, moodValence + 0.20f); }
-    else              { faceEmote(&EM_SAD);   moodValence = max(0.0f, moodValence - 0.25f); }
+    if (bleConnected) { faceTrigger(TRG_CONNECT); moodValence = min(1.0f, moodValence + 0.20f); }
+    else              { faceTrigger(TRG_DISCONNECT); moodValence = max(0.0f, moodValence - 0.25f); }
     if (bleConnected) {
       if (wakeKeyPending && wakeKeyIdx != WAKEKEY_NONE) {
         wakeKeyPending = false;
@@ -4067,7 +4643,7 @@ void loop() {
         if (moodKeyCount < 255) moodKeyCount++;
         if (now - typeBurstStart > 4000) { typeBurstStart = now; typeBurstCount = 0; }
         if (++typeBurstCount == 5) {
-          faceEmote(&EM_EXCITED);
+          faceTrigger(TRG_TYPING);
           moodEnergy = min(1.0f, moodEnergy + 0.15f);
         }
         // IDLE: the face is a screensaver — the first press only wakes it

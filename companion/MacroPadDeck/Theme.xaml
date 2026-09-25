@@ -1,0 +1,464 @@
+<!-- Theme.xaml — "Void Deck": the one palette both windows use.
+     A dark void with one warm light. Ember is the ONLY accent on dark surfaces;
+     red is used exactly once (link lost); profile / eye colours are user content
+     and keep their own hue. Shared with SpeakerDspDeck's App.xaml — keep the two
+     in step by copying the whole file, not by editing one side.
+     The old key names (Ink, Muted, Surface, Border2, Accent, Card, PrimaryBtn,
+     GhostBtn, MutedText, SectionLabel) are kept as aliases so the code-behind
+     and the recorder XAML keep working unchanged. -->
+<ResourceDictionary xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+                    xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml">
+<Color x:Key="VoidColor">#05060A</Color>
+<Color x:Key="SurfaceColor">#0C0E15</Color>
+<Color x:Key="RaisedColor">#12141D</Color>
+<Color x:Key="HairColor">#1B1E2A</Color>
+<Color x:Key="BoneColor">#F4F1EA</Color>
+<Color x:Key="MutedColor">#8D8A80</Color>
+<Color x:Key="DimColor">#4E4C46</Color>
+<Color x:Key="EmberColor">#FFB24D</Color>
+<Color x:Key="EmberDeepColor">#FF7A18</Color>
+<Color x:Key="DangerColor">#FF2A2A</Color>
+
+<SolidColorBrush x:Key="Void"    Color="{StaticResource VoidColor}"/>
+<SolidColorBrush x:Key="Surface" Color="{StaticResource SurfaceColor}"/>
+<SolidColorBrush x:Key="Raised"  Color="{StaticResource RaisedColor}"/>
+<SolidColorBrush x:Key="Hair"    Color="{StaticResource HairColor}"/>
+<SolidColorBrush x:Key="Bone"    Color="{StaticResource BoneColor}"/>
+<SolidColorBrush x:Key="Muted"   Color="{StaticResource MutedColor}"/>
+<SolidColorBrush x:Key="Dim"     Color="{StaticResource DimColor}"/>
+<SolidColorBrush x:Key="EmberFlat" Color="{StaticResource EmberColor}"/>
+<SolidColorBrush x:Key="Danger"  Color="{StaticResource DangerColor}"/>
+<LinearGradientBrush x:Key="Ember" StartPoint="0,0" EndPoint="1,1">
+  <GradientStop Color="{StaticResource EmberColor}" Offset="0"/>
+  <GradientStop Color="{StaticResource EmberDeepColor}" Offset="1"/>
+</LinearGradientBrush>
+<!-- Soft ember halo for thumbs / the status dot. Alpha ramps to 0 at the rim
+     so it reads as glow on the void without any Effect surface. -->
+<RadialGradientBrush x:Key="EmberHalo">
+  <GradientStop Color="#A0FFB24D" Offset="0"/>
+  <GradientStop Color="#40FF9A30" Offset="0.45"/>
+  <GradientStop Color="#00FF7A18" Offset="1"/>
+</RadialGradientBrush>
+<!-- Old keys kept as aliases so nothing else has to change. -->
+<SolidColorBrush x:Key="Page"   Color="{StaticResource VoidColor}"/>
+<SolidColorBrush x:Key="Border" Color="{StaticResource HairColor}"/>
+<SolidColorBrush x:Key="Ink"    Color="{StaticResource BoneColor}"/>
+<SolidColorBrush x:Key="Accent" Color="{StaticResource EmberColor}"/>
+
+<FontFamily x:Key="MonoFont">Cascadia Mono, Consolas</FontFamily>
+
+<!-- ==== Type ==== -->
+<Style TargetType="TextBlock">
+  <Setter Property="Foreground" Value="{StaticResource Bone}"/>
+  <Setter Property="FontFamily" Value="Segoe UI"/>
+</Style>
+<Style x:Key="H1" TargetType="TextBlock">
+  <Setter Property="FontSize" Value="15"/>
+  <Setter Property="FontWeight" Value="Light"/>
+  <Setter Property="Foreground" Value="{StaticResource Bone}"/>
+</Style>
+<!-- Section label: small, muted, upper-case, breathing room below. -->
+<Style x:Key="H2" TargetType="TextBlock">
+  <Setter Property="FontSize" Value="10.5"/>
+  <Setter Property="FontWeight" Value="SemiBold"/>
+  <Setter Property="Foreground" Value="{StaticResource Muted}"/>
+  <Setter Property="Margin" Value="0,0,0,10"/>
+</Style>
+<Style x:Key="Mono" TargetType="TextBlock">
+  <Setter Property="FontFamily" Value="{StaticResource MonoFont}"/>
+  <Setter Property="FontSize" Value="12"/>
+  <Setter Property="Foreground" Value="{StaticResource Bone}"/>
+</Style>
+<Style x:Key="MonoMuted" TargetType="TextBlock" BasedOn="{StaticResource Mono}">
+  <Setter Property="Foreground" Value="{StaticResource Muted}"/>
+  <Setter Property="FontSize" Value="11"/>
+</Style>
+<Style x:Key="Hint" TargetType="TextBlock">
+  <Setter Property="Foreground" Value="{StaticResource Dim}"/>
+  <Setter Property="FontSize" Value="10.5"/>
+</Style>
+
+<!-- ==== Surfaces ==== -->
+<Style x:Key="CardPanel" TargetType="Border">
+  <Setter Property="Background" Value="{StaticResource Surface}"/>
+  <Setter Property="BorderBrush" Value="{StaticResource Hair}"/>
+  <Setter Property="BorderThickness" Value="1"/>
+  <Setter Property="CornerRadius" Value="12"/>
+  <Setter Property="Padding" Value="18,16"/>
+  <Setter Property="Margin" Value="0,0,0,14"/>
+</Style>
+<!-- The hero sits on pure void, not on a raised card. -->
+<Style x:Key="HeroPanel" TargetType="Border" BasedOn="{StaticResource CardPanel}">
+  <Setter Property="Background" Value="{StaticResource Void}"/>
+  <Setter Property="Padding" Value="8,10,8,6"/>
+</Style>
+
+<!-- ==== Buttons ==== -->
+<Style TargetType="Button">
+  <Setter Property="Foreground" Value="{StaticResource Bone}"/>
+  <Setter Property="Background" Value="Transparent"/>
+  <Setter Property="BorderBrush" Value="{StaticResource Hair}"/>
+  <Setter Property="Padding" Value="12,6"/>
+  <Setter Property="FontSize" Value="12"/>
+  <Setter Property="Cursor" Value="Hand"/>
+  <Setter Property="Template">
+    <Setter.Value>
+      <ControlTemplate TargetType="Button">
+        <Border x:Name="bd" Background="{TemplateBinding Background}" BorderBrush="{TemplateBinding BorderBrush}"
+                BorderThickness="1" CornerRadius="8" Padding="{TemplateBinding Padding}">
+          <ContentPresenter HorizontalAlignment="Center" VerticalAlignment="Center"/>
+        </Border>
+        <ControlTemplate.Triggers>
+          <Trigger Property="IsMouseOver" Value="True">
+            <Setter TargetName="bd" Property="BorderBrush" Value="{StaticResource Muted}"/>
+          </Trigger>
+          <Trigger Property="IsEnabled" Value="False">
+            <Setter Property="Foreground" Value="{StaticResource Dim}"/>
+          </Trigger>
+        </ControlTemplate.Triggers>
+      </ControlTemplate>
+    </Setter.Value>
+  </Setter>
+</Style>
+<Style x:Key="Accented" TargetType="Button">
+  <Setter Property="Foreground" Value="{StaticResource Void}"/>
+  <Setter Property="Background" Value="{StaticResource Ember}"/>
+  <Setter Property="Padding" Value="14,7"/>
+  <Setter Property="FontSize" Value="12"/>
+  <Setter Property="FontWeight" Value="SemiBold"/>
+  <Setter Property="Cursor" Value="Hand"/>
+  <Setter Property="Template">
+    <Setter.Value>
+      <ControlTemplate TargetType="Button">
+        <Border x:Name="bd" Background="{TemplateBinding Background}" CornerRadius="8" Padding="{TemplateBinding Padding}">
+          <ContentPresenter HorizontalAlignment="Center" VerticalAlignment="Center"/>
+        </Border>
+        <ControlTemplate.Triggers>
+          <Trigger Property="IsMouseOver" Value="True">
+            <Setter TargetName="bd" Property="Background" Value="{StaticResource EmberFlat}"/>
+          </Trigger>
+          <Trigger Property="IsEnabled" Value="False">
+            <Setter TargetName="bd" Property="Background" Value="{StaticResource Hair}"/>
+            <Setter Property="Foreground" Value="{StaticResource Dim}"/>
+          </Trigger>
+        </ControlTemplate.Triggers>
+      </ControlTemplate>
+    </Setter.Value>
+  </Setter>
+</Style>
+<!-- Title-bar glyph buttons (minimise / close). -->
+<Style x:Key="Glyph" TargetType="Button" BasedOn="{StaticResource {x:Type Button}}">
+  <Setter Property="BorderBrush" Value="Transparent"/>
+  <Setter Property="Foreground" Value="{StaticResource Muted}"/>
+  <Setter Property="Padding" Value="10,4"/>
+  <Setter Property="FontFamily" Value="Segoe MDL2 Assets"/>
+  <Setter Property="FontSize" Value="10"/>
+</Style>
+
+<!-- ==== Slider: hairline track, ember fill, glowing thumb ==== -->
+<Style TargetType="Slider">
+  <Setter Property="Height" Value="22"/>
+  <Setter Property="IsMoveToPointEnabled" Value="True"/>
+  <Setter Property="Template">
+    <Setter.Value>
+      <ControlTemplate TargetType="Slider">
+        <Grid VerticalAlignment="Center" Background="Transparent">
+          <Border Height="2" Background="{StaticResource Hair}" CornerRadius="1" VerticalAlignment="Center"/>
+          <Track x:Name="PART_Track">
+            <Track.DecreaseRepeatButton>
+              <RepeatButton Command="Slider.DecreaseLarge" Focusable="False">
+                <RepeatButton.Template>
+                  <ControlTemplate TargetType="RepeatButton">
+                    <Grid Background="Transparent" Height="22">
+                      <Border Height="2" Background="{StaticResource Ember}" CornerRadius="1" VerticalAlignment="Center"/>
+                    </Grid>
+                  </ControlTemplate>
+                </RepeatButton.Template>
+              </RepeatButton>
+            </Track.DecreaseRepeatButton>
+            <Track.IncreaseRepeatButton>
+              <RepeatButton Command="Slider.IncreaseLarge" Focusable="False">
+                <RepeatButton.Template>
+                  <ControlTemplate TargetType="RepeatButton">
+                    <Grid Background="Transparent" Height="22"/>
+                  </ControlTemplate>
+                </RepeatButton.Template>
+              </RepeatButton>
+            </Track.IncreaseRepeatButton>
+            <Track.Thumb>
+              <Thumb Width="14" Height="14" Focusable="False">
+                <Thumb.Template>
+                  <ControlTemplate TargetType="Thumb">
+                    <!-- Halo is a static radial gradient: cheaper than a DropShadowEffect and
+                         identical on screen. -->
+                    <Grid Width="14" Height="14">
+                      <Ellipse Width="30" Height="30" Margin="-8" Fill="{StaticResource EmberHalo}" IsHitTestVisible="False"/>
+                      <Ellipse Fill="{StaticResource Ember}" Width="14" Height="14"/>
+                    </Grid>
+                  </ControlTemplate>
+                </Thumb.Template>
+              </Thumb>
+            </Track.Thumb>
+          </Track>
+        </Grid>
+      </ControlTemplate>
+    </Setter.Value>
+  </Setter>
+</Style>
+
+<!-- ==== CheckBox as a pill toggle. BorderBrush = the "on" colour so a
+          second style can swap ember for red without a new template. -->
+<Style TargetType="CheckBox">
+  <Setter Property="Foreground" Value="{StaticResource Bone}"/>
+  <Setter Property="BorderBrush" Value="{StaticResource Ember}"/>
+  <Setter Property="Cursor" Value="Hand"/>
+  <Setter Property="FontSize" Value="12"/>
+  <Setter Property="Template">
+    <Setter.Value>
+      <ControlTemplate TargetType="CheckBox">
+        <StackPanel Orientation="Horizontal" Background="Transparent">
+          <Border x:Name="pill" Width="32" Height="17" CornerRadius="8.5" Background="{StaticResource Hair}" VerticalAlignment="Center">
+            <Ellipse x:Name="knob" Width="11" Height="11" Fill="{StaticResource Muted}" HorizontalAlignment="Left" Margin="3,0,0,0">
+              <Ellipse.RenderTransform><TranslateTransform x:Name="kt" X="0"/></Ellipse.RenderTransform>
+            </Ellipse>
+          </Border>
+          <ContentPresenter x:Name="cp" Margin="9,0,0,0" VerticalAlignment="Center" RecognizesAccessKey="True"/>
+        </StackPanel>
+        <ControlTemplate.Triggers>
+          <Trigger Property="HasContent" Value="False">
+            <Setter TargetName="cp" Property="Margin" Value="0"/>
+          </Trigger>
+          <Trigger Property="IsChecked" Value="True">
+            <Setter TargetName="pill" Property="Background" Value="{Binding BorderBrush, RelativeSource={RelativeSource TemplatedParent}}"/>
+            <Setter TargetName="knob" Property="Fill" Value="{StaticResource Void}"/>
+            <Trigger.EnterActions>
+              <BeginStoryboard>
+                <Storyboard><DoubleAnimation Storyboard.TargetName="kt" Storyboard.TargetProperty="X" To="15" Duration="0:0:0.15"/></Storyboard>
+              </BeginStoryboard>
+            </Trigger.EnterActions>
+            <Trigger.ExitActions>
+              <BeginStoryboard>
+                <Storyboard><DoubleAnimation Storyboard.TargetName="kt" Storyboard.TargetProperty="X" To="0" Duration="0:0:0.15"/></Storyboard>
+              </BeginStoryboard>
+            </Trigger.ExitActions>
+          </Trigger>
+          <Trigger Property="IsEnabled" Value="False">
+            <Setter Property="Foreground" Value="{StaticResource Dim}"/>
+          </Trigger>
+        </ControlTemplate.Triggers>
+      </ControlTemplate>
+    </Setter.Value>
+  </Setter>
+</Style>
+<!-- The one red thing in the app. -->
+<Style x:Key="DangerToggle" TargetType="CheckBox" BasedOn="{StaticResource {x:Type CheckBox}}">
+  <Setter Property="BorderBrush" Value="{StaticResource Danger}"/>
+</Style>
+
+<!-- ==== TextBox ==== -->
+<Style TargetType="TextBox">
+  <Setter Property="Foreground" Value="{StaticResource Bone}"/>
+  <Setter Property="Background" Value="{StaticResource Void}"/>
+  <Setter Property="BorderBrush" Value="{StaticResource Hair}"/>
+  <Setter Property="CaretBrush" Value="{StaticResource EmberFlat}"/>
+  <Setter Property="SelectionBrush" Value="{StaticResource EmberFlat}"/>
+  <Setter Property="FontFamily" Value="{StaticResource MonoFont}"/>
+  <Setter Property="FontSize" Value="12"/>
+  <Setter Property="Padding" Value="7,4"/>
+  <Setter Property="Template">
+    <Setter.Value>
+      <ControlTemplate TargetType="TextBox">
+        <Border x:Name="bd" Background="{TemplateBinding Background}" BorderBrush="{TemplateBinding BorderBrush}"
+                BorderThickness="1" CornerRadius="6">
+          <ScrollViewer x:Name="PART_ContentHost" Margin="{TemplateBinding Padding}" VerticalAlignment="Center"
+                        HorizontalScrollBarVisibility="Hidden" VerticalScrollBarVisibility="Hidden"/>
+        </Border>
+        <ControlTemplate.Triggers>
+          <Trigger Property="IsMouseOver" Value="True">
+            <Setter TargetName="bd" Property="BorderBrush" Value="{StaticResource Muted}"/>
+          </Trigger>
+          <Trigger Property="IsKeyboardFocused" Value="True">
+            <Setter TargetName="bd" Property="BorderBrush" Value="{StaticResource EmberFlat}"/>
+          </Trigger>
+        </ControlTemplate.Triggers>
+      </ControlTemplate>
+    </Setter.Value>
+  </Setter>
+</Style>
+
+<!-- ==== ComboBox ==== -->
+<Style TargetType="ComboBoxItem">
+  <Setter Property="Foreground" Value="{StaticResource Bone}"/>
+  <Setter Property="Padding" Value="9,5"/>
+  <Setter Property="FontSize" Value="12"/>
+  <Setter Property="Template">
+    <Setter.Value>
+      <ControlTemplate TargetType="ComboBoxItem">
+        <Border x:Name="bd" Background="Transparent" Padding="{TemplateBinding Padding}">
+          <ContentPresenter/>
+        </Border>
+        <ControlTemplate.Triggers>
+          <Trigger Property="IsHighlighted" Value="True">
+            <Setter TargetName="bd" Property="Background" Value="{StaticResource Hair}"/>
+          </Trigger>
+          <Trigger Property="IsSelected" Value="True">
+            <Setter Property="Foreground" Value="{StaticResource EmberFlat}"/>
+          </Trigger>
+        </ControlTemplate.Triggers>
+      </ControlTemplate>
+    </Setter.Value>
+  </Setter>
+</Style>
+<Style TargetType="ComboBox">
+  <Setter Property="Foreground" Value="{StaticResource Bone}"/>
+  <Setter Property="FontSize" Value="12"/>
+  <Setter Property="Padding" Value="9,4"/>
+  <Setter Property="Template">
+    <Setter.Value>
+      <ControlTemplate TargetType="ComboBox">
+        <Grid>
+          <ToggleButton IsChecked="{Binding IsDropDownOpen, RelativeSource={RelativeSource TemplatedParent}, Mode=TwoWay}"
+                        Focusable="False" ClickMode="Press">
+            <ToggleButton.Template>
+              <ControlTemplate TargetType="ToggleButton">
+                <Border x:Name="bd" Background="{StaticResource Void}" BorderBrush="{StaticResource Hair}" BorderThickness="1" CornerRadius="6">
+                  <Path Data="M0,0 L4,4 L8,0" Stroke="{StaticResource Muted}" StrokeThickness="1.2"
+                        HorizontalAlignment="Right" VerticalAlignment="Center" Margin="0,0,9,0"/>
+                </Border>
+                <ControlTemplate.Triggers>
+                  <Trigger Property="IsMouseOver" Value="True">
+                    <Setter TargetName="bd" Property="BorderBrush" Value="{StaticResource Muted}"/>
+                  </Trigger>
+                  <Trigger Property="IsChecked" Value="True">
+                    <Setter TargetName="bd" Property="BorderBrush" Value="{StaticResource EmberFlat}"/>
+                  </Trigger>
+                </ControlTemplate.Triggers>
+              </ControlTemplate>
+            </ToggleButton.Template>
+          </ToggleButton>
+          <ContentPresenter Content="{TemplateBinding SelectionBoxItem}" ContentTemplate="{TemplateBinding SelectionBoxItemTemplate}"
+                            Margin="{TemplateBinding Padding}" VerticalAlignment="Center" HorizontalAlignment="Left" IsHitTestVisible="False"/>
+          <Popup IsOpen="{TemplateBinding IsDropDownOpen}" Placement="Bottom" AllowsTransparency="True"
+                 PopupAnimation="Fade" StaysOpen="False" Focusable="False">
+            <Border Background="{StaticResource Raised}" BorderBrush="{StaticResource Hair}" BorderThickness="1" CornerRadius="6"
+                    MinWidth="{TemplateBinding ActualWidth}" MaxHeight="240" Margin="0,3,0,0">
+              <ScrollViewer HorizontalScrollBarVisibility="Disabled"><ItemsPresenter/></ScrollViewer>
+            </Border>
+          </Popup>
+        </Grid>
+      </ControlTemplate>
+    </Setter.Value>
+  </Setter>
+</Style>
+
+<!-- ==== Segmented driver tabs: ember underline on the selected one -->
+<Style x:Key="SegmentItem" TargetType="ListBoxItem">
+  <Setter Property="Foreground" Value="{StaticResource Muted}"/>
+  <Setter Property="Cursor" Value="Hand"/>
+  <Setter Property="FontSize" Value="12"/>
+  <Setter Property="Template">
+    <Setter.Value>
+      <ControlTemplate TargetType="ListBoxItem">
+        <Grid Background="Transparent">
+          <Grid.RowDefinitions><RowDefinition/><RowDefinition Height="2"/></Grid.RowDefinitions>
+          <ContentPresenter HorizontalAlignment="Center" Margin="0,6,0,7"/>
+          <Border x:Name="ul" Grid.Row="1" Background="Transparent" CornerRadius="1" Margin="10,0"/>
+        </Grid>
+        <ControlTemplate.Triggers>
+          <Trigger Property="IsMouseOver" Value="True">
+            <Setter Property="Foreground" Value="{StaticResource Bone}"/>
+          </Trigger>
+          <Trigger Property="IsSelected" Value="True">
+            <Setter Property="Foreground" Value="{StaticResource Bone}"/>
+            <Setter TargetName="ul" Property="Background" Value="{StaticResource Ember}"/>
+          </Trigger>
+        </ControlTemplate.Triggers>
+      </ControlTemplate>
+    </Setter.Value>
+  </Setter>
+</Style>
+
+<!-- ==== ScrollBar: a thin hairline thumb, nothing else ==== -->
+<Style TargetType="ScrollBar">
+  <Setter Property="Width" Value="6"/>
+  <Setter Property="Margin" Value="4,0,0,0"/>
+  <Setter Property="Background" Value="Transparent"/>
+  <Setter Property="Template">
+    <Setter.Value>
+      <ControlTemplate TargetType="ScrollBar">
+        <Grid Background="Transparent">
+          <Track x:Name="PART_Track" IsDirectionReversed="True">
+            <Track.DecreaseRepeatButton>
+              <RepeatButton Command="ScrollBar.PageUpCommand" Opacity="0" Focusable="False"/>
+            </Track.DecreaseRepeatButton>
+            <Track.IncreaseRepeatButton>
+              <RepeatButton Command="ScrollBar.PageDownCommand" Opacity="0" Focusable="False"/>
+            </Track.IncreaseRepeatButton>
+            <Track.Thumb>
+              <Thumb>
+                <Thumb.Template>
+                  <ControlTemplate TargetType="Thumb">
+                    <Border Background="{StaticResource Hair}" CornerRadius="3" Width="6"/>
+                  </ControlTemplate>
+                </Thumb.Template>
+              </Thumb>
+            </Track.Thumb>
+          </Track>
+        </Grid>
+      </ControlTemplate>
+    </Setter.Value>
+  </Setter>
+</Style>
+
+  <!-- ==== Editor-specific ==== -->
+  <SolidColorBrush x:Key="Border2" Color="{StaticResource HairColor}"/>
+  <SolidColorBrush x:Key="Line"    Color="{StaticResource HairColor}"/>
+  <Color x:Key="AccentC">#FFFFB24D</Color>
+  <Color x:Key="AccentDC">#FFFF7A18</Color>
+  <Color x:Key="SurfaceC">#FF0C0E15</Color>
+  <Color x:Key="SurfaceC0">#000C0E15</Color>
+  <Color x:Key="RowHoverC">#FF12141D</Color>
+  <Color x:Key="RowHoverC0">#0012141D</Color>
+
+  <Style x:Key="Card" TargetType="Border" BasedOn="{StaticResource CardPanel}">
+    <Setter Property="Margin" Value="0"/>
+  </Style>
+  <Style x:Key="MutedText" TargetType="TextBlock">
+    <Setter Property="Foreground" Value="{StaticResource Muted}"/>
+    <Setter Property="FontSize" Value="11"/>
+  </Style>
+  <Style x:Key="SectionLabel" TargetType="TextBlock" BasedOn="{StaticResource H2}">
+    <Setter Property="Margin" Value="0,16,0,6"/>
+  </Style>
+  <Style x:Key="PrimaryBtn" TargetType="Button" BasedOn="{StaticResource Accented}">
+    <Setter Property="Padding" Value="18,8"/>
+  </Style>
+  <Style x:Key="GhostBtn" TargetType="Button" BasedOn="{StaticResource {x:Type Button}}"/>
+
+  <!-- Profile rows: hairline hover, selected = raised surface + ember left bar. -->
+  <Style x:Key="ProfileRow" TargetType="ListBoxItem">
+    <Setter Property="Foreground" Value="{StaticResource Bone}"/>
+    <Setter Property="Cursor" Value="Hand"/>
+    <Setter Property="HorizontalContentAlignment" Value="Stretch"/>
+    <Setter Property="Template">
+      <Setter.Value>
+        <ControlTemplate TargetType="ListBoxItem">
+          <Grid Margin="0,2">
+            <Border x:Name="bg" CornerRadius="8" Background="Transparent"/>
+            <Border x:Name="bar" Width="3" CornerRadius="1.5" HorizontalAlignment="Left" Margin="0,7" Background="Transparent"/>
+            <ContentPresenter Margin="12,8"/>
+          </Grid>
+          <ControlTemplate.Triggers>
+            <Trigger Property="IsMouseOver" Value="True">
+              <Setter TargetName="bg" Property="Background" Value="{StaticResource Raised}"/>
+            </Trigger>
+            <Trigger Property="IsSelected" Value="True">
+              <Setter TargetName="bg" Property="Background" Value="{StaticResource Raised}"/>
+              <Setter TargetName="bar" Property="Background" Value="{StaticResource Ember}"/>
+            </Trigger>
+          </ControlTemplate.Triggers>
+        </ControlTemplate>
+      </Setter.Value>
+    </Setter>
+  </Style>
+</ResourceDictionary>
