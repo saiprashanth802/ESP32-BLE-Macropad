@@ -16,12 +16,14 @@ public sealed class BlueZBleLink : IBleLink
     readonly string _svcUuid, _evtUuid, _cmdUuid;
     readonly System.Threading.Timer _retry;
     readonly SemaphoreSlim _gate = new(1, 1);
+    readonly SemaphoreSlim _writeLock = new(1, 1);   // serialize command writes
     readonly Dictionary<string, object> _noOpts = new();
 
     Adapter? _adapter;
     Device? _dev;
     GattCharacteristic? _evt, _cmd;
     volatile bool _up;
+    int _writeFails;                                 // consecutive fully-failed writes
 
     public event Action<byte, byte[]>? EventReceived;   // (opcode, payload)
     public event Action<bool>? LinkChanged;             // subscribed / lost
@@ -87,6 +89,13 @@ public sealed class BlueZBleLink : IBleLink
             await _evt.StartNotifyAsync();
             _dev.Disconnected += OnDisconnected;
 
+            // The pad's GATT server needs a beat after ServicesResolved before it
+            // will accept writes. Declaring UP and firing the layout burst the
+            // instant services resolve used to make the first write throw, which
+            // (via Write's old catch) tore the whole link down. Let it settle.
+            await Task.Delay(400);
+
+            _writeFails = 0;
             Log("UP");
             _up = true;
             LinkChanged?.Invoke(true);
@@ -124,14 +133,48 @@ public sealed class BlueZBleLink : IBleLink
 
     public async Task<bool> Write(byte[] cmd)
     {
-        var ch = _cmd;
-        if (!_up || ch is null) return false;
+        if (!_up || _cmd is null) return false;
+
+        // A single failed characteristic write is NOT proof the link is gone: for
+        // a beat after connect the pad rejects writes, and BlueZ surfaces that
+        // (plus the odd mid-session hiccup) as a transient exception. Retry with a
+        // short backoff instead of tearing the link down — the old catch set
+        // _up=false on the first failure, which abandoned the whole connect-time
+        // layout burst and flapped the link. A genuine drop still arrives through
+        // OnDisconnected; a silent death trips the consecutive-failure guard
+        // below. Writes are serialized so a burst can't overlap on the wire.
+        bool ok = false, declareDown = false;
+        await _writeLock.WaitAsync();
         try
         {
-            await ch.WriteValueAsync(cmd, _noOpts);
-            return true;
+            for (int attempt = 0; ; attempt++)
+            {
+                var ch = _cmd;
+                if (!_up || ch is null) break;          // a real disconnect landed
+                try
+                {
+                    await ch.WriteValueAsync(cmd, _noOpts);
+                    _writeFails = 0;
+                    ok = true;
+                    break;
+                }
+                catch (Exception ex)
+                {
+                    if (attempt >= 3)
+                    {
+                        Log($"write failed after {attempt + 1} tries: {ex.Message.Split('\n')[0]}");
+                        if (++_writeFails >= 6 && _up) { _up = false; declareDown = true; }
+                        break;
+                    }
+                    await Task.Delay(100 * (attempt + 1));   // 100, 200, 300 ms
+                }
+            }
         }
-        catch { _up = false; LinkChanged?.Invoke(false); return false; }
+        finally { _writeLock.Release(); }
+
+        // Fire the down transition outside the lock — the handler may call back in.
+        if (declareDown) { Log("too many write failures — treating link as down"); LinkChanged?.Invoke(false); }
+        return ok;
     }
 
     void Drop()

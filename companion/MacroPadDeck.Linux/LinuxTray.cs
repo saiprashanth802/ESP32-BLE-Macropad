@@ -17,7 +17,8 @@ public static class LinuxTray
 {
     static MenuItem _statusItem = null!;
 
-    public static void Run(DeckController deck, MediaPusher media, ProfileStore store)
+    public static void Run(DeckController deck, MediaPusher media, ProfileStore store,
+                           LlmClient llm, StyleStore styles)
     {
         // Map the logical "appindicator" name to whichever of the ayatana / old
         // libappindicator sonames is installed.
@@ -25,7 +26,7 @@ public static class LinuxTray
 
         Application.Init();
 
-        var menu = BuildMenu(deck, media, store);
+        var menu = BuildMenu(deck, media, store, llm, styles);
 
         IntPtr ind = app_indicator_new("macropad-deck", "input-keyboard", CategoryApplicationStatus);
         app_indicator_set_status(ind, StatusActive);
@@ -38,7 +39,8 @@ public static class LinuxTray
         Application.Run();
     }
 
-    static Menu BuildMenu(DeckController deck, MediaPusher media, ProfileStore store)
+    static Menu BuildMenu(DeckController deck, MediaPusher media, ProfileStore store,
+                          LlmClient llm, StyleStore styles)
     {
         var menu = new Menu();
 
@@ -55,13 +57,27 @@ public static class LinuxTray
         editor.Activated += (_, _) => LinuxEditorWindow.Open(deck, store);
         menu.Append(editor);
 
-        var editJson = new MenuItem("Edit profiles.json");
-        editJson.Activated += (_, _) =>
+        menu.Append(OpenFileItem("Edit profiles.json", ProfileStore.FilePath));
+        menu.Append(OpenFileItem("Edit styles.json", StyleStore.FilePath));
+
+        // Loading is automatic on first use; unloading is manual so the VRAM
+        // comes back on demand (before a game, say) rather than on a timer.
+        var loadModel = new MenuItem("Load write model");
+        loadModel.Activated += (_, _) => _ = Task.Run(async () =>
         {
-            try { System.Diagnostics.Process.Start(new System.Diagnostics.ProcessStartInfo("xdg-open", ProfileStore.FilePath) { UseShellExecute = false }); }
-            catch (Exception ex) { Diag.Log($"tray: xdg-open profiles failed: {ex.Message}"); }
-        };
-        menu.Append(editJson);
+            string m = styles.Config.Model;
+            deck.RaiseStatus($"Loading {m}…");
+            deck.RaiseStatus(await llm.Load(m) ? $"{m} loaded" : $"Could not load {m}");
+        });
+        menu.Append(loadModel);
+
+        var unloadModel = new MenuItem("Unload write model");
+        unloadModel.Activated += (_, _) => _ = Task.Run(async () =>
+        {
+            string m = styles.Config.Model;
+            deck.RaiseStatus(await llm.Unload(m) ? $"{m} unloaded" : $"Could not unload {m}");
+        });
+        menu.Append(unloadModel);
 
         var firmware = new MenuItem("Update firmware…");
         firmware.Activated += (_, _) => _ = UpdateFirmware(deck);
@@ -79,6 +95,23 @@ public static class LinuxTray
 
         menu.ShowAll();      // AppIndicator only renders items that are shown
         return menu;
+    }
+
+    /// Hand a config file to the desktop's default editor. The store writes a
+    /// default on first construction, so the path always exists by now.
+    static MenuItem OpenFileItem(string caption, string path)
+    {
+        var item = new MenuItem(caption);
+        item.Activated += (_, _) =>
+        {
+            try
+            {
+                System.Diagnostics.Process.Start(
+                    new System.Diagnostics.ProcessStartInfo("xdg-open", path) { UseShellExecute = false });
+            }
+            catch (Exception ex) { Diag.Log($"tray: xdg-open {path} failed: {ex.Message}"); }
+        };
+        return item;
     }
 
     static async Task UpdateFirmware(DeckController deck)

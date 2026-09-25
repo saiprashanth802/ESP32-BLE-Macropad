@@ -1,0 +1,11 @@
+# The corpus and everything derived from it stays local.
+#
+# The training pairs are built by corrupting sentences lifted verbatim out of
+# the author's own private notes. The generator is reproducible and committed;
+# its input and output are not. Point --docs-root at your own documents.
+corpus/
+data/
+results/
+output/
+*.log
+.venv/
